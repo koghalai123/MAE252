@@ -5,6 +5,11 @@ aloha_sim_dataset/
 # Wandb logs
 wandb/
 
+# Git submodules (external repos)
+act/
+octo/
+openvla/
+
 # Python cache
 __pycache__/
 *.pyc
