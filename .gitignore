@@ -1,0 +1,23 @@
+# Large datasets
+example_sim_data.zip
+aloha_sim_dataset/
+
+# Wandb logs
+wandb/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# Checkpoints
+octo_finetuned_checkpoints/
+*.ckpt
+*.pth
+
+# IDE
+.vscode/
+.idea/

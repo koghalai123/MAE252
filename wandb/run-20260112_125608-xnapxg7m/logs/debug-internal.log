@@ -1,6 +1,0 @@
-{"time":"2026-01-12T12:56:08.312481633-08:00","level":"INFO","msg":"stream: starting","core version":"0.23.1"}
-{"time":"2026-01-12T12:56:08.538146496-08:00","level":"INFO","msg":"stream: created new stream","id":"xnapxg7m"}
-{"time":"2026-01-12T12:56:08.538534128-08:00","level":"INFO","msg":"handler: started","stream_id":"xnapxg7m"}
-{"time":"2026-01-12T12:56:08.538709423-08:00","level":"INFO","msg":"stream: started","id":"xnapxg7m"}
-{"time":"2026-01-12T12:56:08.538767935-08:00","level":"INFO","msg":"writer: started","stream_id":"xnapxg7m"}
-{"time":"2026-01-12T12:56:08.538821307-08:00","level":"INFO","msg":"sender: started","stream_id":"xnapxg7m"}
