@@ -1,0 +1,13 @@
+I0112 12:51:48.500773 130630134262656 02_finetune_new_observation_action.py:59] Loading pre-trained model...
+Traceback (most recent call last):
+  File "/home/koghalai/Desktop/MAE252/octo/examples/02_finetune_new_observation_action.py", line 200, in <module>
+    app.run(main)
+  File "/home/koghalai/miniconda3/envs/octo/lib/python3.10/site-packages/absl/app.py", line 316, in run
+    _run_main(main, args)
+  File "/home/koghalai/miniconda3/envs/octo/lib/python3.10/site-packages/absl/app.py", line 261, in _run_main
+    sys.exit(main(argv))
+  File "/home/koghalai/Desktop/MAE252/octo/examples/02_finetune_new_observation_action.py", line 60, in main
+    pretrained_model = OctoModel.load_pretrained(FLAGS.pretrained_path)
+  File "/home/koghalai/Desktop/MAE252/octo/octo/model/octo_model.py", line 266, in load_pretrained
+    if checkpoint_path.startswith("hf://"):
+AttributeError: 'NoneType' object has no attribute 'startswith'

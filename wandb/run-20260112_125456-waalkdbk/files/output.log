@@ -1,0 +1,14 @@
+I0112 12:54:57.757708 135814173948800 02_finetune_new_observation_action.py:59] Loading pre-trained model...
+Fetching 6 files: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 6/6 [00:00<00:00, 61380.06it/s]
+TensorFlow and JAX classes are deprecated and will be removed in Transformers v5. We recommend migrating to PyTorch classes or pinning your version of Transformers.
+I0112 12:54:59.423039 135814173948800 octo_module.py:219] repeating task tokens at each timestep to perform cross-modal attention
+I0112 12:55:03.470171 135814173948800 checkpointer.py:164] Restoring item from /home/koghalai/.cache/huggingface/hub/models--rail-berkeley--octo-small-1.5/snapshots/dc9aa3019f764726c770814b27e4ab0fc6e32a58/300000/default.
+I0112 12:55:04.419088 135814173948800 checkpointer.py:166] Finished restoring checkpoint from /home/koghalai/.cache/huggingface/hub/models--rail-berkeley--octo-small-1.5/snapshots/dc9aa3019f764726c770814b27e4ab0fc6e32a58/300000/default.
+I0112 12:55:05.388868 135814173948800 02_finetune_new_observation_action.py:66] Loading finetuning dataset...
+I0112 12:55:05.397095 135814173948800 dataset_info.py:578] Load dataset info from /home/koghalai/Desktop/MAE252/aloha_sim_dataset/aloha_sim_cube_scripted_dataset/1.0.0
+I0112 12:55:05.511268 135814173948800 logging_logger.py:49] Constructing tf.data.Dataset aloha_sim_cube_scripted_dataset for split all, from /home/koghalai/Desktop/MAE252/aloha_sim_dataset/aloha_sim_cube_scripted_dataset/1.0.0
+I0112 12:55:06.915896 135814173948800 api.py:446] Sampling uniformly across keys: ['language_instruction']
+I0112 12:55:07.071220 135814173948800 data_utils.py:139] Computing dataset statistics. This may take awhile, but should only need to happen once for each dataset.
+50it [00:00, 4413.20it/s]
+I0112 12:55:07.379706 135814173948800 logging_logger.py:49] Constructing tf.data.Dataset aloha_sim_cube_scripted_dataset for split train[:95%], from /home/koghalai/Desktop/MAE252/aloha_sim_dataset/aloha_sim_cube_scripted_dataset/1.0.0
+I0112 12:55:07.416544 135814173948800 api.py:446] Sampling uniformly across keys: ['language_instruction']

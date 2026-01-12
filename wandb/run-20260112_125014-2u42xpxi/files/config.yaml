@@ -1,0 +1,55 @@
+_wandb:
+    value:
+        cli_version: 0.23.1
+        e:
+            nt848ndodcy3vnl575zuumysqbbh3nab:
+                codePath: octo/examples/03_eval_finetuned.py
+                codePathLocal: octo/examples/03_eval_finetuned.py
+                cpu_count: 8
+                cpu_count_logical: 16
+                cudaVersion: "13.0"
+                disk:
+                    /:
+                        total: "212510470144"
+                        used: "177793998848"
+                email: koghalai@gmail.com
+                executable: /home/koghalai/miniconda3/envs/octo/bin/python
+                gpu: NVIDIA GeForce RTX 3050 6GB Laptop GPU
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 2560
+                      memoryTotal: "6442450944"
+                      name: NVIDIA GeForce RTX 3050 6GB Laptop GPU
+                      uuid: GPU-213c722c-0180-9757-82f8-ed4c1f9ce6ff
+                host: koghalai-Yoga-Pro-7-14AHP9
+                memory:
+                    total: "14446231552"
+                os: Linux-6.14.0-33-generic-x86_64-with-glibc2.39
+                program: /home/koghalai/Desktop/MAE252/octo/examples/03_eval_finetuned.py
+                python: CPython 3.10.19
+                root: /home/koghalai/Desktop/MAE252
+                startedAt: "2026-01-12T20:50:14.751600Z"
+                writerId: nt848ndodcy3vnl575zuumysqbbh3nab
+        m: []
+        python_version: 3.10.19
+        t:
+            "1":
+                - 2
+                - 3
+                - 12
+                - 45
+                - 49
+            "2":
+                - 2
+                - 3
+                - 11
+                - 12
+                - 45
+                - 49
+            "3":
+                - 13
+            "4": 3.10.19
+            "5": 0.23.1
+            "12": 0.23.1
+            "13": linux-x86_64
