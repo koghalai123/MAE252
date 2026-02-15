@@ -5,7 +5,7 @@ aloha_sim_dataset/
 # Wandb logs
 wandb/
 
-
+/venv/
 
 # Python cache
 __pycache__/
