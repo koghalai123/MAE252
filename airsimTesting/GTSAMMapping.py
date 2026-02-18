@@ -1,3 +1,74 @@
+# --------------------------- Occupancy Grid ---------------------------------
+
+
+class OccupancyGrid3D:
+    """Simple 3D occupancy grid for fast visualization."""
+    def __init__(self, voxel_size=1.0, grid_shape=(200,200,80), origin=(-50,-50,-50)):
+        self.voxel_size = voxel_size
+        self.grid_shape = grid_shape
+        self.origin = np.array(origin, dtype=float)
+        self.grid = np.zeros(grid_shape, dtype=np.uint8)
+
+    def show_open3d(self):
+        print("DEBUG: Entered show_open3d()")
+        try:
+            import open3d as o3d
+            import numpy as np
+        except ImportError:
+            print("Open3D not installed. Run: pip install open3d")
+            return
+        print("DEBUG: Open3D and numpy imported successfully.")
+        occupied = np.argwhere(self.grid > 0)
+        print(f"DEBUG: Occupied voxels count = {len(occupied)}")
+        if len(occupied) == 0:
+            print("DEBUG: No occupied voxels to display.")
+            return
+        points = occupied * self.voxel_size + self.origin
+        points = np.array(points, dtype=np.float32)
+        print(f"DEBUG: Points min = {np.min(points, axis=0)}, max = {np.max(points, axis=0)}")
+        print(f"DEBUG: Points shape = {points.shape}")
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        colors = np.tile(np.array([[0.0, 1.0, 0.0]]), (len(points), 1))
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+        print("DEBUG: Calling o3d.visualization.draw_geometries...")
+        try:
+            o3d.visualization.draw_geometries([pcd], window_name="Occupancy Grid (Open3D)")
+            print("DEBUG: draw_geometries call completed.")
+        except Exception as e:
+            print(f"DEBUG: draw_geometries failed: {e}")
+        print("DEBUG: show_open3d() finished.")
+
+    def world_to_grid(self, xyz):
+        idx = np.floor((xyz - self.origin) / self.voxel_size).astype(int)
+        return idx
+
+    def add_points(self, points):
+        if len(points) == 0:
+            return
+        idxs = self.world_to_grid(points)
+        # filter points inside grid
+        mask = ((idxs[:,0] >= 0) & (idxs[:,0] < self.grid_shape[0]) &
+                (idxs[:,1] >= 0) & (idxs[:,1] < self.grid_shape[1]) &
+                (idxs[:,2] >= 0) & (idxs[:,2] < self.grid_shape[2]))
+        idxs = idxs[mask]
+        for i in idxs:
+            self.grid[i[0], i[1], i[2]] = 1
+
+    def to_voxelgrid(self):
+        # Convert occupied voxels to Open3D VoxelGrid with color
+        occupied = np.argwhere(self.grid > 0)
+        if len(occupied) == 0:
+            return o3d.geometry.VoxelGrid()
+        points = occupied * self.voxel_size + self.origin
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        # Color all voxels green
+        colors = np.tile(np.array([[0.0, 1.0, 0.0]]), (len(points), 1))
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+        vg = o3d.geometry.VoxelGrid.create_from_point_cloud(pcd, voxel_size=self.voxel_size)
+        return vg
+
 """
 GTSAM-based LIDAR + GPS mapping (AirSim)
 
@@ -26,15 +97,15 @@ import cosysairsim as airsim
 import numpy as np
 
 try:
-    import open3d as o3d
-except Exception as e:
-    raise ImportError("Open3D is required: pip install open3d")
-
-try:
     import gtsam
     from gtsam import symbol
 except Exception as e:
     raise ImportError("GTSAM python bindings are required (pip install gtsam or follow GTSAM install).")
+
+try:
+    import open3d as o3d
+except Exception as e:
+    raise ImportError("Open3D is required: pip install open3d")
 
 try:
     import cv2
@@ -45,23 +116,33 @@ except Exception:
 
 # --------------------------- Utilities ---------------------------------
 
-def quaternion_to_rot3(quat):
-    """Convert AirSim quaternion (w,x,y,z) to gtsam.Rot3"""
-    w, x, y, z = float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])
-    return gtsam.Rot3.Quaternion(w, x, y, z)
-
-
 def pose3_from_pos_quat(pos, quat):
     """Create gtsam.Pose3 from position (x,y,z) and quaternion (w,x,y,z)"""
-    R = quaternion_to_rot3(quat)
-    t = gtsam.Point3(float(pos[0]), float(pos[1]), float(pos[2]))
-    return gtsam.Pose3(R, t)
+    print('DEBUG pose3_from_pos_quat: pos(type,width)=', type(pos), getattr(pos, 'shape', None), 'quat(type)=', type(quat))
+    print('DEBUG pose3_from_pos_quat values (trim):', None if pos is None else np.array(pos).tolist()[:3], None if quat is None else list(quat)[:4])
+    
+    # Construct 4x4 matrix directly to avoid Rot3 constructor crashes
+    w, x, y, z = float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])
+    
+    # Rotation matrix from quaternion
+    R = np.array([
+        [1 - 2*(y**2 + z**2), 2*(x*y - w*z),     2*(x*z + w*y)],
+        [2*(x*y + w*z),     1 - 2*(x**2 + z**2), 2*(y*z - w*x)],
+        [2*(x*z - w*y),     2*(y*z + w*x),     1 - 2*(x**2 + y**2)]
+    ], dtype=float)
+    
+    T = np.eye(4, dtype=float)
+    T[:3, :3] = R
+    T[0, 3] = float(pos[0])
+    T[1, 3] = float(pos[1])
+    T[2, 3] = float(pos[2])
+    
+    return gtsam.Pose3(T)
 
 
 def transform_matrix_to_pose3(T):
-    R = gtsam.Rot3(T[:3, :3])
-    t = gtsam.Point3(float(T[0, 3]), float(T[1, 3]), float(T[2, 3]))
-    return gtsam.Pose3(R, t)
+    # Construct Pose3 directly from 4x4 matrix to avoid Rot3(matrix) issues
+    return gtsam.Pose3(T)
 
 
 def pose3_to_transform_matrix(pose3: gtsam.Pose3):
@@ -69,7 +150,11 @@ def pose3_to_transform_matrix(pose3: gtsam.Pose3):
     t = pose3.translation()
     T = np.eye(4)
     T[:3, :3] = np.array(R)
-    T[:3, 3] = np.array([t.x(), t.y(), t.z()])
+    # Handle both gtsam.Point3 and numpy array
+    if hasattr(t, 'x') and hasattr(t, 'y') and hasattr(t, 'z'):
+        T[:3, 3] = np.array([t.x(), t.y(), t.z()])
+    else:
+        T[:3, 3] = np.array(t).reshape(3)
     return T
 
 
@@ -126,20 +211,29 @@ class GTSAMMapper:
         self.optimized_poses = []  # optimized Pose3 values after ISAM2
 
         # GTSAM containers
+        print('DEBUG: creating gtsam.NonlinearFactorGraph()')
         self.graph = gtsam.NonlinearFactorGraph()
+        print('DEBUG: creating gtsam.Values()')
         self.initial_estimates = gtsam.Values()
+        print('DEBUG: creating gtsam.ISAM2()')
         self.isam = gtsam.ISAM2()
+        print('DEBUG: created isam')
         self.pose_count = 0
 
         # GPS reference (for lat/lon -> local ENU). Set on first gps sample
+        print('DEBUG: setting gps_ref = None')
         self.gps_ref = None
 
         # Map pointcloud (updated after optimization)
+        print('DEBUG: creating o3d.geometry.PointCloud()')
         self.global_map = o3d.geometry.PointCloud()
+        print('DEBUG: created global_map')
 
         # Pre-allocate a prior noise for the first pose (anchors the graph)
-        prior_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([1e-3, 1e-3, 1e-3, 1e-6, 1e-6, 1e-6]))
-        self.prior_noise = prior_noise
+        print('DEBUG: creating prior_noise via gtsam.noiseModel.Isotropic.Sigma (diagonal broken)')
+        # Diagonal.Sigmas is unstable in some gtsam Python builds; use isotropic fallback
+        self.prior_noise = gtsam.noiseModel.Isotropic.Sigma(6, 1e-3)
+        print('DEBUG: set prior_noise (isotropic)')
 
     # ------------------ ICP helpers ------------------
     def _prepare_pcd(self, points_np):
@@ -167,8 +261,9 @@ class GTSAMMapper:
         # rot_sigma and trans_sigma tuned by icp_noise_scale
         rot_sigma = max(0.05, rmse * 0.5) * self.icp_noise_scale
         trans_sigma = max(0.1, rmse * 1.5) * self.icp_noise_scale
-        sigmas = np.array([rot_sigma, rot_sigma, rot_sigma, trans_sigma, trans_sigma, trans_sigma])
-        return gtsam.noiseModel.Diagonal.Sigmas(sigmas)
+        # Diagonal.Sigmas is unreliable in the current gtsam build; fall back to isotropic
+        combined_sigma = float(max(rot_sigma, trans_sigma))
+        return gtsam.noiseModel.Isotropic.Sigma(6, combined_sigma)
 
     # ------------------ Graph helpers ------------------
     def _add_pose_prior(self, key, pose3):
@@ -182,35 +277,51 @@ class GTSAMMapper:
     def _add_gps_prior_on_pose(self, key, gps_pos_world):
         # gps_pos_world is a 3-vector (x,y,z) in the same world frame as AirSim positions
         # Create a Pose3 with GPS translation and identity rotation and add a PriorFactorPose3
-        pose_from_gps = gtsam.Pose3(gtsam.Rot3(), gtsam.Point3(float(gps_pos_world[0]),
-                                                                float(gps_pos_world[1]),
-                                                                float(gps_pos_world[2])))
+        t_gps = np.array([float(gps_pos_world[0]), float(gps_pos_world[1]), float(gps_pos_world[2])])
+        pose_from_gps = gtsam.Pose3(gtsam.Rot3(), t_gps)
         # noise: large rotation sigma (so GPS doesn't constrain orientation), small translation sigma
         rot_sigma = 1e3
         trans_sigma = max(0.3, self.gps_sigma)
-        sigmas = np.array([rot_sigma, rot_sigma, rot_sigma, trans_sigma, trans_sigma, trans_sigma])
-        noise = gtsam.noiseModel.Diagonal.Sigmas(sigmas)
+        # Diagonal.Sigmas unavailable -> use isotropic noise (translation sigma used for all dims)
+        noise = gtsam.noiseModel.Isotropic.Sigma(6, float(trans_sigma))
         self.graph.add(gtsam.PriorFactorPose3(key, pose_from_gps, noise))
 
     # ------------------ Main API ------------------
     def add_scan(self, points_np, airsim_pos=None, airsim_quat=None, gps_data=None):
-        """Add a LIDAR scan (Nx3 numpy array) and optionally fuse GPS.
-
-        airsim_pos: (x,y,z) from getMultirotorState (same frame as lidar usage in other scripts)
-        airsim_quat: (w,x,y,z) orientation from AirSim
-        gps_data: AirSim getGpsData() object (optional)
-        """
+        """Add a LIDAR scan (Nx3 numpy array) and optionally fuse GPS. Imitates basicMapping3D.py, but uses GTSAM for pose graph optimization."""
         if points_np is None or len(points_np) == 0:
             return
 
-        # Prepare downsampled Open3D pointcloud for ICP/map
-        pcd = self._prepare_pcd(points_np)
+        # Transform scan from sensor to world frame using drone position and orientation
+        if airsim_pos is not None and airsim_quat is not None:
+            w, x, y, z = airsim_quat
+            R = np.array([
+                [1 - 2*(y**2 + z**2), 2*(x*y - w*z), 2*(x*z + w*y)],
+                [2*(x*y + w*z), 1 - 2*(x**2 + z**2), 2*(y*z - w*x)],
+                [2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x**2 + y**2)]
+            ])
+            T = np.eye(4)
+            T[:3, :3] = R
+            T[:3, 3] = airsim_pos
+            scan_pcd = o3d.geometry.PointCloud()
+            scan_pcd.points = o3d.utility.Vector3dVector(points_np)
+            scan_pcd.transform(T)
+        else:
+            scan_pcd = o3d.geometry.PointCloud()
+            scan_pcd.points = o3d.utility.Vector3dVector(points_np)
 
-        # Compute a 'gps' position in world frame if provided (lat/lon -> ENU)
+        # Add to global map
+        self.global_map += scan_pcd
+
+        # Downsample to prevent map from growing too large
+        if len(self.global_map.points) > self.max_map_points:
+            self.global_map = self.global_map.voxel_down_sample(self.voxel_size)
+
+        # GTSAM pose graph logic
+        pcd = self._prepare_pcd(points_np)
         gps_pos_world = None
         if gps_data is not None:
             try:
-                # AirSim may provide gnss.geo_point or simple latitude/longitude fields
                 lat = gps_data.gnss.geo_point.latitude
                 lon = gps_data.gnss.geo_point.longitude
                 alt = gps_data.gnss.geo_point.altitude
@@ -218,85 +329,55 @@ class GTSAMMapper:
                 lat = getattr(gps_data, 'latitude', None)
                 lon = getattr(gps_data, 'longitude', None)
                 alt = getattr(gps_data, 'altitude', None)
-
             if lat is not None and lon is not None:
                 if self.gps_ref is None:
-                    # store reference to convert to local ENU
                     self.gps_ref = (float(lat), float(lon), float(alt) if alt is not None else 0.0)
                 ref_lat, ref_lon, ref_alt = self.gps_ref
                 enu = latlon_to_enu(float(lat), float(lon), float(alt or 0.0), ref_lat, ref_lon, ref_alt)
-                # Use AirSim vehicle position sign convention: AirSim world used elsewhere is typically NED
-                # We'll keep everything in ENU for GPS prior; airsim_pos should be consistent (we use airsim_pos if provided)
                 gps_pos_world = enu
-
-        # Fallback: use AirSim position (kinematics_estimated.position) as a coarse global measurement
         if gps_pos_world is None and airsim_pos is not None:
             gps_pos_world = np.array(airsim_pos, dtype=float)
 
-        # New pose key
         key = symbol('x', self.pose_count)
 
         if self.pose_count == 0:
-            # First pose: insert prior (anchor) using airsim_pos/quat if available, else identity
-            if airsim_pos is not None and airsim_quat is not None:
-                init_pose = pose3_from_pos_quat(airsim_pos, airsim_quat)
-            elif gps_pos_world is not None:
-                init_pose = gtsam.Pose3(gtsam.Rot3(), gtsam.Point3(float(gps_pos_world[0]), float(gps_pos_world[1]), float(gps_pos_world[2])))
-            else:
-                init_pose = gtsam.Pose3()  # identity
-
-            self._add_pose_prior(key, init_pose)
-            self.isam.update(self.graph, self.initial_estimates)
-            self.graph = gtsam.NonlinearFactorGraph()
-            self.initial_estimates = gtsam.Values()
-            current_est = self.isam.calculateEstimate()
-
+            # Anchor first pose
+            pose3 = pose3_from_pos_quat(airsim_pos, airsim_quat)
+            self._add_pose_prior(key, pose3)
+            self.scan_poses_initial.append(pose3)
             self.scans.append(pcd)
-            self.scan_poses_initial.append(init_pose)
-            self.optimized_poses.append(current_est.atPose3(key))
+            self.optimized_poses.append(pose3)
             self.pose_count += 1
             return
 
-        # Otherwise, compute ICP between previous scan and current to estimate relative transform
+        # ICP between previous scan and current
         prev_pcd = self.scans[-1]
-        # Use previous optimized pose as initial guess for ICP alignment in world frame
         init_trans = np.eye(4)
         icp_res = self._compute_icp(pcd, prev_pcd, init_trans)
-
         relative_pose = transform_matrix_to_pose3(icp_res.transformation)
-
-        # Add BetweenFactor from previous pose to this pose with noise from ICP
         key_prev = symbol('x', self.pose_count - 1)
-        key_curr = key
         noise = self._icp_noise_from_result(icp_res)
-        self._add_between_factor(key_prev, key_curr, relative_pose, noise)
+        self._add_between_factor(key_prev, key, relative_pose, noise)
 
-        # Add initial estimate for current pose by composing previous optimized pose and ICP relative
-        # Use last optimized pose if available from isam, else use last initial
+        # Compose previous pose and ICP relative
         try:
             current_estimate_values = self.isam.calculateEstimate()
             prev_opt_pose = current_estimate_values.atPose3(key_prev)
         except Exception:
             prev_opt_pose = self.scan_poses_initial[-1]
-
         initial_pose_guess = prev_opt_pose.compose(relative_pose)
-        self.initial_estimates.insert(key_curr, initial_pose_guess)
+        self.initial_estimates.insert(key, initial_pose_guess)
 
-        # Add GPS prior if we have gps_pos_world available
+        # Add GPS prior if available
         if gps_pos_world is not None:
-            # If gps_ref is set (lat/lon converted), gps_pos_world is ENU relative to the ref origin.
-            # If gps_pos_world was taken from airsim_pos fallback, it's in simulator world coords and matches pose units.
-            self._add_gps_prior_on_pose(key_curr, gps_pos_world)
+            self._add_gps_prior_on_pose(key, gps_pos_world)
 
-        # Optional: loop-closure — check against older scans every LC interval
+        # Optional loop-closure
         if (self.pose_count % self.lc_every) == 0:
             for j in range(0, max(0, self.pose_count - self.lc_min_sep)):
-                # skip near neighbors
                 if abs(self.pose_count - j) < self.lc_min_sep:
                     continue
                 candidate_pcd = self.scans[j]
-                # Quick downsample and bounding-box distance check to avoid heavy ICP
-                # Estimate center distance
                 try:
                     est_values = self.isam.calculateEstimate()
                     pose_j = est_values.atPose3(symbol('x', j))
@@ -304,32 +385,30 @@ class GTSAMMapper:
                     pj = pose3_to_transform_matrix(pose_j)
                     pc = pose3_to_transform_matrix(pose_curr)
                     dist = np.linalg.norm(pj[:3, 3] - pc[:3, 3])
-                    if dist > 50.0:  # too far to consider
+                    if dist > 50.0:
                         continue
                 except Exception:
                     pass
-
                 lc_icp = o3d.pipelines.registration.registration_icp(
                     pcd, candidate_pcd, self.icp_max_dist * 1.5, np.eye(4),
                     o3d.pipelines.registration.TransformationEstimationPointToPlane(),
                     o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=60)
                 )
                 if lc_icp.fitness > self.lc_fitness_thresh and lc_icp.inlier_rmse < (self.icp_max_dist * 0.5):
-                    # Good loop closure — add between factor
                     rel_pose_lc = transform_matrix_to_pose3(lc_icp.transformation)
                     noise_lc = self._icp_noise_from_result(lc_icp)
-                    self._add_between_factor(symbol('x', j), key_curr, rel_pose_lc, noise_lc)
+                    self._add_between_factor(symbol('x', j), key, rel_pose_lc, noise_lc)
                     print(f"Loop-closure added between x{j} and x{self.pose_count} (fitness={lc_icp.fitness:.3f}, rmse={lc_icp.inlier_rmse:.3f})")
                     break
 
-        # Update ISAM with the new factors and initial estimate
+        # Update ISAM
         self.isam.update(self.graph, self.initial_estimates)
         self.graph = gtsam.NonlinearFactorGraph()
         self.initial_estimates = gtsam.Values()
 
-        # Retrieve the optimized current pose
+        # Retrieve optimized pose
         current_est = self.isam.calculateEstimate()
-        opt_pose_curr = current_est.atPose3(key_curr)
+        opt_pose_curr = current_est.atPose3(key)
 
         # Store scan and poses
         self.scans.append(pcd)
@@ -435,24 +514,25 @@ def main(args):
     waypoints = [
         (0, 0, -10),
         (10, 0, -10),
-        (10, 10, -10),
-        (0, 10, -10),
         (0, 0, -10),
     ]
 
-    # Open3D visualizer
-    vis = o3d.visualization.Visualizer()
-    vis.create_window(window_name="GTSAM Map (optimized)", width=900, height=600)
-    render_opt = vis.get_render_option()
-    render_opt.background_color = np.array([0.05, 0.05, 0.05])
-    render_opt.point_size = 2.0
+    # No occupancy grid; visualize global point cloud map after mapping
 
     try:
+        import open3d as o3d
+
+        vis = o3d.visualization.Visualizer()
+        vis.create_window(window_name="GTSAM Map", width=800, height=600)
+        vis.add_geometry(mapper.global_map)
+        render_option = vis.get_render_option()
+        render_option.point_size = 3.0
+        render_option.background_color = np.array([0.1, 0.1, 0.1])
+
         for i, wp in enumerate(waypoints):
             print(f"Moving to waypoint {i+1}/{len(waypoints)}: {wp}")
             client.moveToPositionAsync(wp[0], wp[1], wp[2], velocity=3)
 
-            # gather data while moving
             while True:
                 state = client.getMultirotorState()
                 pos = state.kinematics_estimated.position
@@ -462,22 +542,21 @@ def main(args):
 
                 points = get_lidar_scan(client)
                 gps = get_gps_data(client)
-
+                print(f"DEBUG: Lidar scan points shape: {None if points is None else points.shape}")
                 if points is not None and len(points) > 0:
+                    print(f"DEBUG: Lidar scan points sample: {points[:5]}")
                     mapper.add_scan(points, airsim_pos=pos_arr, airsim_quat=quat, gps_data=gps)
+                    global_points = np.asarray(mapper.global_map.points)
+                    print(f"DEBUG: Global map point count after add_scan: {len(global_points)}")
+                    if len(global_points) > 0:
+                        print(f"DEBUG: Global map points sample: {global_points[:5]}")
+                        colors = np.tile(np.array([[1.0, 1.0, 0.0]]), (len(global_points), 1))
+                        mapper.global_map.colors = o3d.utility.Vector3dVector(colors)
+                        vis.clear_geometries()
+                        vis.add_geometry(mapper.global_map)
+                        vis.poll_events()
+                        vis.update_renderer()
 
-                # Re-optimize map and update visualization occasionally
-                if mapper.pose_count % 2 == 0 and mapper.pose_count > 0:
-                    merged = mapper.optimize_and_build_map()
-                    vis.clear_geometries()
-                    vis.add_geometry(merged)
-                    # coordinate frame
-                    coord = o3d.geometry.TriangleMesh.create_coordinate_frame(size=5.0)
-                    vis.add_geometry(coord)
-                    vis.poll_events()
-                    vis.update_renderer()
-
-                # Optional camera overlay
                 if CV2_AVAILABLE:
                     cam_img = get_camera_image(client)
                     if cam_img is not None:
@@ -486,7 +565,6 @@ def main(args):
                         if cv2.waitKey(1) & 0xFF == ord('q'):
                             raise KeyboardInterrupt
 
-                # check reached waypoint
                 dist = np.linalg.norm(pos_arr - np.array([wp[0], wp[1], wp[2]]))
                 if dist < 1.0:
                     break
@@ -496,13 +574,9 @@ def main(args):
         mapper.optimize_and_build_map()
         mapper.save_map(args.output)
 
-        print("Press 'q' in the camera window (if open) to exit; close 3D window to finish")
-        while True:
-            vis.poll_events()
-            vis.update_renderer()
-            if CV2_AVAILABLE and cv2.waitKey(100) & 0xFF == ord('q'):
-                break
-            time.sleep(0.1)
+        print("DEBUG: Mapping complete. Visualization window open.")
+        print("Press 'q' in the Open3D window to exit.")
+        o3d.visualization.draw_geometries([mapper.global_map], window_name="GTSAM Map", width=800, height=600)
 
     except KeyboardInterrupt:
         print("Interrupted by user — saving partial map...")
@@ -510,7 +584,6 @@ def main(args):
         mapper.save_map(args.output.replace('.ply', '_partial.ply'))
 
     finally:
-        vis.destroy_window()
         if CV2_AVAILABLE:
             cv2.destroyAllWindows()
         print("Landing...")
