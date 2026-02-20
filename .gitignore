@@ -4,7 +4,7 @@ aloha_sim_dataset/
 
 # Wandb logs
 wandb/
-
+/airsim_rosbag_1771564476/
 /venv/
 
 # Python cache
@@ -23,3 +23,7 @@ octo_finetuned_checkpoints/
 # IDE
 .vscode/
 .idea/
+airsim_rosbag_*/
+*.db3
+*.ply
+*.npz

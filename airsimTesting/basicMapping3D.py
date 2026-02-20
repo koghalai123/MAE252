@@ -7,6 +7,14 @@ import numpy as np
 import time
 import cv2
 
+# ---------------------- Configuration (edit here) ----------------------
+# Set USE_ROSBAG to True and provide ROSBAG_PATH to replay recorded data
+# instead of connecting to the live Unreal/ AirSim instance.
+USE_ROSBAG = True
+ROSBAG_PATH = 'airsim_rosbag_1771564476'  # e.g. 'recordings/session01' or 'airsim_rosbag_20250...'
+REPLAY_REALTIME = False  # if True, replay will respect original timestamps
+# ----------------------------------------------------------------------
+
 try:
     import open3d as o3d
     OPEN3D_AVAILABLE = True
@@ -144,6 +152,86 @@ def get_camera_image(client):
     return None
 
 
+# ---------------------- rosbag replay helpers ----------------------
+def rosbag_scan_generator(bag_path, realtime=False):
+    """Yield tuples (points Nx3, pos(3,), quat(4,), timestamp)
+    Reads messages from a rosbag2 storage directory written with rosbag2_py.
+    Expects topics: /lidar (sensor_msgs/PointCloud2), /odom (nav_msgs/Odometry), optional /gps/fix.
+    """
+    try:
+        import rclpy
+        from rclpy.serialization import deserialize_message
+        import rosbag2_py
+        from sensor_msgs.msg import PointCloud2, NavSatFix
+        from nav_msgs.msg import Odometry
+    except Exception as e:
+        raise RuntimeError(f"rosbag replay requires ROS2 python packages: {e}")
+
+    # initialize rclpy for deserialization (safe to call multiple times)
+    try:
+        rclpy.init()
+    except Exception:
+        pass
+
+    reader = rosbag2_py.SequentialReader()
+    storage_options = rosbag2_py.StorageOptions(uri=bag_path, storage_id='sqlite3')
+    converter_options = rosbag2_py.ConverterOptions('cdr', 'cdr')
+    reader.open(storage_options, converter_options)
+
+    # topic -> msgclass mapping (only for topics we care about)
+    available = {t.name: t.type for t in reader.get_all_topics_and_types()}
+    has_lidar = '/lidar' in available
+    has_odom = '/odom' in available
+
+    last_pos = None
+    last_quat = None
+    last_ts = None
+
+    while reader.has_next():
+        topic, data, ts_ns = reader.read_next()
+        # topic is a string; ts_ns is int nanoseconds
+        t_sec = float(ts_ns) / 1e9
+
+        if topic == '/odom' and has_odom:
+            msg = deserialize_message(data, Odometry)
+            px = float(msg.pose.pose.position.x)
+            py = float(msg.pose.pose.position.y)
+            pz = float(msg.pose.pose.position.z)
+            last_pos = np.array([px, py, pz], dtype=np.float32)
+            q = msg.pose.pose.orientation
+            last_quat = (float(q.w), float(q.x), float(q.y), float(q.z))
+
+        elif topic == '/lidar' and has_lidar:
+            msg = deserialize_message(data, PointCloud2)
+            # assume x,y,z float32 packed tightly
+            if msg.data and len(msg.data) > 0:
+                pts = np.frombuffer(msg.data, dtype=np.float32)
+                try:
+                    pts = pts.reshape(-1, 3)
+                except Exception:
+                    # fallback: skip malformed
+                    pts = np.zeros((0, 3), dtype=np.float32)
+            else:
+                pts = np.zeros((0, 3), dtype=np.float32)
+
+            # yield using last known odom (may be None)
+            yield pts, (last_pos if last_pos is not None else None), (last_quat if last_quat is not None else None), t_sec
+
+            # real-time pacing
+            if realtime and last_ts is not None:
+                dt = t_sec - last_ts
+                if dt > 0:
+                    time.sleep(dt)
+
+            last_ts = t_sec
+
+    try:
+        rclpy.shutdown()
+    except Exception:
+        pass
+
+
+
 def visualize_mapping(mapper, camera_img=None):
     """Create a visualization combining 3D map and camera view"""
     vis_img = None
@@ -173,26 +261,89 @@ def visualize_mapping(mapper, camera_img=None):
 
 
 def main():
-    # Connect to AirSim
+    # Use in-file configuration (USE_ROSBAG / ROSBAG_PATH / REPLAY_REALTIME)
+    use_rosbag = bool(USE_ROSBAG and ROSBAG_PATH)
+    rosbag_path = ROSBAG_PATH if use_rosbag else None
+    realtime = bool(REPLAY_REALTIME)
+
+    # Create mapper and visualizer (shared for live + bag modes)
+    print("Initializing 3D mapper & visualizer...")
+    mapper = LidarMapper(voxel_size=0.2, max_points=500000)
+
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name="3D Map", width=800, height=600)
+    vis.add_geometry(mapper.global_map)
+
+    # Add coordinate frame
+    coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=5.0)
+    vis.add_geometry(coord_frame)
+
+    render_option = vis.get_render_option()
+    render_option.point_size = 2.0
+    render_option.background_color = np.array([0.1, 0.1, 0.1])
+
+    # If rosbag provided -> playback mode (controlled by in-file CONFIG)
+    if use_rosbag and rosbag_path:
+        print(f"Replaying from rosbag: {rosbag_path} (realtime={realtime})")
+        try:
+            for points, pos_array, quat, ts in rosbag_scan_generator(rosbag_path, realtime=realtime):
+                if points is not None and len(points) > 0:
+                    # provide defaults if pose not present in bag
+                    pos = pos_array if pos_array is not None else np.array([0.0, 0.0, 0.0])
+                    quat_val = quat if quat is not None else (1.0, 0.0, 0.0, 0.0)
+
+                    mapper.add_scan(points, pos, quat_val)
+                    mapper.colorize_by_height()
+
+                    vis.update_geometry(mapper.global_map)
+                    vis.poll_events()
+                    vis.update_renderer()
+
+                # check for user quit during replay
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    break
+
+            print("\nPlayback finished")
+            mapper.save_map("airsim_map_from_rosbag.ply")
+
+        except KeyboardInterrupt:
+            print("\nPlayback interrupted by user")
+            if mapper.scan_count > 0:
+                mapper.save_map("airsim_map_from_rosbag_partial.ply")
+
+        # KEEP VISUALIZATION OPEN until user closes it (do not auto-close)
+        print("\nPlayback complete — visualization will remain open. Press 'q' in camera window to exit...")
+        try:
+            while True:
+                vis.poll_events()
+                vis.update_renderer()
+                key = cv2.waitKey(100) & 0xFF
+                if key == ord('q'):
+                    break
+        except KeyboardInterrupt:
+            pass
+        finally:
+            vis.destroy_window()
+            cv2.destroyAllWindows()
+            return
+
+    # --- otherwise live AirSim mode (original behaviour) ---
     print("Connecting to AirSim...")
     client = airsim.MultirotorClient()
     client.confirmConnection()
     print("Connected!")
-    
+
     # Enable API control
     client.enableApiControl(True)
     client.armDisarm(True)
     time.sleep(1)
-    
-    # Create mapper
-    print("Initializing 3D mapper...")
-    mapper = LidarMapper(voxel_size=0.2, max_points=500000)
-    
+
     # Takeoff
     print("Taking off...")
     client.takeoffAsync().join()
     time.sleep(2)
-    
+
     # Define flight path for mapping
     waypoints = [
         (0, 0, -10),
@@ -203,88 +354,75 @@ def main():
         (5, 5, -15),  # Go higher for different perspective
         (0, 0, -10),
     ]
-    
+
     print("Starting 3D mapping flight...")
     print("Building map from lidar scans...")
     print("Press 'q' in camera view to stop early")
-    
-    # Create Open3D visualizer (non-blocking)
-    vis = o3d.visualization.Visualizer()
-    vis.create_window(window_name="3D Map", width=800, height=600)
-    vis.add_geometry(mapper.global_map)
-    
-    # Add coordinate frame
-    coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=5.0)
-    vis.add_geometry(coord_frame)
-    
-    render_option = vis.get_render_option()
-    render_option.point_size = 2.0
-    render_option.background_color = np.array([0.1, 0.1, 0.1])
-    
+
     try:
         for i, waypoint in enumerate(waypoints):
             print(f"\nWaypoint {i+1}/{len(waypoints)}: {waypoint}")
-            
+
             # Move to waypoint
             client.moveToPositionAsync(
                 waypoint[0], waypoint[1], waypoint[2],
                 velocity=3
             )
-            
+
             # Collect scans while moving
             while True:
                 # Get drone state
                 state = client.getMultirotorState()
                 position = state.kinematics_estimated.position
                 pos_array = np.array([position.x_val, position.y_val, position.z_val])
-                
+
                 orientation = state.kinematics_estimated.orientation
-                quat = np.array([orientation.w_val, orientation.x_val, 
-                               orientation.y_val, orientation.z_val])
-                
+                quat = np.array([orientation.w_val, orientation.x_val,
+                                 orientation.y_val, orientation.z_val])
+
                 # Get lidar scan
                 points = get_lidar_scan(client)
                 if points is not None and len(points) > 0:
                     mapper.add_scan(points, pos_array, quat)
-                    
+
                     # Update colors
                     mapper.colorize_by_height()
-                    
+
                     # Update visualization
                     vis.update_geometry(mapper.global_map)
                     vis.poll_events()
                     vis.update_renderer()
-                
+
                 # Show camera view
                 camera_img = get_camera_image(client)
                 if camera_img is not None:
                     vis_img = visualize_mapping(mapper, camera_img)
                     cv2.imshow("Camera + Mapping Info", vis_img)
-                
+
                 # Check if reached waypoint
                 distance = np.sqrt(
-                    (position.x_val - waypoint[0])**2 + 
-                    (position.y_val - waypoint[1])**2 + 
+                    (position.x_val - waypoint[0])**2 +
+                    (position.y_val - waypoint[1])**2 +
                     (position.z_val - waypoint[2])**2
                 )
-                
+
                 if distance < 1.0:
                     break
-                
+
                 # Check for quit
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):
                     raise KeyboardInterrupt
-                
+
                 time.sleep(0.1)  # 10Hz scan rate
-        
+
         print("\nMapping complete!")
         print(f"Total points in map: {len(mapper.global_map.points):,}")
         print(f"Total scans collected: {mapper.scan_count}")
-        
+
         # Save map
         mapper.save_map("airsim_map.ply")
-        
+
         # Keep visualization open
         print("\nVisualization windows open.")
         print("Press 'q' in camera window to exit...")
@@ -294,22 +432,21 @@ def main():
                 break
             vis.poll_events()
             vis.update_renderer()
-    
+
     except KeyboardInterrupt:
         print("\nMapping interrupted by user")
         if mapper.scan_count > 0:
             mapper.save_map("airsim_map_partial.ply")
-    
+
     finally:
         print("\nLanding...")
         client.landAsync().join()
         client.armDisarm(False)
         client.enableApiControl(False)
-        
+
         vis.destroy_window()
         cv2.destroyAllWindows()
         print("Done!")
-
 
 if __name__ == "__main__":
     main()
