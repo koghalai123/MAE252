@@ -10,7 +10,7 @@ import cv2
 # ---------------------- Configuration (edit here) ----------------------
 # Set USE_ROSBAG to True and provide ROSBAG_PATH to replay recorded data
 # instead of connecting to the live Unreal/ AirSim instance.
-USE_ROSBAG = True
+USE_ROSBAG = False
 ROSBAG_PATH = 'airsim_rosbag_1771564476'  # e.g. 'recordings/session01' or 'airsim_rosbag_20250...'
 REPLAY_REALTIME = False  # if True, replay will respect original timestamps
 # ----------------------------------------------------------------------

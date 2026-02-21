@@ -86,6 +86,12 @@ Install examples:
 Run while AirSim is running (example):
   python GTSAMMapping.py
 
+You can also replay previously recorded data from a rosbag2 storage directory instead
+of using live AirSim by setting the configuration variables near the bottom of this file:
+  USE_ROSBAG = True
+  ROSBAG_PATH = "/path/to/rosbag2_directory"
+  ROSBAG_REALTIME = True   # optional, throttle to original timing
+
 """
 
 import time
@@ -121,23 +127,10 @@ def pose3_from_pos_quat(pos, quat):
     print('DEBUG pose3_from_pos_quat: pos(type,width)=', type(pos), getattr(pos, 'shape', None), 'quat(type)=', type(quat))
     print('DEBUG pose3_from_pos_quat values (trim):', None if pos is None else np.array(pos).tolist()[:3], None if quat is None else list(quat)[:4])
     
-    # Construct 4x4 matrix directly to avoid Rot3 constructor crashes
     w, x, y, z = float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])
-    
-    # Rotation matrix from quaternion
-    R = np.array([
-        [1 - 2*(y**2 + z**2), 2*(x*y - w*z),     2*(x*z + w*y)],
-        [2*(x*y + w*z),     1 - 2*(x**2 + z**2), 2*(y*z - w*x)],
-        [2*(x*z - w*y),     2*(y*z + w*x),     1 - 2*(x**2 + y**2)]
-    ], dtype=float)
-    
-    T = np.eye(4, dtype=float)
-    T[:3, :3] = R
-    T[0, 3] = float(pos[0])
-    T[1, 3] = float(pos[1])
-    T[2, 3] = float(pos[2])
-    
-    return gtsam.Pose3(T)
+    rotation = gtsam.Rot3.Quaternion(w, x, y, z)
+    translation = gtsam.Point3(float(pos[0]), float(pos[1]), float(pos[2]))
+    return gtsam.Pose3(rotation, translation)
 
 
 def transform_matrix_to_pose3(T):
@@ -192,7 +185,9 @@ class GTSAMMapper:
                  loop_closure_search_every=10,
                  loop_closure_min_index_separation=15,
                  loop_closure_fitness_threshold=0.2,
-                 max_map_points=800000):
+                 max_map_points=800000,
+                 use_icp=True):
+        self.use_icp = use_icp
         self.voxel_size = voxel_size
         self.icp_max_dist = icp_max_dist
         self.gps_sigma = gps_sigma
@@ -209,6 +204,7 @@ class GTSAMMapper:
         self.scans = []            # list of raw Open3D pointclouds (downsampled)
         self.scan_poses_initial = []  # initial (pre-opt) Pose3 for each scan
         self.optimized_poses = []  # optimized Pose3 values after ISAM2
+        self.raw_pose_matrices = []  # 4x4 drone world-pose matrix per scan, for ICP init
 
         # GTSAM containers
         print('DEBUG: creating gtsam.NonlinearFactorGraph()')
@@ -276,15 +272,10 @@ class GTSAMMapper:
 
     def _add_gps_prior_on_pose(self, key, gps_pos_world):
         # gps_pos_world is a 3-vector (x,y,z) in the same world frame as AirSim positions
-        # Create a Pose3 with GPS translation and identity rotation and add a PriorFactorPose3
-        t_gps = np.array([float(gps_pos_world[0]), float(gps_pos_world[1]), float(gps_pos_world[2])])
-        pose_from_gps = gtsam.Pose3(gtsam.Rot3(), t_gps)
-        # noise: large rotation sigma (so GPS doesn't constrain orientation), small translation sigma
-        rot_sigma = 1e3
-        trans_sigma = max(0.3, self.gps_sigma)
-        # Diagonal.Sigmas unavailable -> use isotropic noise (translation sigma used for all dims)
-        noise = gtsam.noiseModel.Isotropic.Sigma(6, float(trans_sigma))
-        self.graph.add(gtsam.PriorFactorPose3(key, pose_from_gps, noise))
+        # Use a GPSFactor, which is a unary factor on the translation part of a Pose3
+        gps_point = gtsam.Point3(float(gps_pos_world[0]), float(gps_pos_world[1]), float(gps_pos_world[2]))
+        gps_noise = gtsam.noiseModel.Isotropic.Sigma(3, self.gps_sigma)
+        self.graph.add(gtsam.GPSFactor(key, gps_point, gps_noise))
 
     # ------------------ Main API ------------------
     def add_scan(self, points_np, airsim_pos=None, airsim_quat=None, gps_data=None):
@@ -341,31 +332,52 @@ class GTSAMMapper:
         key = symbol('x', self.pose_count)
 
         if self.pose_count == 0:
-            # Anchor first pose
+            # Anchor first pose — requires valid pose data
+            if airsim_pos is None or airsim_quat is None:
+                return
             pose3 = pose3_from_pos_quat(airsim_pos, airsim_quat)
             self._add_pose_prior(key, pose3)
             self.scan_poses_initial.append(pose3)
             self.scans.append(pcd)
             self.optimized_poses.append(pose3)
+            self.raw_pose_matrices.append(pose3_to_transform_matrix(pose3))
             self.pose_count += 1
             return
 
-        # ICP between previous scan and current
-        prev_pcd = self.scans[-1]
-        init_trans = np.eye(4)
-        icp_res = self._compute_icp(pcd, prev_pcd, init_trans)
-        relative_pose = transform_matrix_to_pose3(icp_res.transformation)
+        # Compute relative pose and initial guess — either via ICP or pure odometry
         key_prev = symbol('x', self.pose_count - 1)
-        noise = self._icp_noise_from_result(icp_res)
-        self._add_between_factor(key_prev, key, relative_pose, noise)
 
-        # Compose previous pose and ICP relative
-        try:
-            current_estimate_values = self.isam.calculateEstimate()
-            prev_opt_pose = current_estimate_values.atPose3(key_prev)
-        except Exception:
-            prev_opt_pose = self.scan_poses_initial[-1]
-        initial_pose_guess = prev_opt_pose.compose(relative_pose)
+        if airsim_pos is not None and airsim_quat is not None:
+            T_curr = pose3_to_transform_matrix(pose3_from_pos_quat(airsim_pos, airsim_quat))
+        else:
+            T_curr = None
+
+        if self.use_icp:
+            prev_pcd = self.scans[-1]
+            init_trans = np.linalg.inv(self.raw_pose_matrices[-1]) @ T_curr if T_curr is not None else np.eye(4)
+            icp_res = self._compute_icp(pcd, prev_pcd, init_trans)
+            relative_pose = transform_matrix_to_pose3(icp_res.transformation)
+            noise = self._icp_noise_from_result(icp_res)
+            # Compose previous optimized pose with ICP relative for initial estimate
+            try:
+                prev_opt_pose = self.isam.calculateEstimate().atPose3(key_prev)
+            except Exception:
+                prev_opt_pose = self.scan_poses_initial[-1]
+            initial_pose_guess = prev_opt_pose.compose(relative_pose)
+        else:
+            # Odometry-only: derive relative pose directly from consecutive drone poses
+            if T_curr is not None:
+                rel_T = np.linalg.inv(self.raw_pose_matrices[-1]) @ T_curr
+                relative_pose = transform_matrix_to_pose3(rel_T)
+                initial_pose_guess = transform_matrix_to_pose3(T_curr)
+            else:
+                # No odometry available for this scan; hold last pose
+                relative_pose = transform_matrix_to_pose3(np.eye(4))
+                initial_pose_guess = self.scan_poses_initial[-1]
+            noise = gtsam.noiseModel.Isotropic.Sigma(6, 1e-3)
+            icp_res = None
+
+        self._add_between_factor(key_prev, key, relative_pose, noise)
         self.initial_estimates.insert(key, initial_pose_guess)
 
         # Add GPS prior if available
@@ -389,6 +401,12 @@ class GTSAMMapper:
                         continue
                 except Exception:
                     pass
+
+                # Estimate normals for PointToPlane ICP
+                radius = max(self.voxel_size * 2.0, 0.5)
+                pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=30))
+                candidate_pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=30))
+
                 lc_icp = o3d.pipelines.registration.registration_icp(
                     pcd, candidate_pcd, self.icp_max_dist * 1.5, np.eye(4),
                     o3d.pipelines.registration.TransformationEstimationPointToPlane(),
@@ -414,6 +432,12 @@ class GTSAMMapper:
         self.scans.append(pcd)
         self.scan_poses_initial.append(initial_pose_guess)
         self.optimized_poses.append(opt_pose_curr)
+        if T_curr is not None:
+            self.raw_pose_matrices.append(T_curr)
+        elif icp_res is not None:
+            self.raw_pose_matrices.append(self.raw_pose_matrices[-1] @ icp_res.transformation)
+        else:
+            self.raw_pose_matrices.append(self.raw_pose_matrices[-1])
         self.pose_count += 1
 
     def optimize_and_build_map(self, downsample_voxel=None):
@@ -487,9 +511,140 @@ def get_camera_image(client):
         return None
 
 
+# ---------------------- rosbag replay helpers ----------------------
+
+def rosbag_scan_generator(bag_path, realtime=False):
+    """Yield tuples (points Nx3, pos(3,), quat(4,), timestamp, gps_object).
+    Reads messages from a rosbag2 storage directory written with rosbag2_py.
+    Expects topics: /lidar (sensor_msgs/PointCloud2), /odom (nav_msgs/Odometry),
+    optional /gps/fix (sensor_msgs/NavSatFix). GPS messages are converted to a
+    minimal object implementing ``latitude``, ``longitude`` and ``altitude``
+    attributes so that :py:meth:`GTSAMMapper.add_scan` can handle them.
+    """
+    try:
+        import rclpy
+        from rclpy.serialization import deserialize_message
+        import rosbag2_py
+        from sensor_msgs.msg import PointCloud2, NavSatFix
+        from nav_msgs.msg import Odometry
+    except Exception as e:
+        raise RuntimeError(f"rosbag replay requires ROS2 python packages: {e}")
+
+    # simple helper class for GPS data
+    class _BagGPS:
+        def __init__(self, lat, lon, alt):
+            self.latitude = float(lat)
+            self.longitude = float(lon)
+            self.altitude = float(alt)
+
+    # initialize rclpy for deserialization (safe to call multiple times)
+    try:
+        rclpy.init()
+    except Exception:
+        pass
+
+    reader = rosbag2_py.SequentialReader()
+    storage_options = rosbag2_py.StorageOptions(uri=bag_path, storage_id='sqlite3')
+    converter_options = rosbag2_py.ConverterOptions('cdr', 'cdr')
+    reader.open(storage_options, converter_options)
+
+    available = {t.name: t.type for t in reader.get_all_topics_and_types()}
+    has_lidar = '/lidar' in available
+    has_odom = '/odom' in available
+    has_gps = '/gps/fix' in available
+
+    last_pos = None
+    last_quat = None
+    last_gps = None
+    last_ts = None
+
+    while reader.has_next():
+        topic, data, ts_ns = reader.read_next()
+        t_sec = float(ts_ns) / 1e9
+
+        if topic == '/odom' and has_odom:
+            msg = deserialize_message(data, Odometry)
+            px = float(msg.pose.pose.position.x)
+            py = float(msg.pose.pose.position.y)
+            pz = float(msg.pose.pose.position.z)
+            last_pos = np.array([px, py, pz], dtype=np.float32)
+            q = msg.pose.pose.orientation
+            last_quat = (float(q.w), float(q.x), float(q.y), float(q.z))
+
+        elif topic == '/gps/fix' and has_gps:
+            msg = deserialize_message(data, NavSatFix)
+            last_gps = _BagGPS(msg.latitude, msg.longitude, msg.altitude)
+
+        elif topic == '/lidar' and has_lidar:
+            msg = deserialize_message(data, PointCloud2)
+            if msg.data and len(msg.data) > 0:
+                pts = np.frombuffer(msg.data, dtype=np.float32)
+                try:
+                    pts = pts.reshape(-1, 3)
+                except Exception:
+                    pts = np.zeros((0, 3), dtype=np.float32)
+            else:
+                pts = np.zeros((0, 3), dtype=np.float32)
+
+            # yield using last known odom/gps (may be None)
+            yield pts, last_pos, last_quat, t_sec, last_gps
+
+            if realtime and last_ts is not None:
+                dt = t_sec - last_ts
+                if dt > 0:
+                    time.sleep(dt)
+
+            last_ts = t_sec
+
+    try:
+        rclpy.shutdown()
+    except Exception:
+        pass
+
+
+# ---------------------- Configuration Variables ----------------------
+# Set USE_ROSBAG to True to replay from a rosbag instead of live AirSim.
+# When True, ROSBAG_PATH must point to a valid rosbag2 storage directory.
+
+USE_ROSBAG = True
+ROSBAG_PATH = 'airsim_rosbag_1771706695'
+ROSBAG_REALTIME = False
+USE_ICP = False  # Set False to skip ICP and use GPS/odometry poses directly
 # --------------------------- Main script ---------------------------------
 
 def main(args):
+    # decide between live AirSim mode and rosbag playback
+    rosbag_path = ROSBAG_PATH if USE_ROSBAG else None
+    rosbag_realtime = ROSBAG_REALTIME if USE_ROSBAG else False
+
+    if rosbag_path:
+        # playback mode: read scans from rosbag and feed them into mapper
+        print(f"Replaying from rosbag: {rosbag_path} (realtime={rosbag_realtime})")
+        use_icp = not args.no_icp and USE_ICP
+        print(f"Scan matching mode: {'ICP' if use_icp else 'odometry-only'}")
+        mapper = GTSAMMapper(voxel_size=args.voxel_size,
+                             icp_max_dist=args.icp_max_distance,
+                             gps_sigma=args.gps_sigma,
+                             icp_noise_scale=args.icp_noise_scale,
+                             loop_closure_search_every=args.lc_every,
+                             loop_closure_min_index_separation=args.lc_min_sep,
+                             loop_closure_fitness_threshold=args.lc_fitness_thresh,
+                             max_map_points=args.max_map_points,
+                             use_icp=use_icp)
+        try:
+            for points, pos_arr, quat, ts, gps in rosbag_scan_generator(rosbag_path, realtime=rosbag_realtime):
+                if points is not None and len(points) > 0:
+                    mapper.add_scan(points, airsim_pos=pos_arr, airsim_quat=quat, gps_data=gps)
+            print("Rosbag playback finished; optimizing map")
+        except KeyboardInterrupt:
+            print("Interrupted during playback; optimizing partial map")
+
+        final_map = mapper.optimize_and_build_map()
+        print(f"Map contains {len(final_map.points):,} points — opening visualization")
+        o3d.visualization.draw_geometries([final_map], window_name="GTSAM Map", width=800, height=600)
+        return
+
+    # --- live AirSim mode ---
     print("Connecting to AirSim...")
     client = airsim.MultirotorClient()
     client.confirmConnection()
@@ -520,8 +675,6 @@ def main(args):
     # No occupancy grid; visualize global point cloud map after mapping
 
     try:
-        import open3d as o3d
-
         vis = o3d.visualization.Visualizer()
         vis.create_window(window_name="GTSAM Map", width=800, height=600)
         vis.add_geometry(mapper.global_map)
@@ -603,5 +756,7 @@ if __name__ == '__main__':
     parser.add_argument('--lc-fitness-thresh', type=float, default=0.25)
     parser.add_argument('--max-map-points', type=int, default=800000)
     parser.add_argument('--output', type=str, default='gtsam_map.ply')
+    parser.add_argument('--no-icp', action='store_true', default=False,
+                        help='Skip ICP; place scans using GPS/odometry poses only')
     args = parser.parse_args()
     main(args)
