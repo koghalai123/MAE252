@@ -1,22 +1,43 @@
 #!/usr/bin/env python3
 """SLAM pipeline — GTSAM pose-graph + deferred OctoMap + swappable registration.
 
-Combines:
-  - Frame-to-map registration (default: GICP, swappable via REGISTRATION)
-  - GTSAM iSAM2 pose-graph optimisation with between-factors + GPS priors
-  - Deferred OctoMap: fast voxel hash grid during live operation, OctoMap
-    built once at the end for .bt file export (~100x faster than Bayesian)
-  - Submap architecture: local voxel stores in anchor-keyframe coordinates;
-    after pose correction only anchor-to-world transforms are updated
+Object-oriented design for both **replay** and **live AirSim** mapping.
 
-Replay mode only — reads flight_recordings/ directories.
+Core class:
+    SLAMPipeline  — source-agnostic.  Feed it frames via ``process_frame()``
+                     and it handles registration, pose-graph optimisation,
+                     submap management, and visualisation.
 
-Usage:
-    python finalMapping.py                          # latest recording
-    python finalMapping.py /path/to/flight_dir      # explicit directory
+Adapters:
+    ReplaySLAM    — reads flight_recordings/ directories, feeds SLAMPipeline.
+    LiveSLAM      — connects to AirSim, grabs LiDAR + pose in real time.
+
+Usage (replay):
+    python finalMappingPipeline.py                       # latest recording
+    python finalMappingPipeline.py /path/to/flight_dir   # explicit directory
+
+Usage (live — from another script):
+    from finalMappingPipeline import SLAMPipeline, SLAMConfig, LiveSLAM
+    live = LiveSLAM(SLAMConfig(registration="vgicp"))
+    live.run()          # blocking — Ctrl+C to stop
+
+Usage (embed in your own loop):
+    from finalMappingPipeline import SLAMPipeline, SLAMConfig
+    cfg  = SLAMConfig(registration="vgicp", octo_resolution=0.15)
+    slam = SLAMPipeline(cfg)
+    slam.start_viewer()
+    for pts, pos, ori, gps in my_data_source():
+        slam.process_frame(pts, pos, ori, gps=gps)
+    slam.save_octomap("map.bt")
+    slam.print_summary()
 """
 
+from __future__ import annotations
+
 import os, sys, glob, time
+from dataclasses import dataclass, field
+from typing import Callable, Optional
+
 import numpy as np
 import open3d as o3d
 import pyoctomap
@@ -24,9 +45,6 @@ import gtsam
 from gtsam import symbol
 from scipy.spatial.transform import Rotation
 from sensorFeed import Viewer3D
-import matplotlib
-matplotlib.use("TkAgg")
-import matplotlib.pyplot as plt
 
 from RegistrationComparison import (
     get_register_fn, resolve_recording_dir, filter_valid, xform_pts,
@@ -34,37 +52,50 @@ from RegistrationComparison import (
     ICP_VOXEL, NORM_NN, LOCAL_R, MIN_VOXELS,
 )
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-# Configuration
+# Configuration dataclass
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Registration algorithm: "gicp" | "small_gicp" | "vgicp" | "kiss_icp" | "icp" | "fpfh_ransac" | "ndt" | "state_only"
-REGISTRATION = "vgicp"
+@dataclass
+class SLAMConfig:
+    """All tuneable knobs for the SLAM pipeline."""
 
-# Recording
-RECORDING_DIR = ""           # empty → latest in flight_recordings/
-MAX_FRAMES    = 0            # 0 = all
-FRAME_SKIP    = 3            # process every Nth frame
+    # Registration algorithm
+    # "gicp" | "small_gicp" | "vgicp" | "kiss_icp" | "icp" | "fpfh_ransac" | "ndt" | "state_only"
+    registration: str = "vgicp"
 
-# OctoMap / voxel grid
-OCTO_RESOLUTION   = 0.15     # leaf voxel size (m)
-OCTO_INSERT_VOXEL = 0.15     # downsample before submap insertion (0 = skip)
+    # OctoMap / voxel grid
+    octo_resolution: float   = 0.15   # leaf voxel size (m)
+    octo_insert_voxel: float = 0.15   # downsample before submap insertion (0 = skip)
 
-# Submaps
-SUBMAP_FRAMES  = 10          # frames per submap
+    # Submaps
+    submap_frames: int = 10           # frames per submap
 
-# Registration outlier rejection
-REJECT_OUTLIERS     = True
-REJECT_WARMUP       = 4      # frames before rejection kicks in
-REJECT_RMSE_CI      = 0.80   # confidence level for RMSE jump detection
-REJECT_ROT_CI       = 0.0    # confidence level for rotation jump detection
+    # Registration outlier rejection
+    reject_outliers: bool  = True
+    reject_warmup: int     = 4
+    reject_rmse_ci: float  = 0.80
+    reject_rot_ci: float   = 0.0
 
-# Registration target cropping
-REG_LOCAL_RADIUS    = 40.0   # crop target cloud to this radius around drone (m, 0 = no crop)
+    # Registration target cropping
+    reg_local_radius: float = 40.0    # crop target cloud to this radius (m, 0 = no crop)
 
-# GTSAM
-GPS_SIGMA           = 1.0    # GPS position noise (m) — lower = trust GPS more
-ICP_NOISE_SCALE     = 1.0    # multiplier on ICP-derived noise model
+    # GTSAM noise
+    gps_sigma: float       = 1.0     # GPS position noise (m)
+    icp_noise_scale: float = 1.0     # multiplier on ICP-derived noise model
+
+    # Visualisation
+    enable_viewer: bool = True
+    vis_buffer_size: int = 2_000_000
+
+    # Replay-specific
+    recording_dir: str = ""
+    max_frames: int    = 0            # 0 = all
+    frame_skip: int    = 3
+
+    # Live-specific
+    live_max_hz: float = 4.0         # max sensor polling rate
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -72,11 +103,7 @@ ICP_NOISE_SCALE     = 1.0    # multiplier on ICP-derived noise model
 # ══════════════════════════════════════════════════════════════════════════════
 
 class VoxelHashGrid:
-    """O(1)-insert voxel grid backed by a Python set of integer keys.
-
-    Points are quantised to a regular grid; the set gives instant dedup.
-    No raycasting, no tree traversal — just hash operations.
-    """
+    """O(1)-insert voxel grid backed by a Python set of integer keys."""
 
     __slots__ = ('resolution', 'inv_res', 'half_res', 'keys')
 
@@ -87,14 +114,12 @@ class VoxelHashGrid:
         self.keys: set  = set()
 
     def insert_points(self, pts: np.ndarray):
-        """Add points to the grid.  O(n) in number of input points."""
         if len(pts) == 0:
             return
         ijk = np.floor(np.asarray(pts) * self.inv_res).astype(np.int64)
         self.keys.update(map(tuple, ijk))
 
     def get_centers(self) -> np.ndarray:
-        """Return occupied voxel centres as Nx3 float64."""
         if not self.keys:
             return np.empty((0, 3), dtype=np.float64)
         arr = np.array(list(self.keys), dtype=np.float64)
@@ -103,8 +128,7 @@ class VoxelHashGrid:
     def size(self) -> int:
         return len(self.keys)
 
-    def memoryUsage(self) -> int:
-        """Rough byte estimate."""
+    def memory_usage(self) -> int:
         return len(self.keys) * 120
 
 
@@ -120,7 +144,7 @@ class Submap:
     """
 
     def __init__(self, anchor_index: int, anchor_T: np.ndarray,
-                 resolution: float = OCTO_RESOLUTION):
+                 resolution: float):
         self.anchor_index = anchor_index
         self.anchor_T     = anchor_T.copy()
         self.resolution   = resolution
@@ -135,34 +159,21 @@ class Submap:
         return apply_T(world_pts, self._T_inv)
 
     def insert(self, world_pts: np.ndarray):
-        """Insert a scan (world-frame) into the local voxel grid."""
         local_pts = self._to_local(world_pts).astype(np.float64)
         self.grid.insert_points(local_pts)
 
-    def get_world_points(self, updated_T: np.ndarray | None = None
-                         ) -> np.ndarray:
-        """Return occupied voxel centres in the world frame."""
+    def get_world_points(self, updated_T: np.ndarray | None = None) -> np.ndarray:
         occ = self.grid.get_centers()
         if len(occ) == 0:
             return np.empty((0, 3), dtype=np.float64)
         T = updated_T if updated_T is not None else self.anchor_T
         return apply_T(occ, T)
 
-    def memoryUsage(self) -> int:
-        return self.grid.memoryUsage()
+    def memory_usage(self) -> int:
+        return self.grid.memory_usage()
 
     def node_count(self) -> int:
         return self.grid.size()
-
-
-def _downsample_for_insert(pts: np.ndarray) -> np.ndarray:
-    """Voxel-downsample points before submap insertion for speed."""
-    if OCTO_INSERT_VOXEL <= 0:
-        return pts
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
-    pcd = pcd.voxel_down_sample(OCTO_INSERT_VOXEL)
-    return np.asarray(pcd.points)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -170,7 +181,6 @@ def _downsample_for_insert(pts: np.ndarray) -> np.ndarray:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def pose3_from_pos_quat(pos, quat_wxyz):
-    """Build a gtsam.Pose3 from a position vector and w-x-y-z quaternion."""
     w, x, y, z = (float(quat_wxyz[0]), float(quat_wxyz[1]),
                    float(quat_wxyz[2]), float(quat_wxyz[3]))
     return gtsam.Pose3(gtsam.Rot3.Quaternion(w, x, y, z),
@@ -178,22 +188,19 @@ def pose3_from_pos_quat(pos, quat_wxyz):
 
 
 def pose3_to_T(p: gtsam.Pose3) -> np.ndarray:
-    """Convert a gtsam.Pose3 to a 4x4 homogeneous transform matrix."""
     T = np.eye(4)
     T[:3, :3] = p.rotation().matrix()
-    T[:3, 3] = np.array(p.translation()).reshape(3)
+    T[:3, 3]  = np.array(p.translation()).reshape(3)
     return T
 
 
 def T_to_pose3(T: np.ndarray) -> gtsam.Pose3:
-    """Convert a 4x4 homogeneous transform to a gtsam.Pose3."""
     return gtsam.Pose3(T)
 
 
-def _icp_noise(rmse):
-    """Build an isotropic noise model scaled from registration RMSE."""
-    rot_s = max(0.05, rmse * 0.5) * ICP_NOISE_SCALE
-    tra_s = max(0.10, rmse * 1.5) * ICP_NOISE_SCALE
+def _icp_noise(rmse: float, scale: float = 1.0):
+    rot_s = max(0.05, rmse * 0.5) * scale
+    tra_s = max(0.10, rmse * 1.5) * scale
     sigma = float(max(rot_s, tra_s))
     return gtsam.noiseModel.Isotropic.Sigma(6, sigma)
 
@@ -203,20 +210,10 @@ def _icp_noise(rmse):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class RegistrationOutlierDetector:
-    """Detect bad registrations via confidence-interval spike detection.
+    """Detect bad registrations via confidence-interval spike detection."""
 
-    Maintains a running history of RMSE and rotation-correction magnitudes.
-    A frame is flagged as an outlier when:
-      1. Its RMSE exceeds the upper bound of a *rmse_ci* confidence interval
-      2. Its rotation correction exceeds the upper bound of a *rot_ci* CI
-
-    Both conditions must be true simultaneously.
-    The detector is dormant for the first *warmup* accepted frames.
-    """
-
-    def __init__(self, warmup: int = REJECT_WARMUP,
-                 rmse_ci: float = REJECT_RMSE_CI,
-                 rot_ci: float = REJECT_ROT_CI):
+    def __init__(self, warmup: int = 4, rmse_ci: float = 0.80,
+                 rot_ci: float = 0.0):
         self.warmup  = max(3, warmup)
         self.rmse_ci = rmse_ci
         self.rot_ci  = rot_ci
@@ -226,38 +223,25 @@ class RegistrationOutlierDetector:
 
     @staticmethod
     def _z(ci: float) -> float:
-        """One-sided z-score for a given confidence level."""
         from scipy.stats import norm
         return float(norm.ppf((1.0 + ci) / 2.0))
 
     def check(self, rmse: float, dr_mag: float) -> tuple[bool, str]:
-        """Return (is_outlier, reason_string).
-
-        If the frame is *not* an outlier the caller should pass it to
-        ``accept()`` so it enters the running statistics.
-        """
         if rmse == 0.0:
             return False, ""
-
         n = len(self._rmse_hist)
         if n < self.warmup:
             return False, ""
-
         rmse_arr = np.array(self._rmse_hist)
         rot_arr  = np.array(self._rot_hist)
-
         rmse_mean, rmse_std = float(rmse_arr.mean()), float(rmse_arr.std(ddof=1))
         rot_mean,  rot_std  = float(rot_arr.mean()),  float(rot_arr.std(ddof=1))
-
         z_rmse = self._z(self.rmse_ci)
         z_rot  = self._z(self.rot_ci)
-
         rmse_thresh = rmse_mean + z_rmse * rmse_std
         rot_thresh  = rot_mean  + z_rot  * rot_std
-
         rmse_bad = rmse > rmse_thresh
         rot_bad  = dr_mag > rot_thresh
-
         if rmse_bad and rot_bad:
             reason = (f"RMSE {rmse:.4f} > {rmse_thresh:.4f} "
                       f"({self.rmse_ci*100:.0f}% CI, \u03bc={rmse_mean:.4f} \u03c3={rmse_std:.4f}) "
@@ -265,21 +249,14 @@ class RegistrationOutlierDetector:
                       f"({self.rot_ci*100:.0f}% CI, \u03bc={rot_mean:.2f} \u03c3={rot_std:.2f})")
             self.rejected_count += 1
             return True, reason
-
         return False, ""
 
     def accept(self, rmse: float, dr_mag: float):
-        """Record an accepted frame's metrics into the running history."""
         if rmse > 0:
             self._rmse_hist.append(rmse)
             self._rot_hist.append(dr_mag)
 
     def p_values(self, rmse: float, dr_mag: float) -> tuple[float, float]:
-        """Return (p_rmse, p_rot) — upper-tail probabilities.
-
-        p = P(X >= observed) under the running normal model.
-        Returns (1.0, 1.0) during warmup (no evidence of outlier).
-        """
         from scipy.stats import norm
         n = len(self._rmse_hist)
         if n < self.warmup or rmse == 0.0:
@@ -300,272 +277,223 @@ class RegistrationOutlierDetector:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Replay pipeline
+# SLAMPipeline — core engine (source-agnostic)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_replay(recording_dir: str = ""):
-    recording_dir = resolve_recording_dir(recording_dir)
-    all_frames = sorted(glob.glob(os.path.join(recording_dir, "frame_*.npz")))
-    if not all_frames:
-        print(f"No frames in {recording_dir}"); return
+class SLAMPipeline:
+    """GTSAM pose-graph SLAM with submap-based voxel storage.
 
-    frames = all_frames[::FRAME_SKIP]
-    if MAX_FRAMES > 0:
-        frames = frames[:MAX_FRAMES]
+    Feed frames one at a time via ``process_frame()``.  The pipeline handles:
+      - Frame-to-map registration (swappable algorithm)
+      - GTSAM iSAM2 pose-graph with between-factors + GPS priors
+      - Submap management with anchor-pose correction
+      - Real-time visualisation (optional)
 
-    register_fn = get_register_fn(REGISTRATION)
+    Works identically for replay and live data.
+    """
 
-    print(f"Replaying {len(frames)} frames from {recording_dir}")
-    print(f"  available={len(all_frames)} skip={FRAME_SKIP} max={MAX_FRAMES or 'all'}")
-    print(f"  registration={REGISTRATION}  octo_res={OCTO_RESOLUTION}m  mode=deferred")
-    print(f"  submaps: enabled  frames_per_submap={SUBMAP_FRAMES}")
+    def __init__(self, config: SLAMConfig | None = None):
+        self.cfg = config or SLAMConfig()
 
-    # ── GTSAM iSAM2 ──────────────────────────────────────────────────────
-    isam = gtsam.ISAM2()
-    graph = gtsam.NonlinearFactorGraph()
-    initial_estimates = gtsam.Values()
-    prior_noise = gtsam.noiseModel.Isotropic.Sigma(6, 1e-3)
+        # Registration function
+        self._register_fn = get_register_fn(self.cfg.registration)
 
-    scan_T_raw = []      # raw 4x4 world poses (for GTSAM fallback)
-    pose_count = 0
+        # GTSAM iSAM2
+        self._isam = gtsam.ISAM2()
+        self._graph = gtsam.NonlinearFactorGraph()
+        self._initial_estimates = gtsam.Values()
+        self._prior_noise = gtsam.noiseModel.Isotropic.Sigma(6, 1e-3)
 
-    # ── Submaps + viewer ──────────────────────────────────────────────────
-    submaps: list       = []
-    current_submap      = None
+        # Pose bookkeeping
+        self._scan_T_raw: list[np.ndarray] = []
+        self._pose_count = 0
 
-    viewer = Viewer3D()
+        # Submaps
+        self._submaps: list[Submap] = []
+        self._current_submap: Submap | None = None
 
-    inv_res  = 1.0 / OCTO_RESOLUTION
-    half_res = OCTO_RESOLUTION * 0.5
-    seen_keys: set = set()
-    VIS_BUF = 2_000_000
-    vis_buf = np.zeros((VIS_BUF, 3), dtype=np.float32)
-    vis_len = 0
+        # Visualisation buffer (fast voxel dedup for viewer)
+        self._inv_res  = 1.0 / self.cfg.octo_resolution
+        self._half_res = self.cfg.octo_resolution * 0.5
+        self._seen_keys: set = set()
+        self._vis_buf = np.zeros((self.cfg.vis_buffer_size, 3), dtype=np.float32)
+        self._vis_len = 0
 
-    def _voxelise_and_append(pts):
-        """Quantise points to voxel grid and append new voxels to vis_buf."""
-        nonlocal vis_buf, vis_len
-        ijk = np.floor(pts * inv_res).astype(np.int32)
-        unique = set(map(tuple, ijk))
-        new = unique - seen_keys
-        if not new:
-            return 0
-        seen_keys.update(new)
-        arr = np.array(list(new), dtype=np.float32)
-        centres = arr * OCTO_RESOLUTION + half_res
-        n = len(centres)
-        if vis_len + n > len(vis_buf):
-            ns = max(len(vis_buf) * 2, vis_len + n)
-            nb = np.zeros((ns, 3), dtype=np.float32)
-            nb[:vis_len] = vis_buf[:vis_len]
-            vis_buf = nb
-        vis_buf[vis_len:vis_len + n] = centres
-        vis_len += n
-        return n
+        # Viewer
+        self._viewer: Viewer3D | None = None
+        self._drone_pos: np.ndarray | None = None
+        self._target_pos: np.ndarray | None = None
+        self._frontier_points: np.ndarray | None = None
 
-    def _get_vis():
-        """Return the current occupied voxel centres for visualisation."""
-        return vis_buf[:vis_len]
+        # Outlier detector
+        self._outlier_det = RegistrationOutlierDetector(
+            warmup=self.cfg.reject_warmup,
+            rmse_ci=self.cfg.reject_rmse_ci,
+            rot_ci=self.cfg.reject_rot_ci,
+        )
 
-    def _recomposite_from_submaps():
-        """Rebuild vis_buf from all submaps using updated GTSAM poses.
+        # Counters / stats
+        self._raw_total = 0
+        self._frame_index = 0  # total frames submitted (including rejected)
+        self._frames_accepted = 0
 
-        O(total_occupied_voxels) — just point transforms, no raycasting.
+        # Per-frame quality metrics (for plotting / analysis)
+        self.q_frames:   list[int]   = []
+        self.q_fitness:  list[float] = []
+        self.q_rmse:     list[float] = []
+        self.q_dt:       list[float] = []
+        self.q_dr:       list[float] = []
+        self.q_p_rmse:   list[float] = []
+        self.q_p_dr:     list[float] = []
+        self.q_rejected: list[int]   = []
+
+        # Timing
+        self._tkeys = ["load", "transform", "register", "gtsam",
+                        "octo_insert", "vox_track", "vis", "total"]
+        self.timings = {k: [] for k in self._tkeys}
+
+        # Callbacks (optional hooks for logging / plotting / custom actions)
+        self._on_frame_callbacks: list[Callable] = []
+
+    # ── Public properties ─────────────────────────────────────────────────
+
+    @property
+    def pose_count(self) -> int:
+        return self._pose_count
+
+    @property
+    def voxel_count(self) -> int:
+        return self._vis_len
+
+    @property
+    def submap_count(self) -> int:
+        return len(self._submaps)
+
+    @property
+    def rejected_count(self) -> int:
+        return self._outlier_det.rejected_count
+
+    @property
+    def submaps(self) -> list[Submap]:
+        return self._submaps
+
+    @property
+    def isam(self) -> gtsam.ISAM2:
+        return self._isam
+
+    # ── Viewer management ─────────────────────────────────────────────────
+
+    def start_viewer(self):
+        """Launch the Open3D viewer in a separate process."""
+        if self._viewer is None:
+            self._viewer = Viewer3D()
+
+    def stop_viewer(self):
+        """Stop the viewer process."""
+        if self._viewer is not None:
+            self._viewer.stop()
+            self._viewer = None
+
+    def set_drone_pos(self, pos):
+        """Set the drone position for the viewer marker."""
+        self._drone_pos = np.asarray(pos, dtype=float) if pos is not None else None
+
+    def set_target_pos(self, pos):
+        """Set the target waypoint for the viewer marker."""
+        self._target_pos = np.asarray(pos, dtype=float) if pos is not None else None
+
+    def set_frontier_points(self, pts):
+        """Set frontier overlay points (Nx3) shown as orange in the viewer."""
+        if pts is not None and len(pts) > 0:
+            self._frontier_points = np.asarray(pts, dtype=np.float64)
+        else:
+            self._frontier_points = None
+
+    # ── Callback registration ─────────────────────────────────────────────
+
+    def on_frame(self, callback: Callable):
+        """Register a callback invoked after each accepted frame.
+
+        Signature: callback(pipeline, frame_result_dict)
         """
-        nonlocal vis_buf, vis_len, seen_keys
-        values = isam.calculateEstimate()
-        seen_keys = set()
-        vis_buf = np.zeros((VIS_BUF, 3), dtype=np.float32)
-        vis_len = 0
-        for sm in submaps:
-            try:
-                updated_T = pose3_to_T(
-                    values.atPose3(symbol('x', sm.anchor_index)))
-            except Exception:
-                updated_T = sm.anchor_T
-            world_pts = sm.get_world_points(updated_T)
-            if len(world_pts) > 0:
-                _voxelise_and_append(world_pts.astype(np.float64))
+        self._on_frame_callbacks.append(callback)
 
-    # ── Timing ────────────────────────────────────────────────────────────
-    tkeys = ["load", "transform", "register", "gtsam",
-             "octo_insert", "vox_track", "vis", "total"]
-    timings = {k: [] for k in tkeys}
-    raw_total = 0
+    # ── Core frame processing ─────────────────────────────────────────────
 
-    # Detailed registration sub-timings
-    reg_sub_keys = ["local_crop", "src_downsample", "tgt_downsample",
-                    "src_normals", "tgt_normals",
-                    "gicp_pass0", "gicp_pass1", "gicp_pass2"]
-    reg_sub_timings = {k: [] for k in reg_sub_keys}
-    reg_src_pts = []   # source point count after downsample
-    reg_tgt_pts = []   # target point count after downsample
+    def process_frame(
+        self,
+        points: np.ndarray,
+        position: np.ndarray,
+        orientation: np.ndarray,
+        *,
+        gps: np.ndarray | None = None,
+        lidar_position: np.ndarray | None = None,
+        lidar_orientation: np.ndarray | None = None,
+        frame_label: int | None = None,
+    ) -> dict:
+        """Process a single scan frame.
 
-    # ── Detailed timing log file ──────────────────────────────────────────
-    timing_log_path = os.path.join(recording_dir, "timing_log.txt")
-    timing_log_file = open(timing_log_path, "w")
-    timing_log_file.write(
-        f"# Timing log for {recording_dir}\n"
-        f"# registration={REGISTRATION}  octo_res={OCTO_RESOLUTION}  "
-        f"insert_voxel={OCTO_INSERT_VOXEL}\n"
-        f"# submaps=True  submap_frames={SUBMAP_FRAMES}  "
-        f"frame_skip={FRAME_SKIP}\n"
-        f"# ICP_VOXEL={ICP_VOXEL}  LOCAL_R={LOCAL_R}  NORM_NN={NORM_NN}\n"
-        f"#\n"
-    )
-    timing_log_file.write(
-        f"{'frame':>6} {'status':>10} {'raw_pts':>8} {'voxels':>9} "
-        f"{'load_ms':>8} {'xform_ms':>9} {'reg_ms':>8} "
-        f"{'gtsam_ms':>9} {'octo_ms':>8} {'vox_ms':>8} "
-        f"{'vis_ms':>8} {'total_ms':>9} "
-        f"{'fitness':>8} {'rmse':>8} {'dt_m':>8} {'dr_deg':>8} "
-        f"{'p_rmse':>8} {'p_dr':>8} {'cum_voxels':>10} {'submaps':>8}\n"
-    )
-    timing_log_file.write(f"{'='*180}\n")
-    timing_log_file.flush()
-    print(f"  Timing log: {timing_log_path}")
+        Parameters
+        ----------
+        points : (N, 3) float — raw LiDAR points in sensor frame.
+        position : (3,) float — vehicle world position.
+        orientation : (4,) float — vehicle orientation as (w, x, y, z) quaternion.
+        gps : (3,) float, optional — GPS measurement (lat/lon/alt or local XYZ).
+        lidar_position : (3,) float, optional — LiDAR mount offset on vehicle.
+        lidar_orientation : (4,) float, optional — LiDAR mount orientation (w,x,y,z).
+        frame_label : int, optional — frame number for logging (auto-incremented if omitted).
 
-    # ── Registration outlier detector ─────────────────────────────────────
-    outlier_det = RegistrationOutlierDetector()
-
-    # ── Live quality plot ─────────────────────────────────────────────────
-    q_frames   = []
-    q_fitness  = []
-    q_rmse     = []
-    q_dt       = []
-    q_dr       = []
-    q_p_rmse   = []
-    q_p_dr     = []
-    q_rejected = []
-
-    plt.ion()
-    fig_q, axes_q = plt.subplots(2, 2, figsize=(12, 7))
-    fig_q.suptitle(f"Registration Quality  ({REGISTRATION})", fontsize=13)
-    ax_fit, ax_rmse, ax_dt, ax_dr = axes_q.flat
-
-    line_fit,  = ax_fit.plot([], [], 'b-', lw=1)
-    ax_fit.set_ylabel('Fitness'); ax_fit.set_xlabel('Frame')
-    ax_fit.set_title('Fitness (higher = better overlap)')
-    ax_fit.axhline(0.5, color='g', ls='--', lw=0.7, label='good')
-    ax_fit.axhline(0.2, color='r', ls='--', lw=0.7, label='poor')
-    ax_fit.legend(fontsize=8)
-
-    line_rmse, = ax_rmse.plot([], [], 'r-', lw=1)
-    ax_rmse.set_ylabel('Inlier RMSE (m)'); ax_rmse.set_xlabel('Frame')
-    ax_rmse.set_title('RMSE (lower = tighter fit)')
-    ax_rmse2 = ax_rmse.twinx()
-    line_p_rmse, = ax_rmse2.plot([], [], color='orange', ls='--', lw=0.8,
-                                 alpha=0.7, label='p-value')
-    ax_rmse2.set_ylabel('p-value', color='orange')
-    ax_rmse2.tick_params(axis='y', labelcolor='orange')
-    ax_rmse2.set_ylim(-0.05, 1.05)
-    scat_rej_rmse = ax_rmse.scatter([], [], c='red', marker='x', s=40,
-                                    zorder=5, linewidths=1.5, label='rejected')
-
-    line_dt,   = ax_dt.plot([], [], 'm-', lw=1)
-    ax_dt.set_ylabel('\u0394t (m)'); ax_dt.set_xlabel('Frame')
-    ax_dt.set_title('Translation correction')
-
-    line_dr,   = ax_dr.plot([], [], 'c-', lw=1)
-    ax_dr.set_ylabel('\u0394r (\u00b0)'); ax_dr.set_xlabel('Frame')
-    ax_dr.set_title('Rotation correction')
-    ax_dr2 = ax_dr.twinx()
-    line_p_dr, = ax_dr2.plot([], [], color='orange', ls='--', lw=0.8,
-                             alpha=0.7, label='p-value')
-    ax_dr2.set_ylabel('p-value', color='orange')
-    ax_dr2.tick_params(axis='y', labelcolor='orange')
-    ax_dr2.set_ylim(-0.05, 1.05)
-    scat_rej_dr = ax_dr.scatter([], [], c='red', marker='x', s=40,
-                                zorder=5, linewidths=1.5, label='rejected')
-
-    def _update_quality_plot():
-        """Refresh all quality plot lines and rejected-frame markers."""
-        try:
-            line_fit.set_data(q_frames, q_fitness)
-            line_rmse.set_data(q_frames, q_rmse)
-            line_p_rmse.set_data(q_frames, q_p_rmse)
-            line_dt.set_data(q_frames, q_dt)
-            line_dr.set_data(q_frames, q_dr)
-            line_p_dr.set_data(q_frames, q_p_dr)
-            if q_rejected:
-                rej_xy_rmse = np.column_stack(
-                    ([q_frames[j] for j in q_rejected],
-                     [q_rmse[j]   for j in q_rejected]))
-                rej_xy_dr = np.column_stack(
-                    ([q_frames[j] for j in q_rejected],
-                     [q_dr[j]     for j in q_rejected]))
-                scat_rej_rmse.set_offsets(rej_xy_rmse)
-                scat_rej_dr.set_offsets(rej_xy_dr)
-            for ax in axes_q.flat:
-                ax.relim(); ax.autoscale_view()
-            ax_rmse2.set_ylim(-0.05, 1.05)
-            ax_dr2.set_ylim(-0.05, 1.05)
-            fig_q.canvas.draw_idle()
-            fig_q.canvas.flush_events()
-        except Exception:
-            pass
-
-    for ax in axes_q.flat:
-        ax.grid(True, alpha=0.3)
-    fig_q.tight_layout()
-    plt.show(block=False)
-    plt.pause(0.01)
-
-    PLOT_UPDATE_EVERY = 1
-
-    # ══════════════════════════════════════════════════════════════════════
-    # Main frame loop
-    # ══════════════════════════════════════════════════════════════════════
-    for i, path in enumerate(frames):
+        Returns
+        -------
+        dict with keys: accepted, fitness, rmse, dt, dr, voxels, pose_count, etc.
+        """
         t_frame = time.perf_counter()
+        idx = frame_label if frame_label is not None else self._frame_index
+        self._frame_index += 1
 
-        # ── Load ──────────────────────────────────────────────────────────
-        t0 = time.perf_counter()
-        data = np.load(path)
-        pts = filter_valid(data["points"])
+        result = {
+            "accepted": False, "frame": idx, "fitness": 0.0, "rmse": 0.0,
+            "dt": 0.0, "dr": 0.0, "voxels": self._vis_len,
+            "pose_count": self._pose_count, "submaps": len(self._submaps),
+        }
+
+        # ── Filter valid points ───────────────────────────────────────────
+        pts = filter_valid(points)
         if len(pts) == 0:
-            continue
-        timings["load"].append(time.perf_counter() - t0)
+            return result
 
         # ── Transform to world (initial guess) ───────────────────────────
         t0 = time.perf_counter()
-        lp = data["lidar_position"] if "lidar_position" in data.files else np.zeros(3)
-        lo = (data["lidar_orientation"] if "lidar_orientation" in data.files
-              else np.array([1, 0, 0, 0], dtype=float))
+        lp = lidar_position if lidar_position is not None else np.zeros(3)
+        lo = lidar_orientation if lidar_orientation is not None else np.array([1, 0, 0, 0], dtype=float)
         body = xform_pts(pts, lp, lo)
-        pos = data["position"] if "position" in data.files else np.zeros(3)
-        ori = (data["orientation"] if "orientation" in data.files
-               else np.array([1, 0, 0, 0], dtype=float))
+
+        pos = np.asarray(position, dtype=float)
+        ori = np.asarray(orientation, dtype=float)
         world_init = xform_pts(body, pos, ori)
-        timings["transform"].append(time.perf_counter() - t0)
-        raw_total += len(world_init)
+        self.timings["transform"].append(time.perf_counter() - t0)
+        self._raw_total += len(world_init)
 
         # Raw world-pose 4x4
         T_raw = np.eye(4)
         R_raw = Rotation.from_quat([ori[1], ori[2], ori[3], ori[0]]).as_matrix()
         T_raw[:3, :3] = R_raw
-        T_raw[:3, 3] = pos
+        T_raw[:3, 3]  = pos
 
         # ── Registration against voxel map ────────────────────────────────
         t0 = time.perf_counter()
-        if vis_len >= MIN_VOXELS and pose_count > 0 and REGISTRATION != "state_only":
-            target_pts = _get_vis()
-            # Crop target to local sphere around drone for speed
-            if REG_LOCAL_RADIUS > 0:
+        if (self._vis_len >= MIN_VOXELS
+                and self._pose_count > 0
+                and self.cfg.registration != "state_only"):
+            target_pts = self._get_vis()
+            if self.cfg.reg_local_radius > 0:
                 dists = np.linalg.norm(target_pts - pos.reshape(1, 3), axis=1)
-                mask = dists <= REG_LOCAL_RADIUS
-                target_pts = target_pts[mask]
-            T_reg, fitness, rmse, reg_detail = register_fn(
+                target_pts = target_pts[dists <= self.cfg.reg_local_radius]
+
+            T_reg, fitness, rmse, reg_detail = self._register_fn(
                 world_init.astype(np.float64),
                 target_pts.astype(np.float64))
             world_pts = apply_T(world_init, T_reg).astype(np.float32)
-
-            # Record registration sub-timings
-            if isinstance(reg_detail, dict):
-                for sk in reg_sub_keys:
-                    reg_sub_timings[sk].append(reg_detail.get(sk, 0.0))
-                reg_src_pts.append(reg_detail.get('src_pts', 0))
-                reg_tgt_pts.append(reg_detail.get('tgt_pts', 0))
 
             ct = T_reg[:3, 3]
             ce = Rotation.from_matrix(T_reg[:3, :3]).as_euler("xyz", degrees=True)
@@ -573,305 +501,807 @@ def run_replay(recording_dir: str = ""):
             dr_mag = float(np.linalg.norm(ce))
             src_n = reg_detail.get('src_pts', 0) if isinstance(reg_detail, dict) else 0
             tgt_n = reg_detail.get('tgt_pts', 0) if isinstance(reg_detail, dict) else 0
-            print(f"  REG {i:03d}: fit={fitness:.4f} rmse={rmse:.4f} "
+            print(f"  REG {idx:03d}: fit={fitness:.4f} rmse={rmse:.4f} "
                   f"\u0394t={dt_mag:.4f}m "
                   f"\u0394r=({ce[0]:+.2f},{ce[1]:+.2f},{ce[2]:+.2f})\u00b0"
                   f"  src={src_n:,} tgt={tgt_n:,}")
         else:
             world_pts = world_init.astype(np.float32)
             T_reg = np.eye(4)
-            fitness = 0.0
-            rmse = 0.0
-            dt_mag = 0.0
-            dr_mag = 0.0
-            print(f"  frame {i:03d}: "
-                  f"{'baseline' if REGISTRATION == 'state_only' else f'too few voxels ({vis_len})'}"
+            fitness = rmse = dt_mag = dr_mag = 0.0
+            print(f"  frame {idx:03d}: "
+                  f"{'baseline' if self.cfg.registration == 'state_only' else f'too few voxels ({self._vis_len})'}"
                   f", state pose only")
-        timings["register"].append(time.perf_counter() - t0)
+        self.timings["register"].append(time.perf_counter() - t0)
 
         # Record quality metrics
-        q_frames.append(i)
-        q_fitness.append(fitness)
-        q_rmse.append(rmse)
-        q_dt.append(dt_mag)
-        q_dr.append(dr_mag)
+        self.q_frames.append(idx)
+        self.q_fitness.append(fitness)
+        self.q_rmse.append(rmse)
+        self.q_dt.append(dt_mag)
+        self.q_dr.append(dr_mag)
 
-        # ── Outlier rejection + p-value computation ───────────────────────
-        p_rmse_val, p_dr_val = outlier_det.p_values(rmse, dr_mag)
-        q_p_rmse.append(p_rmse_val)
-        q_p_dr.append(p_dr_val)
+        # ── Outlier rejection ─────────────────────────────────────────────
+        p_rmse_val, p_dr_val = self._outlier_det.p_values(rmse, dr_mag)
+        self.q_p_rmse.append(p_rmse_val)
+        self.q_p_dr.append(p_dr_val)
 
-        if REJECT_OUTLIERS and rmse > 0:
-            is_outlier, reason = outlier_det.check(rmse, dr_mag)
+        if self.cfg.reject_outliers and rmse > 0:
+            is_outlier, reason = self._outlier_det.check(rmse, dr_mag)
             if is_outlier:
-                print(f"  \u2717 REJECTED frame {i:03d}: {reason}")
-                q_rejected.append(len(q_frames) - 1)
-                timings["total"].append(time.perf_counter() - t_frame)
-                _update_quality_plot()
-                _tl = lambda k: timings[k][-1] * 1e3 if timings[k] else 0.0
-                timing_log_file.write(
-                    f"{i:6d} {'rejected':>10} {len(pts):8d} {vis_len:9d} "
-                    f"{_tl('load'):8.2f} {_tl('transform'):9.2f} {_tl('register'):8.2f} "
-                    f"{'--':>9} {'--':>8} {'--':>8} "
-                    f"{'--':>8} {_tl('total'):9.2f} "
-                    f"{fitness:8.4f} {rmse:8.4f} {dt_mag:8.4f} {dr_mag:8.4f} "
-                    f"{q_p_rmse[-1]:8.4f} {q_p_dr[-1]:8.4f} "
-                    f"{vis_len:10d} {len(submaps):8d}\n"
-                )
-                timing_log_file.flush()
-                continue
-            outlier_det.accept(rmse, dr_mag)
+                print(f"  \u2717 REJECTED frame {idx:03d}: {reason}")
+                self.q_rejected.append(len(self.q_frames) - 1)
+                self.timings["total"].append(time.perf_counter() - t_frame)
+                result.update(fitness=fitness, rmse=rmse, dt=dt_mag, dr=dr_mag)
+                return result
+            self._outlier_det.accept(rmse, dr_mag)
 
         # ── GTSAM factor graph ────────────────────────────────────────────
         t0 = time.perf_counter()
-        key_curr = symbol('x', pose_count)
+        key_curr = symbol('x', self._pose_count)
 
         pose3_curr = pose3_from_pos_quat(pos, ori)
         if np.any(T_reg[:3, :3] != np.eye(3)) or np.any(T_reg[:3, 3] != 0):
             corrected_T = T_reg @ T_raw
             pose3_curr = T_to_pose3(corrected_T)
 
-        if pose_count == 0:
-            graph.add(gtsam.PriorFactorPose3(key_curr, pose3_curr, prior_noise))
-            initial_estimates.insert(key_curr, pose3_curr)
+        if self._pose_count == 0:
+            self._graph.add(gtsam.PriorFactorPose3(key_curr, pose3_curr, self._prior_noise))
+            self._initial_estimates.insert(key_curr, pose3_curr)
         else:
-            key_prev = symbol('x', pose_count - 1)
+            key_prev = symbol('x', self._pose_count - 1)
             try:
-                prev_est = isam.calculateEstimate().atPose3(key_prev)
+                prev_est = self._isam.calculateEstimate().atPose3(key_prev)
             except Exception:
-                prev_est = T_to_pose3(scan_T_raw[-1])
+                prev_est = T_to_pose3(self._scan_T_raw[-1])
             relative_pose = prev_est.between(pose3_curr)
-            noise = (_icp_noise(rmse) if rmse > 0
+            noise = (_icp_noise(rmse, self.cfg.icp_noise_scale) if rmse > 0
                      else gtsam.noiseModel.Isotropic.Sigma(6, 0.5))
-            graph.add(gtsam.BetweenFactorPose3(
+            self._graph.add(gtsam.BetweenFactorPose3(
                 key_prev, key_curr, relative_pose, noise))
-            initial_estimates.insert(key_curr, pose3_curr)
+            self._initial_estimates.insert(key_curr, pose3_curr)
 
         # GPS prior
-        if "gps" in data.files:
-            gps = data["gps"]
+        if gps is not None:
             gps_pt = gtsam.Point3(float(gps[0]), float(gps[1]), float(gps[2]))
-            graph.add(gtsam.GPSFactor(
+            self._graph.add(gtsam.GPSFactor(
                 key_curr, gps_pt,
-                gtsam.noiseModel.Isotropic.Sigma(3, GPS_SIGMA)))
+                gtsam.noiseModel.Isotropic.Sigma(3, self.cfg.gps_sigma)))
 
-        isam.update(graph, initial_estimates)
-        graph = gtsam.NonlinearFactorGraph()
-        initial_estimates = gtsam.Values()
-        timings["gtsam"].append(time.perf_counter() - t0)
+        self._isam.update(self._graph, self._initial_estimates)
+        self._graph = gtsam.NonlinearFactorGraph()
+        self._initial_estimates = gtsam.Values()
+        self.timings["gtsam"].append(time.perf_counter() - t0)
 
-        scan_T_raw.append(T_raw.copy())
+        self._scan_T_raw.append(T_raw.copy())
         T_est_curr = (T_reg @ T_raw) if (
             np.any(T_reg[:3, :3] != np.eye(3))
             or np.any(T_reg[:3, 3] != 0)) else T_raw
-        pose_count += 1
+        self._pose_count += 1
+        self._frames_accepted += 1
 
         # ── Submap management / voxel insertion ───────────────────────────
-        if (current_submap is None
-                or len(current_submap.frame_indices) >= SUBMAP_FRAMES):
-            current_submap = Submap(
-                anchor_index=pose_count - 1,
-                anchor_T=T_est_curr.copy())
-            submaps.append(current_submap)
-        current_submap.frame_indices.append(pose_count - 1)
+        if (self._current_submap is None
+                or len(self._current_submap.frame_indices) >= self.cfg.submap_frames):
+            self._current_submap = Submap(
+                anchor_index=self._pose_count - 1,
+                anchor_T=T_est_curr.copy(),
+                resolution=self.cfg.octo_resolution)
+            self._submaps.append(self._current_submap)
+        self._current_submap.frame_indices.append(self._pose_count - 1)
 
         t0 = time.perf_counter()
         wf64 = world_pts.astype(np.float64)
-        ds_pts = _downsample_for_insert(wf64)
-        current_submap.insert(ds_pts)
-        timings["octo_insert"].append(time.perf_counter() - t0)
+        ds_pts = self._downsample_for_insert(wf64)
+        self._current_submap.insert(ds_pts)
+        self.timings["octo_insert"].append(time.perf_counter() - t0)
 
         t0 = time.perf_counter()
-        _voxelise_and_append(wf64)
-        timings["vox_track"].append(time.perf_counter() - t0)
+        self._voxelise_and_append(wf64)
+        self.timings["vox_track"].append(time.perf_counter() - t0)
 
         # ── Visualise ─────────────────────────────────────────────────────
         t0 = time.perf_counter()
-        vp = _get_vis()
-        if not viewer._proc:
-            viewer.start(initial_points=vp)
-        else:
-            viewer.update(vp)
-        timings["vis"].append(time.perf_counter() - t0)
+        if self._viewer is not None and self.cfg.enable_viewer:
+            vp = self._get_vis()
+            if not self._viewer._proc:
+                self._viewer.start(initial_points=vp)
+            else:
+                self._viewer.update(vp,
+                                    drone_pos=self._drone_pos,
+                                    target_pos=self._target_pos,
+                                    frontier_points=self._frontier_points)
+        self.timings["vis"].append(time.perf_counter() - t0)
 
-        timings["total"].append(time.perf_counter() - t_frame)
+        self.timings["total"].append(time.perf_counter() - t_frame)
 
-        # ── Update live quality plot ──────────────────────────────────────
-        if len(q_frames) % PLOT_UPDATE_EVERY == 0:
-            _update_quality_plot()
-
-        # ── Per-frame console log ─────────────────────────────────────────
-        total_mem = sum(sm.memoryUsage() for sm in submaps)
-        print(f"  {i+1:3d}/{len(frames)} | raw={len(pts):6,} "
-              f"voxels={vis_len:8,} submaps={len(submaps)} "
+        # ── Console log ───────────────────────────────────────────────────
+        total_mem = sum(sm.memory_usage() for sm in self._submaps)
+        print(f"  {self._frames_accepted:3d} | raw={len(pts):6,} "
+              f"voxels={self._vis_len:8,} submaps={len(self._submaps)} "
               f"mem={total_mem/1e6:.1f}MB | "
-              f"tot={timings['total'][-1]*1e3:.0f}ms\n", flush=True)
+              f"tot={self.timings['total'][-1]*1e3:.0f}ms\n", flush=True)
 
-        # ── Write detailed timing to log file ─────────────────────────────
-        _tl = lambda k: timings[k][-1] * 1e3 if timings[k] else 0.0
-        timing_log_file.write(
-            f"{i:6d} {'ok':>10} {len(pts):8d} {vis_len:9d} "
-            f"{_tl('load'):8.2f} {_tl('transform'):9.2f} {_tl('register'):8.2f} "
-            f"{_tl('gtsam'):9.2f} {_tl('octo_insert'):8.2f} {_tl('vox_track'):8.2f} "
-            f"{_tl('vis'):8.2f} {_tl('total'):9.2f} "
-            f"{fitness:8.4f} {rmse:8.4f} {dt_mag:8.4f} {dr_mag:8.4f} "
-            f"{q_p_rmse[-1]:8.4f} {q_p_dr[-1]:8.4f} "
-            f"{vis_len:10d} {len(submaps):8d}\n"
+        # ── Build result ──────────────────────────────────────────────────
+        result.update(
+            accepted=True, fitness=fitness, rmse=rmse,
+            dt=dt_mag, dr=dr_mag,
+            voxels=self._vis_len,
+            pose_count=self._pose_count,
+            submaps=len(self._submaps),
         )
-        timing_log_file.flush()
 
-    # ══════════════════════════════════════════════════════════════════════
-    # Post-loop: save outputs and print summary
-    # ══════════════════════════════════════════════════════════════════════
-
-    # ── Save final quality plot ────────────────────────────────────────────
-    try:
-        bad_idx = [j for j, f in enumerate(q_fitness) if 0 < f < 0.3]
-        if bad_idx:
-            ax_fit.scatter([q_frames[j] for j in bad_idx],
-                           [q_fitness[j] for j in bad_idx],
-                           c='red', s=25, zorder=5, label='fit < 0.3')
-            ax_fit.legend(fontsize=8)
-
-        if q_rejected:
-            rej_frames_rmse = [q_frames[j] for j in q_rejected]
-            rej_rmse_vals   = [q_rmse[j]   for j in q_rejected]
-            rej_dr_vals     = [q_dr[j]     for j in q_rejected]
-            ax_rmse.scatter(rej_frames_rmse, rej_rmse_vals,
-                            c='red', marker='x', s=40, zorder=5,
-                            linewidths=1.5, label='rejected')
-            ax_rmse.legend(fontsize=8, loc='upper left')
-            ax_dr.scatter(rej_frames_rmse, rej_dr_vals,
-                          c='red', marker='x', s=40, zorder=5,
-                          linewidths=1.5, label='rejected')
-            ax_dr.legend(fontsize=8, loc='upper left')
-
-        for ax in axes_q.flat:
-            ax.relim(); ax.autoscale_view()
-        ax_rmse2.set_ylim(-0.05, 1.05)
-        ax_dr2.set_ylim(-0.05, 1.05)
-        png_path = os.path.join(recording_dir, "reg_quality.png")
-        fig_q.savefig(png_path, dpi=150, bbox_inches='tight')
-        print(f"  Quality plot saved to {png_path}")
-    except Exception as e:
-        print(f"  (could not save quality plot: {e})")
-
-    # ── Build final OctoMap for .bt export ─────────────────────────────────
-    print("  Building final OctoMap for export...")
-    try:
-        merged = pyoctomap.OcTree(OCTO_RESOLUTION)
-        values = isam.calculateEstimate()
-        for sm in submaps:
+        # ── Fire callbacks ────────────────────────────────────────────────
+        for cb in self._on_frame_callbacks:
             try:
-                T = pose3_to_T(
-                    values.atPose3(symbol('x', sm.anchor_index)))
+                cb(self, result)
+            except Exception as e:
+                print(f"  (callback error: {e})")
+
+        return result
+
+    # ── Map access ────────────────────────────────────────────────────────
+
+    def get_map_points(self) -> np.ndarray:
+        """Return current occupied voxel centres (Nx3 float32)."""
+        return self._get_vis()
+
+    def get_corrected_map_points(self) -> np.ndarray:
+        """Recomposite all submaps using latest GTSAM poses."""
+        self._recomposite_from_submaps()
+        return self._get_vis()
+
+    def get_optimised_poses(self) -> list[np.ndarray]:
+        """Return list of optimised 4x4 poses from iSAM2."""
+        values = self._isam.calculateEstimate()
+        poses = []
+        for i in range(self._pose_count):
+            try:
+                poses.append(pose3_to_T(values.atPose3(symbol('x', i))))
+            except Exception:
+                poses.append(self._scan_T_raw[i] if i < len(self._scan_T_raw) else np.eye(4))
+        return poses
+
+    # ── OctoMap export ────────────────────────────────────────────────────
+
+    def save_octomap(self, path: str) -> str:
+        """Build a final OctoMap from corrected submaps and save as .bt."""
+        print("  Building final OctoMap for export...")
+        merged = pyoctomap.OcTree(self.cfg.octo_resolution)
+        values = self._isam.calculateEstimate()
+        for sm in self._submaps:
+            try:
+                T = pose3_to_T(values.atPose3(symbol('x', sm.anchor_index)))
             except Exception:
                 T = sm.anchor_T
             wpts = sm.get_world_points(T)
             if len(wpts) > 0:
                 merged.updateNodes(wpts.astype(np.float64), True)
-        bt_path = os.path.join(recording_dir, "map.bt")
-        merged.writeBinary(bt_path)
-        print(f"  OctoMap saved to {bt_path} "
-              f"({merged.size():,} nodes, "
-              f"{merged.memoryUsage()/1e6:.1f}MB)")
-    except Exception as e:
-        print(f"  (could not save OctoMap: {e})")
+        merged.writeBinary(path)
+        print(f"  OctoMap saved to {path} "
+              f"({merged.size():,} nodes, {merged.memoryUsage()/1e6:.1f}MB)")
+        return path
 
-    # ── Final vis recomposite ─────────────────────────────────────────────
-    _recomposite_from_submaps()
+    # ── Summary / stats ───────────────────────────────────────────────────
 
-    plane = fit_plane(_get_vis())
-    ratio = vis_len / raw_total * 100 if raw_total else 0
+    def get_summary(self) -> dict:
+        """Return a dictionary of pipeline statistics."""
+        ratio = self._vis_len / self._raw_total * 100 if self._raw_total else 0
+        total_mem = sum(sm.memory_usage() for sm in self._submaps)
+        total_nodes = sum(sm.node_count() for sm in self._submaps)
+        plane = fit_plane(self._get_vis()) if self._vis_len > 10 else None
+        return {
+            "registration": self.cfg.registration,
+            "octo_resolution": self.cfg.octo_resolution,
+            "submap_count": len(self._submaps),
+            "submap_frames": self.cfg.submap_frames,
+            "rejected_count": self._outlier_det.rejected_count,
+            "raw_total": self._raw_total,
+            "voxel_count": self._vis_len,
+            "compression_ratio": ratio,
+            "map_nodes": total_nodes,
+            "map_memory_mb": total_mem / 1e6,
+            "pose_count": self._pose_count,
+            "plane": plane,
+            "timings": {k: list(v) for k, v in self.timings.items()},
+        }
 
-    print(f"\n{'='*65}")
-    print(f"Final Mapping Summary  (registration={REGISTRATION})")
-    print(f"{'='*65}")
-    print(f"  Octo resolution:  {OCTO_RESOLUTION} m")
-    print(f"  Submaps:          {len(submaps)} submaps, "
-          f"{SUBMAP_FRAMES} frames/submap")
-    if REJECT_OUTLIERS:
-        print(f"  Outlier rejection: {outlier_det.rejected_count} frames rejected "
-              f"(warmup={REJECT_WARMUP}, RMSE CI={REJECT_RMSE_CI*100:.0f}%, "
-              f"Rot CI={REJECT_ROT_CI*100:.0f}%)")
-    print(f"  Raw pts total:    {raw_total:,}")
-    print(f"  Occupied voxels:  {vis_len:,}  "
-          f"({ratio:.1f}% -> {raw_total/max(vis_len,1):.1f}x)")
-    total_mem = sum(sm.memoryUsage() for sm in submaps)
-    total_nodes = sum(sm.node_count() for sm in submaps)
-    print(f"  Map nodes:        {total_nodes:,}  "
-          f"mem={total_mem/1e6:.1f}MB  ({len(submaps)} submaps)")
-    print(f"  Pose graph nodes: {pose_count}")
-    if plane:
-        n, sx, sy, res = plane
-        print(f"  Plane residual:   {res:.4f} m")
-        print(f"  Plane slope:      x={sx:+.4f}  y={sy:+.4f}")
+    def print_summary(self):
+        """Print a formatted summary to stdout."""
+        s = self.get_summary()
+        ratio = s["compression_ratio"]
+        print(f"\n{'='*65}")
+        print(f"Final Mapping Summary  (registration={s['registration']})")
+        print(f"{'='*65}")
+        print(f"  Octo resolution:  {s['octo_resolution']} m")
+        print(f"  Submaps:          {s['submap_count']} submaps, "
+              f"{s['submap_frames']} frames/submap")
+        if self.cfg.reject_outliers:
+            print(f"  Outlier rejection: {s['rejected_count']} frames rejected "
+                  f"(warmup={self.cfg.reject_warmup}, RMSE CI={self.cfg.reject_rmse_ci*100:.0f}%, "
+                  f"Rot CI={self.cfg.reject_rot_ci*100:.0f}%)")
+        print(f"  Raw pts total:    {s['raw_total']:,}")
+        print(f"  Occupied voxels:  {s['voxel_count']:,}  "
+              f"({ratio:.1f}% -> {s['raw_total']/max(s['voxel_count'],1):.1f}x)")
+        print(f"  Map nodes:        {s['map_nodes']:,}  "
+              f"mem={s['map_memory_mb']:.1f}MB  ({s['submap_count']} submaps)")
+        print(f"  Pose graph nodes: {s['pose_count']}")
+        if s["plane"]:
+            n, sx, sy, res = s["plane"]
+            print(f"  Plane residual:   {res:.4f} m")
+            print(f"  Plane slope:      x={sx:+.4f}  y={sy:+.4f}")
 
-    gt = sum(timings["total"])
-    summary_lines = []
-    summary_lines.append(
-        f"\n  {'step':<20} {'total':>7} {'mean':>7} {'max':>7} "
-        f"{'min':>7} {'std':>7} {'%':>5}  {'count':>5}")
-    summary_lines.append(f"  {'-'*76}")
-    for k in tkeys:
-        v = timings[k]
-        if not v:
-            continue
-        s = sum(v)
-        pct = 100 * s / gt if gt else 0
-        va = np.array(v)
-        summary_lines.append(
-            f"  {k:<20} {s:>7.3f} {va.mean():>7.4f} {va.max():>7.4f} "
-            f"{va.min():>7.4f} {va.std():>7.4f} {pct:>4.1f}%  {len(v):>5d}")
-        # Expand registration sub-timings inline
-        if k == "register":
-            for sk in reg_sub_keys:
-                sv = reg_sub_timings[sk]
-                if not sv:
-                    continue
-                ss = sum(sv)
-                sp = 100 * ss / gt if gt else 0
-                sa = np.array(sv)
-                summary_lines.append(
-                    f"    {sk:<18} {ss:>7.3f} {sa.mean():>7.4f} {sa.max():>7.4f} "
-                    f"{sa.min():>7.4f} {sa.std():>7.4f} {sp:>4.1f}%  {len(sv):>5d}")
-            if reg_src_pts:
-                sa = np.array(reg_src_pts)
-                summary_lines.append(
-                    f"    {'src_pts':<18} {'':>7} {sa.mean():>7.0f} {sa.max():>7d} "
-                    f"{sa.min():>7d} {sa.std():>7.0f} {'':>5}  {len(sa):>5d}")
-            if reg_tgt_pts:
-                ta = np.array(reg_tgt_pts)
-                summary_lines.append(
-                    f"    {'tgt_pts':<18} {'':>7} {ta.mean():>7.0f} {ta.max():>7d} "
-                    f"{ta.min():>7d} {ta.std():>7.0f} {'':>5}  {len(ta):>5d}")
-    summary_lines.append(f"  {'='*76}")
-    for line in summary_lines:
-        print(line)
+        gt = sum(self.timings["total"])
+        print(f"\n  {'step':<20} {'total':>7} {'mean':>7} {'max':>7} "
+              f"{'min':>7} {'std':>7} {'%':>5}  {'count':>5}")
+        print(f"  {'-'*76}")
+        for k in self._tkeys:
+            v = self.timings[k]
+            if not v:
+                continue
+            s_sum = sum(v)
+            pct = 100 * s_sum / gt if gt else 0
+            va = np.array(v)
+            print(f"  {k:<20} {s_sum:>7.3f} {va.mean():>7.4f} {va.max():>7.4f} "
+                  f"{va.min():>7.4f} {va.std():>7.4f} {pct:>4.1f}%  {len(v):>5d}")
+        print(f"  {'='*76}")
 
-    # Write summary to timing log
-    timing_log_file.write(f"\n{'='*70}\n")
-    timing_log_file.write(f"SUMMARY\n")
-    timing_log_file.write(f"{'='*70}\n")
-    for line in summary_lines:
-        timing_log_file.write(line + "\n")
-    timing_log_file.write(f"\nTotal wall-clock: {gt:.3f}s\n")
-    timing_log_file.write(f"Frames processed: {len(timings['total'])}\n")
-    timing_log_file.write(f"Frames rejected:  {outlier_det.rejected_count}\n")
-    timing_log_file.close()
-    print(f"\n  Detailed timing log saved to {timing_log_path}")
+    # ── Reset ─────────────────────────────────────────────────────────────
 
-    print("\nClose the Open3D window or Ctrl+C to exit.")
-    try:
-        while True:
-            time.sleep(0.5)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        viewer.stop()
+    def reset(self):
+        """Clear all state and start fresh (keeps config and viewer)."""
+        self._isam = gtsam.ISAM2()
+        self._graph = gtsam.NonlinearFactorGraph()
+        self._initial_estimates = gtsam.Values()
+        self._scan_T_raw.clear()
+        self._pose_count = 0
+        self._submaps.clear()
+        self._current_submap = None
+        self._seen_keys.clear()
+        self._vis_buf = np.zeros((self.cfg.vis_buffer_size, 3), dtype=np.float32)
+        self._vis_len = 0
+        self._outlier_det = RegistrationOutlierDetector(
+            warmup=self.cfg.reject_warmup,
+            rmse_ci=self.cfg.reject_rmse_ci,
+            rot_ci=self.cfg.reject_rot_ci)
+        self._raw_total = 0
+        self._frame_index = 0
+        self._frames_accepted = 0
+        self.q_frames.clear()
+        self.q_fitness.clear()
+        self.q_rmse.clear()
+        self.q_dt.clear()
+        self.q_dr.clear()
+        self.q_p_rmse.clear()
+        self.q_p_dr.clear()
+        self.q_rejected.clear()
+        self.timings = {k: [] for k in self._tkeys}
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Private helpers
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _downsample_for_insert(self, pts: np.ndarray) -> np.ndarray:
+        if self.cfg.octo_insert_voxel <= 0:
+            return pts
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
+        pcd = pcd.voxel_down_sample(self.cfg.octo_insert_voxel)
+        return np.asarray(pcd.points)
+
+    def _voxelise_and_append(self, pts: np.ndarray):
+        ijk = np.floor(pts * self._inv_res).astype(np.int32)
+        unique = set(map(tuple, ijk))
+        new = unique - self._seen_keys
+        if not new:
+            return 0
+        self._seen_keys.update(new)
+        arr = np.array(list(new), dtype=np.float32)
+        centres = arr * self.cfg.octo_resolution + self._half_res
+        n = len(centres)
+        if self._vis_len + n > len(self._vis_buf):
+            ns = max(len(self._vis_buf) * 2, self._vis_len + n)
+            nb = np.zeros((ns, 3), dtype=np.float32)
+            nb[:self._vis_len] = self._vis_buf[:self._vis_len]
+            self._vis_buf = nb
+        self._vis_buf[self._vis_len:self._vis_len + n] = centres
+        self._vis_len += n
+        return n
+
+    def _get_vis(self) -> np.ndarray:
+        return self._vis_buf[:self._vis_len]
+
+    def _recomposite_from_submaps(self):
+        values = self._isam.calculateEstimate()
+        self._seen_keys = set()
+        self._vis_buf = np.zeros((self.cfg.vis_buffer_size, 3), dtype=np.float32)
+        self._vis_len = 0
+        for sm in self._submaps:
+            try:
+                updated_T = pose3_to_T(
+                    values.atPose3(symbol('x', sm.anchor_index)))
+            except Exception:
+                updated_T = sm.anchor_T
+            world_pts = sm.get_world_points(updated_T)
+            if len(world_pts) > 0:
+                self._voxelise_and_append(world_pts.astype(np.float64))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ReplaySLAM — run on recorded flight data
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ReplaySLAM:
+    """Feed recorded flight data to ``SLAMPipeline``.
+
+    Usage::
+
+        replay = ReplaySLAM(SLAMConfig(registration="vgicp"))
+        replay.run()                          # latest recording
+        replay.run("/path/to/flight_dir")     # explicit directory
+    """
+
+    def __init__(self, config: SLAMConfig | None = None,
+                 pipeline: SLAMPipeline | None = None):
+        self.cfg = config or SLAMConfig()
+        self.pipeline = pipeline or SLAMPipeline(self.cfg)
+        self.recording_dir: str = ""
+
+    def run(self, recording_dir: str = "") -> SLAMPipeline:
+        """Replay all frames and return the pipeline (with map, poses, etc.)."""
+        self.recording_dir = resolve_recording_dir(recording_dir or self.cfg.recording_dir)
+        all_frames = sorted(glob.glob(os.path.join(self.recording_dir, "frame_*.npz")))
+        if not all_frames:
+            print(f"No frames in {self.recording_dir}")
+            return self.pipeline
+
+        frames = all_frames[::self.cfg.frame_skip]
+        if self.cfg.max_frames > 0:
+            frames = frames[:self.cfg.max_frames]
+
+        print(f"Replaying {len(frames)} frames from {self.recording_dir}")
+        print(f"  available={len(all_frames)} skip={self.cfg.frame_skip} "
+              f"max={self.cfg.max_frames or 'all'}")
+        print(f"  registration={self.cfg.registration}  "
+              f"octo_res={self.cfg.octo_resolution}m  mode=deferred")
+        print(f"  submaps: enabled  frames_per_submap={self.cfg.submap_frames}")
+
+        # Start viewer
+        if self.cfg.enable_viewer:
+            self.pipeline.start_viewer()
+
+        # Optionally set up live quality plot
+        quality_plot = _QualityPlot(self.cfg.registration)
+
+        for i, path in enumerate(frames):
+            t0 = time.perf_counter()
+            data = np.load(path)
+            pts = data["points"]
+            load_time = time.perf_counter() - t0
+            self.pipeline.timings["load"].append(load_time)
+
+            pos = data["position"] if "position" in data.files else np.zeros(3)
+            ori = (data["orientation"] if "orientation" in data.files
+                   else np.array([1, 0, 0, 0], dtype=float))
+            lp = data["lidar_position"] if "lidar_position" in data.files else None
+            lo = data["lidar_orientation"] if "lidar_orientation" in data.files else None
+            gps = data["gps"] if "gps" in data.files else None
+
+            result = self.pipeline.process_frame(
+                pts, pos, ori,
+                gps=gps,
+                lidar_position=lp,
+                lidar_orientation=lo,
+                frame_label=i,
+            )
+
+            quality_plot.update(self.pipeline)
+
+        # ── Post-loop ─────────────────────────────────────────────────────
+        self.pipeline.get_corrected_map_points()
+
+        # Save OctoMap
+        bt_path = os.path.join(self.recording_dir, "map.bt")
+        try:
+            self.pipeline.save_octomap(bt_path)
+        except Exception as e:
+            print(f"  (could not save OctoMap: {e})")
+
+        # Save quality plot
+        try:
+            png_path = os.path.join(self.recording_dir, "reg_quality.png")
+            quality_plot.save(png_path, self.pipeline)
+            print(f"  Quality plot saved to {png_path}")
+        except Exception as e:
+            print(f"  (could not save quality plot: {e})")
+
+        self.pipeline.print_summary()
+        return self.pipeline
+
+    def wait_for_exit(self):
+        """Block until Ctrl+C, then stop viewer."""
+        print("\nClose the Open3D window or Ctrl+C to exit.")
+        try:
+            while True:
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.pipeline.stop_viewer()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LiveSLAM — real-time mapping with AirSim
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LiveSLAM:
+    """Connect to AirSim and map in real time.
+
+    Usage::
+
+        live = LiveSLAM(SLAMConfig(registration="vgicp"))
+        live.run()        # blocking — Ctrl+C to stop and save
+
+    Or drive from your own control loop::
+
+        live = LiveSLAM(config)
+        live.connect()
+        while flying:
+            live.process_once()    # grab one scan and feed to pipeline
+        live.finish("/path/to/output")
+    """
+
+    def __init__(self, config: SLAMConfig | None = None,
+                 pipeline: SLAMPipeline | None = None):
+        self.cfg = config or SLAMConfig()
+        self.pipeline = pipeline or SLAMPipeline(self.cfg)
+        self.client = None
+        self._frame_count = 0
+        self._min_interval = 1.0 / max(self.cfg.live_max_hz, 0.1)
+        self._last_scan_time = 0.0
+        self._target_pos = None
+
+        # Optional: save directory for recording frames alongside mapping
+        self.save_dir: str | None = None
+
+    def set_target(self, pos):
+        """Set the current target waypoint (shown as green sphere in viewer)."""
+        self._target_pos = pos
+        self.pipeline.set_target_pos(pos)
+
+    def set_frontier_points(self, pts):
+        """Set frontier overlay points (Nx3) shown as orange in the viewer."""
+        self.pipeline.set_frontier_points(pts)
+
+    def connect(self):
+        """Connect to AirSim and arm the drone."""
+        import cosysairsim as airsim
+        print("Connecting to AirSim...")
+        self.client = airsim.MultirotorClient()
+        self.client.confirmConnection()
+        self.client.enableApiControl(True)
+        self.client.armDisarm(True)
+        print("Connected!")
+        time.sleep(0.5)
+
+    def enable_recording(self, save_dir: str | None = None):
+        """Enable saving raw frames to disk alongside live mapping."""
+        if save_dir is None:
+            base = os.path.join(os.path.dirname(__file__), "flight_recordings")
+            save_dir = os.path.join(base, f"flight_{int(time.time())}")
+        os.makedirs(save_dir, exist_ok=True)
+        self.save_dir = save_dir
+        print(f"  Recording frames to {self.save_dir}")
+
+    def process_once(self) -> dict | None:
+        """Grab one LiDAR scan + pose from AirSim and feed to the pipeline.
+
+        Returns None if called too soon (rate-limited) or no data available.
+        """
+        import cosysairsim as airsim
+
+        now = time.time()
+        if now - self._last_scan_time < self._min_interval:
+            return None
+
+        if self.client is None:
+            raise RuntimeError("Call connect() before process_once()")
+
+        # ── Sample state BEFORE LiDAR ─────────────────────────────────────
+        state_before = self.client.getMultirotorState()
+
+        # ── Get sensor data ───────────────────────────────────────────────
+        lidar_data = self.client.getLidarData()
+
+        # ── Sample state AFTER LiDAR ──────────────────────────────────────
+        state_after = self.client.getMultirotorState()
+
+        if len(lidar_data.point_cloud) < 9:  # at least 3 points
+            return None
+
+        points = np.array(lidar_data.point_cloud, dtype=np.float32).reshape((-1, 3))
+
+        # Interpolate pose to LiDAR timestamp
+        pos, ori = self._interpolate_pose(state_before, state_after, lidar_data)
+
+        # LiDAR mount offset
+        lpos = lidar_data.pose.position
+        lori = lidar_data.pose.orientation
+        lidar_position = np.array([lpos.x_val, lpos.y_val, lpos.z_val])
+        lidar_orientation = np.array([lori.w_val, lori.x_val, lori.y_val, lori.z_val])
+
+        # GPS
+        gps = None
+        try:
+            gps_data = self.client.getGpsData()
+            gp = gps_data.gnss.geo_point
+            gps = np.array([gp.latitude, gp.longitude, gp.altitude])
+        except Exception:
+            pass
+
+        # ── Optional: save frame to disk ──────────────────────────────────
+        if self.save_dir is not None:
+            self._save_frame(points, pos, ori, lidar_position, lidar_orientation, gps)
+
+        # ── Feed to pipeline ──────────────────────────────────────────────
+        self.pipeline.set_drone_pos(pos)
+        result = self.pipeline.process_frame(
+            points, pos, ori,
+            gps=gps,
+            lidar_position=lidar_position,
+            lidar_orientation=lidar_orientation,
+            frame_label=self._frame_count,
+        )
+
+        self._frame_count += 1
+        self._last_scan_time = now
+        return result
+
+    def run(self, save_dir: str | None = None, takeoff: bool = True):
+        """Full blocking loop: connect, optionally takeoff, map until Ctrl+C.
+
+        Parameters
+        ----------
+        save_dir : str, optional — also record raw frames to disk.
+        takeoff : bool — call takeoffAsync() before starting the loop.
+        """
+        self.connect()
+
+        if save_dir is not None:
+            self.enable_recording(save_dir)
+
+        if self.cfg.enable_viewer:
+            self.pipeline.start_viewer()
+
+        if takeoff:
+            print("Taking off...")
+            self.client.takeoffAsync().join()
+            time.sleep(1)
+
+        print(f"Live mapping started  (registration={self.cfg.registration}, "
+              f"max_hz={self.cfg.live_max_hz})")
+        print("Press Ctrl+C to stop.\n")
+
+        try:
+            while True:
+                self.process_once()
+                time.sleep(0.001)  # yield to OS
+        except KeyboardInterrupt:
+            print("\nStopping live mapping...")
+
+        self.finish()
+
+    def finish(self, output_dir: str | None = None):
+        """Finalise: correct map, save OctoMap, print summary, stop viewer."""
+        self.pipeline.get_corrected_map_points()
+
+        out = output_dir or self.save_dir
+        if out:
+            bt_path = os.path.join(out, "map.bt")
+            try:
+                self.pipeline.save_octomap(bt_path)
+            except Exception as e:
+                print(f"  (could not save OctoMap: {e})")
+
+        self.pipeline.print_summary()
+        self.pipeline.stop_viewer()
+
+    # ── Private helpers ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_pose(state):
+        ts = float(state.timestamp)
+        p = state.kinematics_estimated.position
+        o = state.kinematics_estimated.orientation
+        pos  = np.array([p.x_val, p.y_val, p.z_val])
+        quat = np.array([o.w_val, o.x_val, o.y_val, o.z_val])  # w,x,y,z
+        return ts, pos, quat
+
+    @staticmethod
+    def _interpolate_pose(state_before, state_after, lidar_data):
+        """Interpolate vehicle pose to the LiDAR timestamp."""
+        from scipy.spatial.transform import Slerp
+
+        ts_b, pos_b, ori_b = LiveSLAM._extract_pose(state_before)
+        ts_a, pos_a, ori_a = LiveSLAM._extract_pose(state_after)
+        lidar_ts = float(lidar_data.time_stamp)
+
+        dt = ts_a - ts_b
+        if dt <= 0:
+            return pos_b, ori_b
+
+        t = np.clip((lidar_ts - ts_b) / dt, 0.0, 1.0)
+
+        # Linear position
+        pos = (1 - t) * pos_b + t * pos_a
+
+        # SLERP orientation (scipy wants x, y, z, w)
+        rots = Rotation.from_quat([
+            [ori_b[1], ori_b[2], ori_b[3], ori_b[0]],
+            [ori_a[1], ori_a[2], ori_a[3], ori_a[0]],
+        ])
+        slerp = Slerp([0.0, 1.0], rots)
+        q_scipy = slerp([t])[0].as_quat()   # x, y, z, w
+        quat = np.array([q_scipy[3], q_scipy[0], q_scipy[1], q_scipy[2]])  # w, x, y, z
+
+        return pos, quat
+
+    def _save_frame(self, points, pos, ori, lidar_pos, lidar_ori, gps):
+        path = os.path.join(self.save_dir, f"frame_{self._frame_count:05d}.npz")
+        kw = dict(
+            points=points,
+            position=pos,
+            orientation=ori,
+            lidar_position=lidar_pos,
+            lidar_orientation=lidar_ori,
+        )
+        if gps is not None:
+            kw["gps"] = gps
+        np.savez(path, **kw)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Quality plot helper (used by ReplaySLAM; can also be used standalone)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _QualityPlot:
+    """Live matplotlib registration quality dashboard."""
+
+    def __init__(self, method_name: str = ""):
+        try:
+            import matplotlib
+            matplotlib.use("TkAgg")
+            import matplotlib.pyplot as plt
+        except Exception:
+            self._ok = False
+            return
+
+        self._ok = True
+        plt.ion()
+        self.fig, axes = plt.subplots(2, 2, figsize=(12, 7))
+        self.fig.suptitle(f"Registration Quality  ({method_name})", fontsize=13)
+        self.ax_fit, self.ax_rmse, self.ax_dt, self.ax_dr = axes.flat
+        self.axes = axes
+
+        self.line_fit,  = self.ax_fit.plot([], [], 'b-', lw=1)
+        self.ax_fit.set_ylabel('Fitness'); self.ax_fit.set_xlabel('Frame')
+        self.ax_fit.set_title('Fitness (higher = better overlap)')
+        self.ax_fit.axhline(0.5, color='g', ls='--', lw=0.7, label='good')
+        self.ax_fit.axhline(0.2, color='r', ls='--', lw=0.7, label='poor')
+        self.ax_fit.legend(fontsize=8)
+
+        self.line_rmse, = self.ax_rmse.plot([], [], 'r-', lw=1)
+        self.ax_rmse.set_ylabel('Inlier RMSE (m)'); self.ax_rmse.set_xlabel('Frame')
+        self.ax_rmse.set_title('RMSE (lower = tighter fit)')
+        self.ax_rmse2 = self.ax_rmse.twinx()
+        self.line_p_rmse, = self.ax_rmse2.plot([], [], color='orange', ls='--',
+                                                lw=0.8, alpha=0.7, label='p-value')
+        self.ax_rmse2.set_ylabel('p-value', color='orange')
+        self.ax_rmse2.tick_params(axis='y', labelcolor='orange')
+        self.ax_rmse2.set_ylim(-0.05, 1.05)
+
+        self.line_dt,   = self.ax_dt.plot([], [], 'm-', lw=1)
+        self.ax_dt.set_ylabel('\u0394t (m)'); self.ax_dt.set_xlabel('Frame')
+        self.ax_dt.set_title('Translation correction')
+
+        self.line_dr,   = self.ax_dr.plot([], [], 'c-', lw=1)
+        self.ax_dr.set_ylabel('\u0394r (\u00b0)'); self.ax_dr.set_xlabel('Frame')
+        self.ax_dr.set_title('Rotation correction')
+        self.ax_dr2 = self.ax_dr.twinx()
+        self.line_p_dr, = self.ax_dr2.plot([], [], color='orange', ls='--',
+                                            lw=0.8, alpha=0.7, label='p-value')
+        self.ax_dr2.set_ylabel('p-value', color='orange')
+        self.ax_dr2.tick_params(axis='y', labelcolor='orange')
+        self.ax_dr2.set_ylim(-0.05, 1.05)
+
+        self.scat_rej_rmse = self.ax_rmse.scatter([], [], c='red', marker='x',
+                                                   s=40, zorder=5, linewidths=1.5)
+        self.scat_rej_dr   = self.ax_dr.scatter([], [], c='red', marker='x',
+                                                  s=40, zorder=5, linewidths=1.5)
+
+        for ax in axes.flat:
+            ax.grid(True, alpha=0.3)
+        self.fig.tight_layout()
+        plt.show(block=False)
+        plt.pause(0.01)
+
+    def update(self, pipeline: SLAMPipeline):
+        if not self._ok:
+            return
+        try:
+            p = pipeline
+            self.line_fit.set_data(p.q_frames, p.q_fitness)
+            self.line_rmse.set_data(p.q_frames, p.q_rmse)
+            self.line_p_rmse.set_data(p.q_frames, p.q_p_rmse)
+            self.line_dt.set_data(p.q_frames, p.q_dt)
+            self.line_dr.set_data(p.q_frames, p.q_dr)
+            self.line_p_dr.set_data(p.q_frames, p.q_p_dr)
+
+            if p.q_rejected:
+                rej_xy_rmse = np.column_stack(
+                    ([p.q_frames[j] for j in p.q_rejected],
+                     [p.q_rmse[j]   for j in p.q_rejected]))
+                rej_xy_dr = np.column_stack(
+                    ([p.q_frames[j] for j in p.q_rejected],
+                     [p.q_dr[j]     for j in p.q_rejected]))
+                self.scat_rej_rmse.set_offsets(rej_xy_rmse)
+                self.scat_rej_dr.set_offsets(rej_xy_dr)
+
+            for ax in self.axes.flat:
+                ax.relim(); ax.autoscale_view()
+            self.ax_rmse2.set_ylim(-0.05, 1.05)
+            self.ax_dr2.set_ylim(-0.05, 1.05)
+            self.fig.canvas.draw_idle()
+            self.fig.canvas.flush_events()
+        except Exception:
+            pass
+
+    def save(self, path: str, pipeline: SLAMPipeline):
+        if not self._ok:
+            return
+        p = pipeline
+        # Mark low-fitness frames
+        bad_idx = [j for j, f in enumerate(p.q_fitness) if 0 < f < 0.3]
+        if bad_idx:
+            self.ax_fit.scatter([p.q_frames[j] for j in bad_idx],
+                                [p.q_fitness[j] for j in bad_idx],
+                                c='red', s=25, zorder=5, label='fit < 0.3')
+            self.ax_fit.legend(fontsize=8)
+
+        if p.q_rejected:
+            rej_f = [p.q_frames[j] for j in p.q_rejected]
+            self.ax_rmse.scatter(rej_f, [p.q_rmse[j] for j in p.q_rejected],
+                                 c='red', marker='x', s=40, zorder=5,
+                                 linewidths=1.5, label='rejected')
+            self.ax_rmse.legend(fontsize=8, loc='upper left')
+            self.ax_dr.scatter(rej_f, [p.q_dr[j] for j in p.q_rejected],
+                               c='red', marker='x', s=40, zorder=5,
+                               linewidths=1.5, label='rejected')
+            self.ax_dr.legend(fontsize=8, loc='upper left')
+
+        for ax in self.axes.flat:
+            ax.relim(); ax.autoscale_view()
+        self.ax_rmse2.set_ylim(-0.05, 1.05)
+        self.ax_dr2.set_ylim(-0.05, 1.05)
+        self.fig.savefig(path, dpi=150, bbox_inches='tight')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CLI entry point (backward-compatible)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_replay(recording_dir: str = ""):
+    """Legacy entry point — wraps ``ReplaySLAM`` for backward compatibility."""
+    cfg = SLAMConfig(
+        registration="vgicp",
+        recording_dir=recording_dir,
+    )
+    replay = ReplaySLAM(cfg)
+    replay.run(recording_dir)
+    replay.wait_for_exit()
 
 
 if __name__ == "__main__":
     t0 = time.perf_counter()
-    run_replay(sys.argv[1] if len(sys.argv) > 1 else RECORDING_DIR)
+    run_replay(sys.argv[1] if len(sys.argv) > 1 else "")
     print(f"\nWall-clock: {time.perf_counter()-t0:.1f}s")
