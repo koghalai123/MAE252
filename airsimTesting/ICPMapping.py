@@ -1,477 +1,470 @@
+"""3D Mapping with ICP refinement — stitch LiDAR scans into a global point cloud.
+
+Extends basicMapping3D.py by using Open3D's point-to-plane ICP to refine the
+drone pose before each scan is merged.  The workflow is:
+
+  1.  Transform the new scan to an *initial* world pose using the recorded
+      vehicle state (same as basicMapping3D).
+  2.  Down-sample the new scan and the current global map to voxel grids.
+  3.  Estimate surface normals on both clouds.
+  4.  Run point-to-plane ICP with the state-derived pose as the initial guess.
+  5.  Apply the ICP-refined 4×4 transform to the *full-resolution* new scan
+      and merge it into the global map.
+
+This corrects the residual timing-mismatch errors that cause individual scans
+to be slightly tilted relative to the rest of the map.
+
+Modes
+-----
+REPLAY : load a flight_recordings/ directory recorded by saveFlightData.py
+LIVE   : fly waypoints in Unreal / AirSim, accumulate scans in real time
+
+Toggle the mode with USE_RECORDING / RECORDING_DIR below.
 """
-Advanced 3D Mapping using ICP-based SLAM
-Uses GPS for initial pose estimation and ICP for scan registration refinement
-Open3D for point cloud processing and visualization
-"""
+
 import cosysairsim as airsim
 import numpy as np
 import time
-import cv2
-from collections import deque
+import os
+import glob
+import open3d as o3d
+from scipy.spatial.transform import Rotation
+from sensorFeed import Viewer3D
 
-try:
-    import open3d as o3d
-    OPEN3D_AVAILABLE = True
-except ImportError:
-    print("Open3D not installed. Install with: pip install open3d")
-    print("Open3D is recommended for 3D mapping and visualization")
-    OPEN3D_AVAILABLE = False
-    exit(1)
+# ── Configuration ────────────────────────────────────────────────────────────
+USE_RECORDING = True
+RECORDING_DIR = "/home/koghalai/MAE252/airsimTesting/flight_recordings/"
 
+MAX_SCAN_HZ = 10  # live-mode scan rate limit
 
-class ICPSLAMMapper:
-    """
-    3D Mapping with ICP-based scan registration
-    Uses GPS for initial pose guess, then refines with ICP scan matching
-    """
-    
-    def __init__(self, voxel_size=0.15, icp_fitness_threshold=0.3):
-        """
-        Args:
-            voxel_size: Size of voxel for downsampling (meters)
-            icp_fitness_threshold: Minimum fitness score for ICP to be accepted
-        """
-        self.voxel_size = voxel_size
-        self.icp_fitness_threshold = icp_fitness_threshold
-        
-        # Map storage
-        self.global_map = o3d.geometry.PointCloud()
-        self.local_maps = []  # Store recent local maps for ICP
-        self.max_local_maps = 5
-        
-        # Pose tracking
-        self.poses = []  # List of refined poses
-        self.gps_poses = []  # GPS-based poses for comparison
-        
-        # Statistics
-        self.scan_count = 0
-        self.icp_success_count = 0
-        self.total_drift = 0.0
-        
-    def add_scan(self, points, gps_position, orientation):
-        """
-        Add a lidar scan using ICP-based registration
-        
-        Args:
-            points: Nx3 numpy array of points in sensor frame
-            gps_position: (x, y, z) GPS position (used as initial guess)
-            orientation: (w, x, y, z) quaternion orientation
-        """
-        if len(points) == 0 or len(points) < 100:
-            return
-        
-        # Create point cloud from this scan
-        scan_pcd = o3d.geometry.PointCloud()
-        scan_pcd.points = o3d.utility.Vector3dVector(points)
-        
-        # Remove outliers
-        scan_pcd, _ = scan_pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-        
-        # Downsample the scan
-        scan_pcd = scan_pcd.voxel_down_sample(self.voxel_size)
-        
-        if len(scan_pcd.points) < 50:
-            return
-        
-        # Compute normals for better ICP
-        scan_pcd.estimate_normals(
-            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.5, max_nn=30)
-        )
-        
-        # GPS-based transformation (initial guess)
-        gps_transform = self._create_transform_matrix(gps_position, orientation)
-        self.gps_poses.append(gps_transform)
-        
-        # First scan - just add it
-        if self.scan_count == 0:
-            scan_pcd.transform(gps_transform)
-            # Don't replace reference, copy data to maintain visualizer connection
-            self.global_map.points = scan_pcd.points
-            self.global_map.colors = scan_pcd.colors if scan_pcd.has_colors() else o3d.utility.Vector3dVector([])
-            self.global_map.normals = scan_pcd.normals if scan_pcd.has_normals() else o3d.utility.Vector3dVector([])
-            self.local_maps.append(o3d.geometry.PointCloud(scan_pcd))
-            self.poses.append(gps_transform)
-            self.scan_count += 1
-            return
-        
-        # ICP registration against recent local maps
-        refined_transform = self._register_scan_icp(scan_pcd, gps_transform)
-        
-        # Transform scan with refined pose
-        scan_pcd.transform(refined_transform)
-        
-        # Add to global map
-        self.global_map += scan_pcd
-        
-        # Store for future ICP matching
-        self.local_maps.append(scan_pcd)
-        if len(self.local_maps) > self.max_local_maps:
-            self.local_maps.pop(0)
-        
-        # Store pose
-        self.poses.append(refined_transform)
-        
-        # Periodically downsample global map
-        if self.scan_count % 10 == 0:
-            self.global_map = self.global_map.voxel_down_sample(self.voxel_size)
-            
-        self.scan_count += 1
-    
-    def _register_scan_icp(self, scan_pcd, initial_transform):
-        """
-        Register scan against local map using ICP
-        
-        Args:
-            scan_pcd: Current scan point cloud
-            initial_transform: GPS-based initial transformation
-            
-        Returns:
-            Refined transformation matrix
-        """
-        # Create target from recent local maps
-        target = o3d.geometry.PointCloud()
-        for local_map in self.local_maps[-3:]:  # Use last 3 scans
-            target += local_map
-        target = target.voxel_down_sample(self.voxel_size)
-        
-        if len(target.points) < 50:
-            return initial_transform
-        
-        # Estimate normals for target
-        target.estimate_normals(
-            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.5, max_nn=30)
-        )
-        
-        # Transform scan with initial guess
-        source = o3d.geometry.PointCloud(scan_pcd)
-        source.transform(initial_transform)
-        
-        # Point-to-plane ICP
-        icp_result = o3d.pipelines.registration.registration_icp(
-            source, target,
-            max_correspondence_distance=self.voxel_size * 3,
-            init=np.eye(4),
-            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-            criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-                max_iteration=50,
-                relative_fitness=1e-6,
-                relative_rmse=1e-6
-            )
-        )
-        
-        # Check if ICP succeeded
-        if icp_result.fitness > self.icp_fitness_threshold:
-            self.icp_success_count += 1
-            # Combine ICP refinement with initial transform
-            refined_transform = icp_result.transformation @ initial_transform
-            
-            # Calculate drift correction
-            drift = np.linalg.norm(refined_transform[:3, 3] - initial_transform[:3, 3])
-            self.total_drift += drift
-            
-            return refined_transform
-        else:
-            # ICP failed, use GPS pose
-            return initial_transform
-        
-    def _create_transform_matrix(self, position, orientation):
-        """Create 4x4 transformation matrix from position and quaternion"""
-        # Convert quaternion to rotation matrix
-        w, x, y, z = orientation
-        
-        # Quaternion to rotation matrix
-        R = np.array([
-            [1 - 2*(y**2 + z**2), 2*(x*y - w*z), 2*(x*z + w*y)],
-            [2*(x*y + w*z), 1 - 2*(x**2 + z**2), 2*(y*z - w*x)],
-            [2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x**2 + y**2)]
-        ])
-        
-        # Create 4x4 transformation matrix
-        T = np.eye(4)
-        T[:3, :3] = R
-        T[:3, 3] = position
-        
-        return T
-    
-    def get_map(self):
-        """Get the current global map"""
-        return self.global_map
-    
-    def colorize_by_height(self):
-        """Color points by height (z coordinate)"""
-        if len(self.global_map.points) == 0:
-            return
-        
-        points = np.asarray(self.global_map.points)
-        z_values = points[:, 2]
-        
-        # Normalize z values to 0-1 range
-        z_min, z_max = z_values.min(), z_values.max()
-        if z_max > z_min:
-            z_norm = (z_values - z_min) / (z_max - z_min)
-        else:
-            z_norm = np.zeros_like(z_values)
-        
-        # Create color map (blue = low, green = mid, red = high)
-        colors = np.zeros((len(points), 3))
-        colors[:, 2] = 1 - z_norm  # Blue decreases with height
-        colors[:, 0] = z_norm      # Red increases with height
-        colors[:, 1] = 1 - np.abs(z_norm - 0.5) * 2  # Green peaks at middle
-        
-        self.global_map.colors = o3d.utility.Vector3dVector(colors)
-    
-    def save_map(self, filename="map.ply"):
-        """Save map to file"""
-        # Final global downsampling
-        final_map = self.global_map.voxel_down_sample(self.voxel_size * 0.8)
-        
-        # Remove statistical outliers
-        final_map, _ = final_map.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-        
-        o3d.io.write_point_cloud(filename, final_map)
-        print(f"Map saved to {filename}")
-        print(f"Final map points: {len(final_map.points):,}")
-        
-    def get_statistics(self):
-        """Get mapping statistics"""
-        icp_success_rate = (self.icp_success_count / max(self.scan_count - 1, 1)) * 100
-        avg_drift = self.total_drift / max(self.scan_count - 1, 1)
-        
-        return {
-            'total_scans': self.scan_count,
-            'total_points': len(self.global_map.points),
-            'icp_success_rate': icp_success_rate,
-            'average_drift_correction': avg_drift
-        }
+WAYPOINTS = [
+    (0, 0, -10),
+    (10, 0, -10),
+    (10, 10, -10),
+    (0, 10, -10),
+    (0, 0, -10),
+    (5, 5, -15),
+    (0, 0, -10),
+]
+FLY_VELOCITY = 3  # m/s
+
+# ── ICP parameters ───────────────────────────────────────────────────────────
+ICP_VOXEL_SIZE      = 0.25   # down-sample resolution for ICP matching (metres)
+ICP_MAX_CORR_DIST   = 1.0    # maximum correspondence distance
+ICP_MAX_ITERATION   = 30     # ICP iteration cap
+ICP_RELATIVE_FITNESS = 1e-6  # convergence threshold (fitness change)
+ICP_RELATIVE_RMSE    = 1e-6  # convergence threshold (RMSE change)
+ICP_MIN_MAP_POINTS  = 5000   # skip ICP until the map has this many points
+NORMAL_RADIUS       = 0.50   # radius for normal estimation
+NORMAL_MAX_NN       = 20     # max neighbours for normal estimation
+MAP_VOXEL_SIZE      = 0.05   # voxel size for thinning the stored global map
+                              # (0 = keep all points, costs more RAM)
+ICP_LOCAL_RADIUS    = 30.0   # only use map points within this radius of scan
+                              # centroid for ICP (metres).  0 = use whole map.
+USE_GPU             = True   # use CUDA-accelerated tensor ICP when available
 
 
-def get_lidar_scan(client):
-    """Get lidar point cloud data"""
-    try:
-        lidar_data = client.getLidarData()
-        
-        if len(lidar_data.point_cloud) < 3:
-            return None
-        
-        # Parse point cloud
-        points = np.array(lidar_data.point_cloud, dtype=np.float32)
-        points = points.reshape((-1, 3))
-        
-        return points
-    except Exception as e:
+# ── Utility functions ────────────────────────────────────────────────────────
+
+def filter_valid_points(points):
+    """Remove zero / invalid LiDAR returns (all-zero rows)."""
+    return points[np.any(points != 0, axis=1)]
+
+
+def transform_points(points, position, orientation):
+    """Rotate + translate *points* by a pose given as position + [w,x,y,z] quat."""
+    rot = Rotation.from_quat([orientation[1], orientation[2],
+                              orientation[3], orientation[0]])
+    R = rot.as_matrix()
+    return (R @ points.T).T + position
+
+
+def apply_T(points, T):
+    """Apply a 4×4 homogeneous transform to Nx3 points."""
+    pts_h = np.hstack([points, np.ones((len(points), 1))])
+    return (T @ pts_h.T).T[:, :3]
+
+
+def fit_plane(points, label=""):
+    """Fit a plane via SVD and print its slope.  Returns (normal, slope_x, slope_y)."""
+    if len(points) < 10:
         return None
+    centroid = points.mean(axis=0)
+    _, _, Vt = np.linalg.svd(points - centroid, full_matrices=False)
+    normal = Vt[-1]
+    if normal[2] != 0:
+        slope_x = -normal[0] / normal[2]
+        slope_y = -normal[1] / normal[2]
+    else:
+        slope_x = slope_y = float("nan")
+    print(f"  {label}plane slope  x: {slope_x:+.4f}  y: {slope_y:+.4f}  "
+          f"normal: [{normal[0]:+.4f}, {normal[1]:+.4f}, {normal[2]:+.4f}]")
+    return normal, slope_x, slope_y
 
 
-def get_camera_image(client):
-    """Get camera image"""
-    responses = client.simGetImages([
-        airsim.ImageRequest("0", airsim.ImageType.Scene, False, False)
-    ])
-    
-    if responses:
-        response = responses[0]
-        img1d = np.frombuffer(response.image_data_uint8, dtype=np.uint8)
-        img_rgb = img1d.reshape(response.height, response.width, 3)
-        return img_rgb
-    return None
+def resolve_recording_dir(path):
+    """If *path* is the parent recordings folder, pick the latest flight_* subfolder."""
+    if os.path.isfile(os.path.join(path, "frame_00000.npz")):
+        return path
+    flights = sorted(glob.glob(os.path.join(path, "flight_*")))
+    if flights:
+        return flights[-1]
+    return path
 
 
-def visualize_mapping(mapper, camera_img=None):
-    """Create a visualization combining 3D map and camera view with SLAM stats"""
-    vis_img = None
-    
-    if camera_img is not None:
-        # Resize camera image for display
-        vis_img = cv2.resize(camera_img, (640, 480))
-        
-        # Add mapping stats overlay
-        stats = mapper.get_statistics()
-        
-        # Draw semi-transparent overlay
-        overlay = vis_img.copy()
-        cv2.rectangle(overlay, (10, 10), (350, 130), (0, 0, 0), -1)
-        vis_img = cv2.addWeighted(vis_img, 0.7, overlay, 0.3, 0)
-        
-        # Add text
-        cv2.putText(vis_img, "ICP-SLAM MAPPING", (20, 35),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        cv2.putText(vis_img, f"Points: {stats['total_points']:,}", (20, 60),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(vis_img, f"Scans: {stats['total_scans']}", (20, 80),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(vis_img, f"ICP Success: {stats['icp_success_rate']:.1f}%", (20, 100),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-        cv2.putText(vis_img, f"Avg Drift Fix: {stats['average_drift_correction']:.3f}m", (20, 120),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-    
-    return vis_img
+# ── Detect GPU at import time ────────────────────────────────────────────────
+_HAS_CUDA = False
+try:
+    if USE_GPU and o3d.core.cuda.is_available():
+        _HAS_CUDA = True
+        _DEVICE = o3d.core.Device("CUDA:0")
+        print("ICP: using CUDA GPU acceleration")
+except Exception:
+    pass
+if not _HAS_CUDA:
+    _DEVICE = o3d.core.Device("CPU:0")
+    print("ICP: using CPU")
 
 
-def main():
-    # Connect to AirSim
+# ── ICP helpers ──────────────────────────────────────────────────────────────
+
+def _to_pcd(points):
+    """Numpy Nx3 → Open3D legacy PointCloud."""
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
+    return pcd
+
+
+def _to_tpcd(points, device=None):
+    """Numpy Nx3 → Open3D *tensor* PointCloud on the given device."""
+    if device is None:
+        device = _DEVICE
+    tpcd = o3d.t.geometry.PointCloud(device)
+    tpcd.point.positions = o3d.core.Tensor(points.astype(np.float64), device=device)
+    return tpcd
+
+
+def _estimate_normals_tensor(tpcd):
+    """Estimate normals on a tensor PointCloud (in-place)."""
+    tpcd.estimate_normals(radius=NORMAL_RADIUS, max_nn=NORMAL_MAX_NN)
+    return tpcd
+
+
+def _downsample_tensor(tpcd, voxel_size):
+    """Voxel-downsample a tensor PointCloud."""
+    if voxel_size > 0:
+        return tpcd.voxel_down_sample(voxel_size)
+    return tpcd
+
+
+def _extract_local_window(map_pts, centroid, radius):
+    """Return map points within *radius* of *centroid* (fast numpy mask)."""
+    if radius <= 0:
+        return map_pts
+    diff = map_pts - centroid
+    dist_sq = np.einsum('ij,ij->i', diff, diff)
+    return map_pts[dist_sq <= radius * radius]
+
+
+def _downsample_legacy(pcd, voxel_size):
+    """Voxel-downsample a legacy point cloud."""
+    if voxel_size > 0:
+        return pcd.voxel_down_sample(voxel_size)
+    return pcd
+
+
+def _estimate_normals_legacy(pcd):
+    """Estimate surface normals on a legacy PointCloud in-place."""
+    pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(
+            radius=NORMAL_RADIUS, max_nn=NORMAL_MAX_NN
+        )
+    )
+    return pcd
+
+
+def run_icp(source_pts, target_pts, init_T=np.eye(4)):
+    """Run point-to-plane ICP.  Returns (4×4 refined transform, fitness, rmse).
+
+    Uses CUDA tensor ICP when available, otherwise falls back to the legacy
+    CPU pipeline.  A local spatial window is extracted from the target map
+    to avoid processing millions of irrelevant points.
+
+    Parameters
+    ----------
+    source_pts : Nx3 float — the *new* scan (already roughly placed in world frame)
+    target_pts : Mx3 float — the accumulated global map
+    init_T     : 4×4        — starting transform (identity = scan already placed)
+    """
+    # ── Extract local window from target map ──────────────────────────────
+    centroid = source_pts.mean(axis=0)
+    local_target = _extract_local_window(target_pts, centroid, ICP_LOCAL_RADIUS)
+    if len(local_target) < 100:
+        local_target = target_pts  # fallback to full map
+
+    init_T_64 = init_T.astype(np.float64)
+
+    if _HAS_CUDA:
+        return _run_icp_tensor(source_pts, local_target, init_T_64)
+    else:
+        return _run_icp_legacy(source_pts, local_target, init_T_64)
+
+
+def _run_icp_tensor(source_pts, target_pts, init_T):
+    """GPU-accelerated tensor ICP."""
+    src = _downsample_tensor(_to_tpcd(source_pts), ICP_VOXEL_SIZE)
+    tgt = _downsample_tensor(_to_tpcd(target_pts), ICP_VOXEL_SIZE)
+
+    _estimate_normals_tensor(src)
+    _estimate_normals_tensor(tgt)
+
+    criteria = o3d.t.pipelines.registration.ICPConvergenceCriteria(
+        max_iteration=ICP_MAX_ITERATION,
+        relative_fitness=ICP_RELATIVE_FITNESS,
+        relative_rmse=ICP_RELATIVE_RMSE,
+    )
+
+    estimation = o3d.t.pipelines.registration.TransformationEstimationPointToPlane()
+
+    result = o3d.t.pipelines.registration.icp(
+        source=src,
+        target=tgt,
+        max_correspondence_distance=ICP_MAX_CORR_DIST,
+        init_source_to_target=o3d.core.Tensor(init_T, device=_DEVICE),
+        estimation_method=estimation,
+        criteria=criteria,
+    )
+    T = result.transformation.cpu().numpy()
+    return T, result.fitness, result.inlier_rmse
+
+
+def _run_icp_legacy(source_pts, target_pts, init_T):
+    """CPU legacy ICP fallback."""
+    src_pcd = _downsample_legacy(_to_pcd(source_pts), ICP_VOXEL_SIZE)
+    tgt_pcd = _downsample_legacy(_to_pcd(target_pts), ICP_VOXEL_SIZE)
+
+    _estimate_normals_legacy(src_pcd)
+    _estimate_normals_legacy(tgt_pcd)
+
+    criteria = o3d.pipelines.registration.ICPConvergenceCriteria(
+        max_iteration=ICP_MAX_ITERATION,
+        relative_fitness=ICP_RELATIVE_FITNESS,
+        relative_rmse=ICP_RELATIVE_RMSE,
+    )
+
+    result = o3d.pipelines.registration.registration_icp(
+        source=src_pcd,
+        target=tgt_pcd,
+        max_correspondence_distance=ICP_MAX_CORR_DIST,
+        init=init_T,
+        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+        criteria=criteria,
+    )
+    return result.transformation, result.fitness, result.inlier_rmse
+
+
+def voxel_thin(points, voxel_size):
+    """Thin a point cloud via voxel down-sampling, returning Nx3 numpy array."""
+    if voxel_size <= 0 or len(points) == 0:
+        return points
+    pcd = _to_pcd(points)
+    pcd = pcd.voxel_down_sample(voxel_size)
+    return np.asarray(pcd.points, dtype=np.float32)
+
+
+# ── Replay mode ──────────────────────────────────────────────────────────────
+
+def run_replay(recording_dir):
+    recording_dir = resolve_recording_dir(recording_dir)
+    frames = sorted(glob.glob(os.path.join(recording_dir, "frame_*.npz")))
+    if not frames:
+        print(f"No frame_*.npz files found in {recording_dir}")
+        return
+
+    print(f"Replaying {len(frames)} frames from {recording_dir}")
+    print(f"ICP params: voxel={ICP_VOXEL_SIZE}, max_corr={ICP_MAX_CORR_DIST}, "
+          f"iter={ICP_MAX_ITERATION}, map_voxel={MAP_VOXEL_SIZE}")
+
+    viewer = Viewer3D()
+    global_map = np.zeros((0, 3), dtype=np.float32)
+
+    for i, path in enumerate(frames):
+        data = np.load(path)
+        points = filter_valid_points(data["points"])
+        if len(points) == 0:
+            continue
+
+        # ── Step 1: state-based transform (initial guess) ────────────────
+        lidar_pos = data["lidar_position"] if "lidar_position" in data.files else np.zeros(3)
+        lidar_ori = (data["lidar_orientation"] if "lidar_orientation" in data.files
+                     else np.array([1, 0, 0, 0], dtype=float))
+        body_pts = transform_points(points, lidar_pos, lidar_ori)
+
+        position = data["position"] if "position" in data.files else np.zeros(3)
+        orientation = (data["orientation"] if "orientation" in data.files
+                       else np.array([1, 0, 0, 0], dtype=float))
+        world_pts_initial = transform_points(body_pts, position, orientation)
+
+        # ── Step 2: ICP refinement against current map ───────────────────
+        if len(global_map) >= ICP_MIN_MAP_POINTS:
+            T_refine, fitness, rmse = run_icp(world_pts_initial, global_map)
+            world_pts = apply_T(world_pts_initial, T_refine).astype(np.float32)
+
+            # Decompose correction for logging
+            correction_t = T_refine[:3, 3]
+            correction_R = Rotation.from_matrix(T_refine[:3, :3])
+            correction_euler = correction_R.as_euler("xyz", degrees=True)
+            print(f"  ICP frame {i:03d}: fitness={fitness:.4f}  rmse={rmse:.4f}  "
+                  f"Δt={np.linalg.norm(correction_t):.4f}m  "
+                  f"Δr=({correction_euler[0]:+.2f}, {correction_euler[1]:+.2f}, "
+                  f"{correction_euler[2]:+.2f})°")
+        else:
+            world_pts = world_pts_initial.astype(np.float32)
+            print(f"  frame {i:03d}: map too small for ICP ({len(global_map)} pts), using state pose")
+
+        # ── Step 3: per-scan plane diagnostic ────────────────────────────
+        fit_plane(world_pts, label=f"frame {i:03d} ")
+
+        # ── Step 4: merge into global map ────────────────────────────────
+        global_map = np.vstack([global_map, world_pts])
+
+        # Periodically thin the map to keep RAM in check
+        if MAP_VOXEL_SIZE > 0 and len(global_map) > 2_000_000 and i % 5 == 4:
+            pre = len(global_map)
+            global_map = voxel_thin(global_map, MAP_VOXEL_SIZE)
+            print(f"  map thinned {pre:,} → {len(global_map):,}")
+
+        # ── Visualize ────────────────────────────────────────────────────
+        if i == 0:
+            viewer.start(initial_points=global_map)
+        else:
+            viewer.update(global_map)
+
+        extra = ""
+        if "gps" in data.files:
+            gps = data["gps"]
+            extra = f" | GPS ({gps[0]:.6f}, {gps[1]:.6f}, {gps[2]:.1f})"
+        print(f"  frame {i+1}/{len(frames)} | map pts {len(global_map):,}{extra}\n",
+              flush=True)
+
+    # Final thin + plane fit
+    if MAP_VOXEL_SIZE > 0:
+        global_map = voxel_thin(global_map, MAP_VOXEL_SIZE)
+    viewer.update(global_map)
+    print(f"\nFinal global map: {len(global_map):,} points")
+    fit_plane(global_map, label="FINAL ")
+
+    print(f"\nReplay complete — {len(global_map):,} points in map.")
+    print("Close the Open3D window or Ctrl+C to exit.")
+    try:
+        while True:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        viewer.stop()
+
+
+# ── Live mode ────────────────────────────────────────────────────────────────
+
+def run_live():
     print("Connecting to AirSim...")
     client = airsim.MultirotorClient()
     client.confirmConnection()
-    print("Connected!")
-    
-    # Enable API control
     client.enableApiControl(True)
     client.armDisarm(True)
-    time.sleep(1)
-    
-    # Create ICP-SLAM mapper
-    print("Initializing ICP-SLAM mapper...")
-    print("Using GPS for initial pose + ICP for refinement")
-    mapper = ICPSLAMMapper(voxel_size=0.15, icp_fitness_threshold=0.3)
-    
-    # Takeoff
+    time.sleep(0.5)
+
+    lidar = client.getLidarData()
+    init_pts = np.array(lidar.point_cloud, dtype=np.float32).reshape((-1, 3))
+
+    viewer = Viewer3D()
+    viewer.start(initial_points=init_pts)
+    global_map = np.zeros((0, 3), dtype=np.float32)
+
     print("Taking off...")
     client.takeoffAsync().join()
-    time.sleep(2)
-    
-    # Define flight path for mapping
-    waypoints = [
-        (0, 0, -10),
-        (10, 0, -10),
-        (10, 10, -10),
-        (0, 10, -10),
-        (0, 0, -10),
-        (5, 5, -15),  # Go higher for different perspective
-        (0, 0, -10),
-    ]
-    
-    print("Starting ICP-SLAM mapping flight...")
-    print("Building map with scan registration...")
-    print("ICP will refine GPS poses for accurate alignment")
-    print("Press 'q' in camera view to stop early")
-    
-    # Create Open3D visualizer (non-blocking)
-    vis = o3d.visualization.Visualizer()
-    vis.create_window(window_name="3D ICP-SLAM Map", width=800, height=600)
-    vis.add_geometry(mapper.global_map)
-    
-    # Add coordinate frame
-    coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=5.0)
-    vis.add_geometry(coord_frame)
-    
-    render_option = vis.get_render_option()
-    render_option.point_size = 2.0
-    render_option.background_color = np.array([0.1, 0.1, 0.1])
-    
-    # Flag to reset view after first scan
-    first_scan_received = False
-    
+    time.sleep(1)
+
+    min_interval = 1.0 / MAX_SCAN_HZ
+    last_scan = 0.0
+    scan_count = 0
+
     try:
-        for i, waypoint in enumerate(waypoints):
-            print(f"\nWaypoint {i+1}/{len(waypoints)}: {waypoint}")
-            
-            # Move to waypoint
-            client.moveToPositionAsync(
-                waypoint[0], waypoint[1], waypoint[2],
-                velocity=3
-            )
-            
-            # Collect scans while moving
-            while True:
-                # Get drone state
+        for i, wp in enumerate(WAYPOINTS):
+            print(f"\nWaypoint {i+1}/{len(WAYPOINTS)}: {wp}")
+            future = client.moveToPositionAsync(wp[0], wp[1], wp[2],
+                                                velocity=FLY_VELOCITY)
+
+            while not future._set_flag:
+                now = time.time()
+                if now - last_scan < min_interval:
+                    time.sleep(0.01)
+                    continue
+                last_scan = now
+
+                lidar = client.getLidarData()
+                points = np.array(lidar.point_cloud, dtype=np.float32).reshape((-1, 3))
+                points = filter_valid_points(points)
+                if len(points) == 0:
+                    continue
+
                 state = client.getMultirotorState()
-                position = state.kinematics_estimated.position
-                pos_array = np.array([position.x_val, position.y_val, position.z_val])
-                
-                orientation = state.kinematics_estimated.orientation
-                quat = np.array([orientation.w_val, orientation.x_val, 
-                               orientation.y_val, orientation.z_val])
-                
-                # Get lidar scan
-                points = get_lidar_scan(client)
-                if points is not None and len(points) > 0:
-                    prev_point_count = len(mapper.global_map.points)
-                    mapper.add_scan(points, pos_array, quat)
-                    
-                    # Reset view after first scan to fix bounding box
-                    if not first_scan_received and len(mapper.global_map.points) > 0:
-                        first_scan_received = True
-                        vis.reset_view_point(True)
-                        print(f"3D view initialized - map now has {len(mapper.global_map.points)} points")
-                    
-                    # Only update visualization if points were added
-                    if len(mapper.global_map.points) > prev_point_count:
-                        # Update colors
-                        mapper.colorize_by_height()
-                        
-                        # Update visualization
-                        vis.update_geometry(mapper.global_map)
-                    
-                    vis.poll_events()
-                    vis.update_renderer()
-                
-                # Show camera view
-                camera_img = get_camera_image(client)
-                if camera_img is not None:
-                    vis_img = visualize_mapping(mapper, camera_img)
-                    cv2.imshow("Camera + SLAM Info", vis_img)
-                
-                # Check if reached waypoint
-                distance = np.sqrt(
-                    (position.x_val - waypoint[0])**2 + 
-                    (position.y_val - waypoint[1])**2 + 
-                    (position.z_val - waypoint[2])**2
-                )
-                
-                if distance < 1.0:
-                    break
-                
-                # Check for quit
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    raise KeyboardInterrupt
-                
-                time.sleep(0.1)  # 10Hz scan rate
-        
-        print("\n" + "="*50)
-        print("MAPPING COMPLETE!")
-        print("="*50)
-        
-        stats = mapper.get_statistics()
-        print(f"Total scans collected: {stats['total_scans']}")
-        print(f"Total points in map: {stats['total_points']:,}")
-        print(f"ICP success rate: {stats['icp_success_rate']:.1f}%")
-        print(f"Average drift correction: {stats['average_drift_correction']:.3f}m")
-        print("="*50)
-        
-        # Save map
-        print("\nSaving final map...")
-        mapper.save_map("airsim_icp_slam_map.ply")
-        
-        # Keep visualization open
-        print("\nVisualization windows open.")
-        print("Press 'q' in camera window to exit...")
+                pos = state.kinematics_estimated.position
+                ori = state.kinematics_estimated.orientation
+                position = np.array([pos.x_val, pos.y_val, pos.z_val])
+                orientation = np.array([ori.w_val, ori.x_val, ori.y_val, ori.z_val])
+
+                lpos = lidar.pose.position
+                lori = lidar.pose.orientation
+                lidar_position = np.array([lpos.x_val, lpos.y_val, lpos.z_val])
+                lidar_orientation = np.array([lori.w_val, lori.x_val, lori.y_val, lori.z_val])
+
+                # sensor local → body → world (initial guess)
+                body_pts = transform_points(points, lidar_position, lidar_orientation)
+                world_pts_initial = transform_points(body_pts, position, orientation)
+
+                # ICP refinement
+                if len(global_map) >= ICP_MIN_MAP_POINTS:
+                    T_refine, fitness, rmse = run_icp(world_pts_initial, global_map)
+                    world_pts = apply_T(world_pts_initial, T_refine).astype(np.float32)
+                else:
+                    world_pts = world_pts_initial.astype(np.float32)
+
+                global_map = np.vstack([global_map, world_pts])
+
+                # Periodic thinning
+                if MAP_VOXEL_SIZE > 0 and len(global_map) > 2_000_000 and scan_count % 5 == 4:
+                    global_map = voxel_thin(global_map, MAP_VOXEL_SIZE)
+
+                viewer.update(global_map)
+                scan_count += 1
+                print(f"\r  scans {scan_count} | map pts {len(global_map):,}",
+                      end="", flush=True)
+
+        # Final thin
+        if MAP_VOXEL_SIZE > 0:
+            global_map = voxel_thin(global_map, MAP_VOXEL_SIZE)
+        viewer.update(global_map)
+        fit_plane(global_map, label="FINAL ")
+        print(f"\n\nMapping complete — {len(global_map):,} points, {scan_count} scans.")
+        print("Close the Open3D window or Ctrl+C to exit.")
         while True:
-            key = cv2.waitKey(100) & 0xFF
-            if key == ord('q'):
-                break
-            vis.poll_events()
-            vis.update_renderer()
-    
+            time.sleep(0.5)
+
     except KeyboardInterrupt:
-        print("\nMapping interrupted by user")
-        if mapper.scan_count > 0:
-            stats = mapper.get_statistics()
-            print(f"\nPartial map statistics:")
-            print(f"Scans collected: {stats['total_scans']}")
-            print(f"ICP success rate: {stats['icp_success_rate']:.1f}%")
-            mapper.save_map("airsim_icp_slam_map_partial.ply")
-    
+        print("\nInterrupted.")
     finally:
-        print("\nLanding...")
+        print("Landing...")
         client.landAsync().join()
         client.armDisarm(False)
         client.enableApiControl(False)
-        
-        vis.destroy_window()
-        cv2.destroyAllWindows()
-        print("Done!")
+        viewer.stop()
+        print("Done.")
 
 
 if __name__ == "__main__":
-    main()
+    if USE_RECORDING:
+        run_replay(RECORDING_DIR)
+    else:
+        run_live()

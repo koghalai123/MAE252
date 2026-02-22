@@ -18,7 +18,10 @@ def _vis_process(shm_name, shape, dtype_str, lock, update_event, stop_event):
     buf = _np.ndarray(shape, dtype=dtype_str, buffer=shm.buf)
 
     pcd = _o3d.geometry.PointCloud()
-    pcd.points = _o3d.utility.Vector3dVector(buf.copy())
+    # Filter zero-padded slots for initial display
+    init_pts = buf.copy()
+    mask = _np.any(init_pts != 0, axis=1)
+    pcd.points = _o3d.utility.Vector3dVector(init_pts[mask])
 
     vis = _o3d.visualization.Visualizer()
     vis.create_window()
@@ -29,6 +32,9 @@ def _vis_process(shm_name, shape, dtype_str, lock, update_event, stop_event):
             with lock:
                 pts = buf.copy()
             update_event.clear()
+            # Only render actual points, not zero-padded buffer slots
+            mask = _np.any(pts != 0, axis=1)
+            pts = pts[mask]
             pcd.points = _o3d.utility.Vector3dVector(pts)
             vis.update_geometry(pcd)
         vis.poll_events()
@@ -42,7 +48,7 @@ def _vis_process(shm_name, shape, dtype_str, lock, update_event, stop_event):
 class Viewer3D:
     """Open3D visualizer in a separate process — stays responsive at breakpoints."""
 
-    MAX_POINTS = 200_000  # pre-allocated shared buffer size
+    MAX_POINTS = 7_000_000  # pre-allocated shared buffer size
 
     def __init__(self):
         self._shm = None

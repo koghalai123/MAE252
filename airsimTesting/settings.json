@@ -14,9 +14,10 @@
         "LidarSensor1": {
           "SensorType": 6,
           "Enabled": true,
-          "NumberOfChannels": 32,
-          "PointsPerSecond": 100000,
-          "UpdateFrequency": 10,
+          "NumberOfChannels": 300,
+          "MeasurementsPerCycle": 1000,
+          "RotationsPerSecond": 500,
+          "UpdateFrequency": 10000,
           "X": 0,
           "Y": 0,
           "Z": -1,
@@ -28,7 +29,6 @@
           "HorizontalFOVStart": -180,
           "HorizontalFOVEnd": 180,
           "DrawDebugPoints": false,
-          "DataFrame": "SensorLocalFrame"
         }
       }
     }
