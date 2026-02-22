@@ -65,7 +65,7 @@ NDT_MAX_SRC      = 8000     # randomly subsample source for speed
 NDT_MAX_ITER     = 50       # scipy optimizer iterations
 
 # ── FPFH-specific ─────────────────────────────────────────────────────────────
-FPFH_VOXEL       = 0.5      # voxel size for FPFH feature computation
+FPFH_VOXEL       = 0.25      # voxel size for FPFH feature computation
 FPFH_MAX_NN      = 100
 RANSAC_N         = 4        # RANSAC sample size
 RANSAC_ITER      = 100_000
@@ -207,8 +207,8 @@ def register_state_only(src, tgt, init_T=np.eye(4)):
 #   let ICP progressively lock on.
 # ══════════════════════════════════════════════════════════════════════════════
 
-ICP_MULTI_CORR = [3.0, 1.5, 0.5]   # coarse → fine correspondence distances
-ICP_MULTI_ITER = [40,  30,  20 ]   # iterations per pass
+ICP_MULTI_CORR = [5.0, 2, 0.5]   # coarse → fine correspondence distances
+ICP_MULTI_ITER = [25, 15,  7 ]   # iterations per pass
 
 
 def register_icp_p2plane(src, tgt, init_T=np.eye(4)):
@@ -256,17 +256,37 @@ def register_icp_p2plane(src, tgt, init_T=np.eye(4)):
 
 def register_gicp(src, tgt, init_T=np.eye(4)):
     t0 = time.perf_counter()
+    _t = time.perf_counter
+    sub = {}  # detailed sub-timings (seconds)
+
+    _ts = _t()
     local = _local(tgt, src.mean(axis=0), LOCAL_R)
     if len(local) < 100:
         local = tgt
+    sub['local_crop'] = _t() - _ts
 
+    _ts = _t()
     sp = _to_pcd(src).voxel_down_sample(ICP_VOXEL)
+    sub['src_downsample'] = _t() - _ts
+
+    _ts = _t()
     tp = _to_pcd(local).voxel_down_sample(ICP_VOXEL)
+    sub['tgt_downsample'] = _t() - _ts
+
+    _ts = _t()
     sp.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(NORM_R, NORM_NN))
+    sub['src_normals'] = _t() - _ts
+
+    _ts = _t()
     tp.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(NORM_R, NORM_NN))
+    sub['tgt_normals'] = _t() - _ts
+
+    sub['src_pts'] = len(sp.points)
+    sub['tgt_pts'] = len(tp.points)
 
     T_cur = init_T.astype(np.float64)
-    for corr, iters in zip(ICP_MULTI_CORR, ICP_MULTI_ITER):
+    for idx, (corr, iters) in enumerate(zip(ICP_MULTI_CORR, ICP_MULTI_ITER)):
+        _ts = _t()
         r = o3d.pipelines.registration.registration_generalized_icp(
             sp, tp, corr, T_cur,
             o3d.pipelines.registration.TransformationEstimationForGeneralizedICP(),
@@ -274,7 +294,10 @@ def register_gicp(src, tgt, init_T=np.eye(4)):
                 relative_fitness=ICP_FIT_TOL, relative_rmse=ICP_RMSE_TOL,
                 max_iteration=iters))
         T_cur = np.asarray(r.transformation)
-    return T_cur, r.fitness, r.inlier_rmse, time.perf_counter() - t0
+        sub[f'gicp_pass{idx}'] = _t() - _ts
+
+    sub['total'] = _t() - t0
+    return T_cur, r.fitness, r.inlier_rmse, sub
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -516,6 +539,249 @@ class ScanContext:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 7. small_gicp — Parallel C++ GICP (multi-threaded, much faster)
+#
+#   Uses the small_gicp library which provides optimised C++/pybind11
+#   implementations of GICP with parallel tree construction and matching.
+#   Multi-scale coarse→fine, same as the Open3D GICP above.
+# ══════════════════════════════════════════════════════════════════════════════
+
+try:
+    import small_gicp as _sg
+    _HAS_SMALL_GICP = True
+except ImportError:
+    _HAS_SMALL_GICP = False
+
+_NUM_THREADS = min(multiprocessing.cpu_count(), 16)
+
+
+def _sg_fitness_rmse(src_np, T, tgt_np, max_dist):
+    """Compute Open3D-compatible fitness & inlier RMSE after alignment."""
+    pts = src_np[:, :3] if src_np.shape[1] > 3 else src_np
+    tgt = tgt_np[:, :3] if tgt_np.shape[1] > 3 else tgt_np
+    h = np.hstack([pts, np.ones((len(pts), 1))])
+    transformed = (T @ h.T).T[:, :3]
+    tree = cKDTree(tgt)
+    dists, _ = tree.query(transformed, k=1)
+    inlier = dists <= max_dist
+    fitness = float(np.mean(inlier)) if len(inlier) else 0.0
+    rmse = float(np.sqrt(np.mean(dists[inlier] ** 2))) if np.any(inlier) else 0.0
+    return fitness, rmse
+
+
+def register_small_gicp(src, tgt, init_T=np.eye(4)):
+    """Parallel GICP via small_gicp — multi-scale coarse→fine."""
+    if not _HAS_SMALL_GICP:
+        raise RuntimeError("small_gicp is not installed — pip install small_gicp")
+
+    t0 = time.perf_counter()
+    _t = time.perf_counter
+    sub = {}
+
+    # Local crop
+    _ts = _t()
+    local = _local(tgt, src.mean(axis=0), LOCAL_R)
+    if len(local) < 100:
+        local = tgt
+    sub['local_crop'] = _t() - _ts
+
+    # Downsample + preprocess source (returns pointcloud + kdtree)
+    _ts = _t()
+    src_sg, _ = _sg.preprocess_points(src.astype(np.float64),
+                                      downsampling_resolution=ICP_VOXEL,
+                                      num_neighbors=NORM_NN,
+                                      num_threads=_NUM_THREADS)
+    sub['src_downsample'] = _t() - _ts
+
+    # Downsample + preprocess target
+    _ts = _t()
+    tgt_sg, tgt_tree = _sg.preprocess_points(local.astype(np.float64),
+                                             downsampling_resolution=ICP_VOXEL,
+                                             num_neighbors=NORM_NN,
+                                             num_threads=_NUM_THREADS)
+    sub['tgt_downsample'] = _t() - _ts
+
+    # No separate normal step — preprocess_points handles normals+covs
+    sub['src_normals'] = 0.0
+    sub['tgt_normals'] = 0.0
+
+    sub['src_pts'] = src_sg.size()
+    sub['tgt_pts'] = tgt_sg.size()
+
+    # Multi-scale coarse → fine
+    T_cur = init_T.astype(np.float64)
+    for idx, (corr, iters) in enumerate(zip(ICP_MULTI_CORR, ICP_MULTI_ITER)):
+        _ts = _t()
+        result = _sg.align(tgt_sg, src_sg, tgt_tree,
+                           init_T_target_source=T_cur,
+                           registration_type='GICP',
+                           max_correspondence_distance=corr,
+                           num_threads=_NUM_THREADS,
+                           max_iterations=iters)
+        T_cur = result.T_target_source
+        sub[f'gicp_pass{idx}'] = _t() - _ts
+
+    # Compute fitness/RMSE consistent with Open3D
+    src_ds_np = np.asarray(src_sg.points())
+    tgt_ds_np = np.asarray(tgt_sg.points())
+    fitness, rmse = _sg_fitness_rmse(src_ds_np, T_cur, tgt_ds_np,
+                                     ICP_MULTI_CORR[-1])
+
+    sub['total'] = _t() - t0
+    return T_cur, fitness, rmse, sub
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 8. small_gicp VGICP — Voxelised GICP (fastest for large target clouds)
+#
+#   Instead of building a KD-tree on the target, the target is inserted into
+#   a Gaussian Voxel Map.  The source is matched against voxel distributions.
+#   This avoids the expensive KD-tree query on large targets.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def register_small_vgicp(src, tgt, init_T=np.eye(4)):
+    """Voxelised GICP via small_gicp — fastest for large target maps."""
+    if not _HAS_SMALL_GICP:
+        raise RuntimeError("small_gicp is not installed — pip install small_gicp")
+
+    t0 = time.perf_counter()
+    _t = time.perf_counter
+    sub = {}
+
+    # Local crop
+    _ts = _t()
+    local = _local(tgt, src.mean(axis=0), LOCAL_R)
+    if len(local) < 100:
+        local = tgt
+    sub['local_crop'] = _t() - _ts
+
+    # Downsample + preprocess source (returns pointcloud + kdtree)
+    _ts = _t()
+    src_sg, _ = _sg.preprocess_points(src.astype(np.float64),
+                                      downsampling_resolution=ICP_VOXEL,
+                                      num_neighbors=NORM_NN,
+                                      num_threads=_NUM_THREADS)
+    sub['src_downsample'] = _t() - _ts
+
+    # Build Gaussian Voxel Map from target (replaces downsample + KD-tree)
+    _ts = _t()
+    tgt_sg, _ = _sg.preprocess_points(local.astype(np.float64),
+                                      downsampling_resolution=ICP_VOXEL,
+                                      num_neighbors=NORM_NN,
+                                      num_threads=_NUM_THREADS)
+    voxelmap = _sg.GaussianVoxelMap(ICP_VOXEL)
+    voxelmap.insert(tgt_sg)
+    sub['tgt_downsample'] = _t() - _ts
+
+    sub['src_normals'] = 0.0
+    sub['tgt_normals'] = 0.0
+
+    sub['src_pts'] = src_sg.size()
+    sub['tgt_pts'] = len(voxelmap)
+
+    # Multi-scale coarse → fine
+    T_cur = init_T.astype(np.float64)
+    for idx, (corr, iters) in enumerate(zip(ICP_MULTI_CORR, ICP_MULTI_ITER)):
+        _ts = _t()
+        result = _sg.align(voxelmap, src_sg,
+                           init_T_target_source=T_cur,
+                           max_correspondence_distance=corr,
+                           num_threads=_NUM_THREADS,
+                           max_iterations=iters)
+        T_cur = result.T_target_source
+        sub[f'gicp_pass{idx}'] = _t() - _ts
+
+    # Compute fitness/RMSE
+    src_ds_np = np.asarray(src_sg.points())
+    tgt_ds_np = np.asarray(tgt_sg.points())
+    fitness, rmse = _sg_fitness_rmse(src_ds_np, T_cur, tgt_ds_np,
+                                     ICP_MULTI_CORR[-1])
+
+    sub['total'] = _t() - t0
+    return T_cur, fitness, rmse, sub
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 9. KISS-ICP — Adaptive-threshold ICP with voxel hash map
+#
+#   Designed for LiDAR odometry.  Uses an adaptive correspondence threshold
+#   and a voxel hash map for the target.  Very fast but returns a 4x4
+#   transform only (no fitness/RMSE — we compute them post-hoc).
+# ══════════════════════════════════════════════════════════════════════════════
+
+try:
+    from kiss_icp.registration import Registration as _KISSRegistration
+    from kiss_icp.mapping import VoxelHashMap as _KISSVoxelMap
+    _HAS_KISS_ICP = True
+except ImportError:
+    _HAS_KISS_ICP = False
+
+
+def register_kiss_icp(src, tgt, init_T=np.eye(4)):
+    """KISS-ICP adaptive-threshold registration."""
+    if not _HAS_KISS_ICP:
+        raise RuntimeError("kiss_icp is not installed — pip install kiss_icp")
+
+    t0 = time.perf_counter()
+    _t = time.perf_counter
+    sub = {}
+
+    # Local crop
+    _ts = _t()
+    local = _local(tgt, src.mean(axis=0), LOCAL_R)
+    if len(local) < 100:
+        local = tgt
+    sub['local_crop'] = _t() - _ts
+
+    # Downsample source
+    _ts = _t()
+    sp = _to_pcd(src).voxel_down_sample(ICP_VOXEL)
+    src_ds = np.asarray(sp.points)
+    sub['src_downsample'] = _t() - _ts
+
+    # Build KISS voxel hash map from target
+    _ts = _t()
+    voxel_size = ICP_VOXEL
+    max_dist = ICP_MULTI_CORR[0]  # use widest correspondence distance
+    voxel_map = _KISSVoxelMap(voxel_size=voxel_size,
+                              max_distance=max_dist,
+                              max_points_per_voxel=20)
+    tp = _to_pcd(local).voxel_down_sample(ICP_VOXEL)
+    tgt_ds = np.asarray(tp.points)
+    voxel_map.update(tgt_ds, np.eye(4))
+    sub['tgt_downsample'] = _t() - _ts
+
+    sub['src_normals'] = 0.0
+    sub['tgt_normals'] = 0.0
+
+    sub['src_pts'] = len(src_ds)
+    sub['tgt_pts'] = len(tgt_ds)
+
+    # Registration
+    _ts = _t()
+    reg = _KISSRegistration(max_num_iterations=sum(ICP_MULTI_ITER),
+                            convergence_criterion=ICP_FIT_TOL,
+                            max_num_threads=_NUM_THREADS)
+    # sigma is an adaptive threshold — use widest corr dist as conservative value
+    T_result = reg.align_points_to_map(
+        points=src_ds,
+        voxel_map=voxel_map,
+        initial_guess=init_T.astype(np.float64),
+        max_correspondance_distance=max_dist,
+        kernel=1.0)
+    sub['gicp_pass0'] = _t() - _ts
+    sub['gicp_pass1'] = 0.0
+    sub['gicp_pass2'] = 0.0
+
+    # Compute fitness/RMSE
+    fitness, rmse = _sg_fitness_rmse(src_ds, T_result, tgt_ds,
+                                     ICP_MULTI_CORR[-1])
+
+    sub['total'] = _t() - t0
+    return T_result, fitness, rmse, sub
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Registration registry — importable by other scripts
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -528,16 +794,22 @@ REGISTRATION_METHODS = {
     "fpfh":          register_fpfh_ransac,
     "fpfh_ransac":   register_fpfh_ransac,
 }
+if _HAS_SMALL_GICP:
+    REGISTRATION_METHODS["small_gicp"] = register_small_gicp
+    REGISTRATION_METHODS["vgicp"]      = register_small_vgicp
+if _HAS_KISS_ICP:
+    REGISTRATION_METHODS["kiss_icp"]   = register_kiss_icp
 
 
 def get_register_fn(method: str):
     """Return a registration function by keyword.
 
-    Valid keywords: state_only, icp, p2plane, gicp, ndt, fpfh, fpfh_ransac
+    Valid keywords: state_only, icp, p2plane, gicp, ndt, fpfh, fpfh_ransac,
+                    small_gicp, vgicp, kiss_icp
 
     Each function has signature:
         register(source_pts, target_pts, init_T=np.eye(4))
-        -> (T_4x4, fitness, inlier_rmse, elapsed_seconds)
+        -> (T_4x4, fitness, inlier_rmse, detail_dict_or_seconds)
     """
     key = method.lower().strip()
     if key not in REGISTRATION_METHODS:
