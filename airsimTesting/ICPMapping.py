@@ -59,6 +59,8 @@ NORMAL_RADIUS       = 0.50   # radius for normal estimation
 NORMAL_MAX_NN       = 20     # max neighbours for normal estimation
 MAP_VOXEL_SIZE      = 0.05   # voxel size for thinning the stored global map
                               # (0 = keep all points, costs more RAM)
+MAP_THIN_TRIGGER    = 1_500_000  # thin when map exceeds this many points
+MAP_BUFFER_SIZE     = 20_000_000 # pre-allocated point buffer size
 ICP_LOCAL_RADIUS    = 30.0   # only use map points within this radius of scan
                               # centroid for ICP (metres).  0 = use whole map.
 USE_GPU             = True   # use CUDA-accelerated tensor ICP when available
@@ -184,7 +186,7 @@ def _estimate_normals_legacy(pcd):
 
 
 def run_icp(source_pts, target_pts, init_T=np.eye(4)):
-    """Run point-to-plane ICP.  Returns (4×4 refined transform, fitness, rmse).
+    """Run point-to-plane ICP.  Returns (4×4 transform, fitness, rmse, timing_dict).
 
     Uses CUDA tensor ICP when available, otherwise falls back to the legacy
     CPU pipeline.  A local spatial window is extracted from the target map
@@ -196,28 +198,42 @@ def run_icp(source_pts, target_pts, init_T=np.eye(4)):
     target_pts : Mx3 float — the accumulated global map
     init_T     : 4×4        — starting transform (identity = scan already placed)
     """
+    td = {}  # timing breakdown
+
     # ── Extract local window from target map ──────────────────────────────
+    t0 = time.perf_counter()
     centroid = source_pts.mean(axis=0)
     local_target = _extract_local_window(target_pts, centroid, ICP_LOCAL_RADIUS)
     if len(local_target) < 100:
         local_target = target_pts  # fallback to full map
+    td["local_window"] = time.perf_counter() - t0
 
     init_T_64 = init_T.astype(np.float64)
 
     if _HAS_CUDA:
-        return _run_icp_tensor(source_pts, local_target, init_T_64)
+        T, fitness, rmse, sub_td = _run_icp_tensor(source_pts, local_target, init_T_64)
     else:
-        return _run_icp_legacy(source_pts, local_target, init_T_64)
+        T, fitness, rmse, sub_td = _run_icp_legacy(source_pts, local_target, init_T_64)
+
+    td.update(sub_td)
+    return T, fitness, rmse, td
 
 
 def _run_icp_tensor(source_pts, target_pts, init_T):
     """GPU-accelerated tensor ICP."""
+    td = {}
+
+    t0 = time.perf_counter()
     src = _downsample_tensor(_to_tpcd(source_pts), ICP_VOXEL_SIZE)
     tgt = _downsample_tensor(_to_tpcd(target_pts), ICP_VOXEL_SIZE)
+    td["downsample"] = time.perf_counter() - t0
 
+    t0 = time.perf_counter()
     _estimate_normals_tensor(src)
     _estimate_normals_tensor(tgt)
+    td["normals"] = time.perf_counter() - t0
 
+    t0 = time.perf_counter()
     criteria = o3d.t.pipelines.registration.ICPConvergenceCriteria(
         max_iteration=ICP_MAX_ITERATION,
         relative_fitness=ICP_RELATIVE_FITNESS,
@@ -234,18 +250,27 @@ def _run_icp_tensor(source_pts, target_pts, init_T):
         estimation_method=estimation,
         criteria=criteria,
     )
+    td["icp_solve"] = time.perf_counter() - t0
+
     T = result.transformation.cpu().numpy()
-    return T, result.fitness, result.inlier_rmse
+    return T, result.fitness, result.inlier_rmse, td
 
 
 def _run_icp_legacy(source_pts, target_pts, init_T):
     """CPU legacy ICP fallback."""
+    td = {}
+
+    t0 = time.perf_counter()
     src_pcd = _downsample_legacy(_to_pcd(source_pts), ICP_VOXEL_SIZE)
     tgt_pcd = _downsample_legacy(_to_pcd(target_pts), ICP_VOXEL_SIZE)
+    td["downsample"] = time.perf_counter() - t0
 
+    t0 = time.perf_counter()
     _estimate_normals_legacy(src_pcd)
     _estimate_normals_legacy(tgt_pcd)
+    td["normals"] = time.perf_counter() - t0
 
+    t0 = time.perf_counter()
     criteria = o3d.pipelines.registration.ICPConvergenceCriteria(
         max_iteration=ICP_MAX_ITERATION,
         relative_fitness=ICP_RELATIVE_FITNESS,
@@ -260,7 +285,9 @@ def _run_icp_legacy(source_pts, target_pts, init_T):
         estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
         criteria=criteria,
     )
-    return result.transformation, result.fitness, result.inlier_rmse
+    td["icp_solve"] = time.perf_counter() - t0
+
+    return result.transformation, result.fitness, result.inlier_rmse, td
 
 
 def voxel_thin(points, voxel_size):
@@ -286,15 +313,63 @@ def run_replay(recording_dir):
           f"iter={ICP_MAX_ITERATION}, map_voxel={MAP_VOXEL_SIZE}")
 
     viewer = Viewer3D()
-    global_map = np.zeros((0, 3), dtype=np.float32)
+
+    # Pre-allocated buffer — avoids np.vstack copies (was 66% of runtime)
+    map_buf = np.zeros((MAP_BUFFER_SIZE, 3), dtype=np.float32)
+    map_len = 0  # number of valid points in map_buf
+
+    def _get_map():
+        """Return a view of the filled portion of the buffer."""
+        return map_buf[:map_len]
+
+    def _append(pts):
+        """Append pts to buffer, growing if needed."""
+        nonlocal map_buf, map_len
+        n = len(pts)
+        if map_len + n > len(map_buf):
+            new_size = max(len(map_buf) * 2, map_len + n)
+            new_buf = np.zeros((new_size, 3), dtype=np.float32)
+            new_buf[:map_len] = map_buf[:map_len]
+            map_buf = new_buf
+        map_buf[map_len:map_len + n] = pts
+        map_len += n
+
+    def _replace(pts):
+        """Replace buffer contents (after thinning)."""
+        nonlocal map_buf, map_len
+        n = len(pts)
+        if n > len(map_buf):
+            map_buf = np.zeros((n + 1_000_000, 3), dtype=np.float32)
+        map_buf[:n] = pts
+        map_len = n
+
+    # ── Timing accumulators ───────────────────────────────────────────
+    timings = {
+        "load":        [],
+        "transform":   [],
+        "local_window":[],
+        "downsample":  [],
+        "normals":     [],
+        "icp_solve":   [],
+        "apply_T":     [],
+        "fit_plane":   [],
+        "merge":       [],
+        "visualize":   [],
+        "total":       [],
+    }
 
     for i, path in enumerate(frames):
+        t_total_start = time.perf_counter()
+
+        t0 = time.perf_counter()
         data = np.load(path)
         points = filter_valid_points(data["points"])
         if len(points) == 0:
             continue
+        timings["load"].append(time.perf_counter() - t0)
 
         # ── Step 1: state-based transform (initial guess) ────────────────
+        t0 = time.perf_counter()
         lidar_pos = data["lidar_position"] if "lidar_position" in data.files else np.zeros(3)
         lidar_ori = (data["lidar_orientation"] if "lidar_orientation" in data.files
                      else np.array([1, 0, 0, 0], dtype=float))
@@ -304,11 +379,21 @@ def run_replay(recording_dir):
         orientation = (data["orientation"] if "orientation" in data.files
                        else np.array([1, 0, 0, 0], dtype=float))
         world_pts_initial = transform_points(body_pts, position, orientation)
+        timings["transform"].append(time.perf_counter() - t0)
 
         # ── Step 2: ICP refinement against current map ───────────────────
-        if len(global_map) >= ICP_MIN_MAP_POINTS:
-            T_refine, fitness, rmse = run_icp(world_pts_initial, global_map)
+        if map_len >= ICP_MIN_MAP_POINTS:
+            T_refine, fitness, rmse, icp_breakdown = run_icp(world_pts_initial, _get_map())
+
+            # Record ICP sub-step timings
+            timings["local_window"].append(icp_breakdown.get("local_window", 0))
+            timings["downsample"].append(icp_breakdown.get("downsample", 0))
+            timings["normals"].append(icp_breakdown.get("normals", 0))
+            timings["icp_solve"].append(icp_breakdown.get("icp_solve", 0))
+
+            t0 = time.perf_counter()
             world_pts = apply_T(world_pts_initial, T_refine).astype(np.float32)
+            timings["apply_T"].append(time.perf_counter() - t0)
 
             # Decompose correction for logging
             correction_t = T_refine[:3, 3]
@@ -320,41 +405,75 @@ def run_replay(recording_dir):
                   f"{correction_euler[2]:+.2f})°")
         else:
             world_pts = world_pts_initial.astype(np.float32)
-            print(f"  frame {i:03d}: map too small for ICP ({len(global_map)} pts), using state pose")
+            print(f"  frame {i:03d}: map too small for ICP ({map_len} pts), using state pose")
+            for k in ["local_window", "downsample", "normals", "icp_solve", "apply_T"]:
+                timings[k].append(0.0)
 
         # ── Step 3: per-scan plane diagnostic ────────────────────────────
+        t0 = time.perf_counter()
         fit_plane(world_pts, label=f"frame {i:03d} ")
+        timings["fit_plane"].append(time.perf_counter() - t0)
 
         # ── Step 4: merge into global map ────────────────────────────────
-        global_map = np.vstack([global_map, world_pts])
+        t0 = time.perf_counter()
+        _append(world_pts)
 
         # Periodically thin the map to keep RAM in check
-        if MAP_VOXEL_SIZE > 0 and len(global_map) > 2_000_000 and i % 5 == 4:
-            pre = len(global_map)
-            global_map = voxel_thin(global_map, MAP_VOXEL_SIZE)
-            print(f"  map thinned {pre:,} → {len(global_map):,}")
+        if MAP_VOXEL_SIZE > 0 and map_len > MAP_THIN_TRIGGER:
+            pre = map_len
+            _replace(voxel_thin(_get_map(), MAP_VOXEL_SIZE))
+            print(f"  map thinned {pre:,} → {map_len:,}")
+        timings["merge"].append(time.perf_counter() - t0)
 
         # ── Visualize ────────────────────────────────────────────────────
+        t0 = time.perf_counter()
         if i == 0:
-            viewer.start(initial_points=global_map)
+            viewer.start(initial_points=_get_map())
         else:
-            viewer.update(global_map)
+            viewer.update(_get_map())
 
         extra = ""
         if "gps" in data.files:
             gps = data["gps"]
             extra = f" | GPS ({gps[0]:.6f}, {gps[1]:.6f}, {gps[2]:.1f})"
-        print(f"  frame {i+1}/{len(frames)} | map pts {len(global_map):,}{extra}\n",
+        print(f"  frame {i+1}/{len(frames)} | map pts {map_len:,}{extra}",
               flush=True)
+        timings["visualize"].append(time.perf_counter() - t0)
+        timings["total"].append(time.perf_counter() - t_total_start)
+
+        # Per-frame timing summary
+        print(f"  ⏱  load={timings['load'][-1]:.3f}  xform={timings['transform'][-1]:.3f}  "
+              f"window={timings['local_window'][-1]:.3f}  ds={timings['downsample'][-1]:.3f}  "
+              f"normals={timings['normals'][-1]:.3f}  icp={timings['icp_solve'][-1]:.3f}  "
+              f"apply={timings['apply_T'][-1]:.3f}  plane={timings['fit_plane'][-1]:.3f}  "
+              f"merge={timings['merge'][-1]:.3f}  vis={timings['visualize'][-1]:.3f}  "
+              f"TOTAL={timings['total'][-1]:.3f}s\n")
 
     # Final thin + plane fit
     if MAP_VOXEL_SIZE > 0:
-        global_map = voxel_thin(global_map, MAP_VOXEL_SIZE)
-    viewer.update(global_map)
-    print(f"\nFinal global map: {len(global_map):,} points")
-    fit_plane(global_map, label="FINAL ")
+        _replace(voxel_thin(_get_map(), MAP_VOXEL_SIZE))
+    viewer.update(_get_map())
+    print(f"\nFinal global map: {map_len:,} points")
+    fit_plane(_get_map(), label="FINAL ")
 
-    print(f"\nReplay complete — {len(global_map):,} points in map.")
+    print(f"\nReplay complete — {map_len:,} points in map.")
+
+    # ── Timing summary ────────────────────────────────────────────────
+    print("\n" + "="*70)
+    print("TIMING SUMMARY (seconds)")
+    print(f"{'step':<15} {'total':>8} {'mean':>8} {'max':>8} {'%':>6}")
+    print("-"*50)
+    grand_total = sum(timings["total"])
+    for key in ["load", "transform", "local_window", "downsample", "normals",
+                "icp_solve", "apply_T", "fit_plane", "merge", "visualize", "total"]:
+        vals = timings[key]
+        if not vals:
+            continue
+        s = sum(vals)
+        pct = 100.0 * s / grand_total if grand_total > 0 else 0
+        print(f"{key:<15} {s:>8.3f} {s/len(vals):>8.4f} {max(vals):>8.4f} {pct:>5.1f}%")
+    print("="*70)
+
     print("Close the Open3D window or Ctrl+C to exit.")
     try:
         while True:
@@ -380,7 +499,30 @@ def run_live():
 
     viewer = Viewer3D()
     viewer.start(initial_points=init_pts)
-    global_map = np.zeros((0, 3), dtype=np.float32)
+    map_buf = np.zeros((MAP_BUFFER_SIZE, 3), dtype=np.float32)
+    map_len = 0
+
+    def _get_map():
+        return map_buf[:map_len]
+
+    def _append(pts):
+        nonlocal map_buf, map_len
+        n = len(pts)
+        if map_len + n > len(map_buf):
+            new_size = max(len(map_buf) * 2, map_len + n)
+            new_buf = np.zeros((new_size, 3), dtype=np.float32)
+            new_buf[:map_len] = map_buf[:map_len]
+            map_buf = new_buf
+        map_buf[map_len:map_len + n] = pts
+        map_len += n
+
+    def _replace(pts):
+        nonlocal map_buf, map_len
+        n = len(pts)
+        if n > len(map_buf):
+            map_buf = np.zeros((n + 1_000_000, 3), dtype=np.float32)
+        map_buf[:n] = pts
+        map_len = n
 
     print("Taking off...")
     client.takeoffAsync().join()
@@ -425,29 +567,29 @@ def run_live():
                 world_pts_initial = transform_points(body_pts, position, orientation)
 
                 # ICP refinement
-                if len(global_map) >= ICP_MIN_MAP_POINTS:
-                    T_refine, fitness, rmse = run_icp(world_pts_initial, global_map)
+                if map_len >= ICP_MIN_MAP_POINTS:
+                    T_refine, fitness, rmse, _ = run_icp(world_pts_initial, _get_map())
                     world_pts = apply_T(world_pts_initial, T_refine).astype(np.float32)
                 else:
                     world_pts = world_pts_initial.astype(np.float32)
 
-                global_map = np.vstack([global_map, world_pts])
+                _append(world_pts)
 
                 # Periodic thinning
-                if MAP_VOXEL_SIZE > 0 and len(global_map) > 2_000_000 and scan_count % 5 == 4:
-                    global_map = voxel_thin(global_map, MAP_VOXEL_SIZE)
+                if MAP_VOXEL_SIZE > 0 and map_len > MAP_THIN_TRIGGER:
+                    _replace(voxel_thin(_get_map(), MAP_VOXEL_SIZE))
 
-                viewer.update(global_map)
+                viewer.update(_get_map())
                 scan_count += 1
-                print(f"\r  scans {scan_count} | map pts {len(global_map):,}",
+                print(f"\r  scans {scan_count} | map pts {map_len:,}",
                       end="", flush=True)
 
         # Final thin
         if MAP_VOXEL_SIZE > 0:
-            global_map = voxel_thin(global_map, MAP_VOXEL_SIZE)
-        viewer.update(global_map)
-        fit_plane(global_map, label="FINAL ")
-        print(f"\n\nMapping complete — {len(global_map):,} points, {scan_count} scans.")
+            _replace(voxel_thin(_get_map(), MAP_VOXEL_SIZE))
+        viewer.update(_get_map())
+        fit_plane(_get_map(), label="FINAL ")
+        print(f"\n\nMapping complete — {map_len:,} points, {scan_count} scans.")
         print("Close the Open3D window or Ctrl+C to exit.")
         while True:
             time.sleep(0.5)
@@ -464,7 +606,10 @@ def run_live():
 
 
 if __name__ == "__main__":
+    _wall_start = time.perf_counter()
     if USE_RECORDING:
         run_replay(RECORDING_DIR)
     else:
         run_live()
+    _wall_elapsed = time.perf_counter() - _wall_start
+    print(f"\nTotal wall-clock time: {_wall_elapsed:.3f}s ({_wall_elapsed/60:.1f}min)")
