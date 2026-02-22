@@ -41,7 +41,7 @@ import matplotlib.pyplot as plt
 
 # ── Recording ─────────────────────────────────────────────────────────────────
 RECORDING_DIR = ""          # empty → latest in flight_recordings/
-MAX_FRAMES    = 20           # 0 = all
+MAX_FRAMES    = 0           # 0 = all
 FRAME_SKIP    = 2           # process every Nth frame
 
 # ── Voxel display resolution ─────────────────────────────────────────────────
@@ -200,8 +200,16 @@ def register_state_only(src, tgt, init_T=np.eye(4)):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 2. Point-to-plane ICP
+# 2. Point-to-plane ICP  (multi-scale coarse→fine)
+#
+#   A single tight correspondence distance cannot recover rotational error:
+#   1° at 30 m ≈ 0.5 m displacement.  Three passes (wide → medium → tight)
+#   let ICP progressively lock on.
 # ══════════════════════════════════════════════════════════════════════════════
+
+ICP_MULTI_CORR = [3.0, 1.5, 0.5]   # coarse → fine correspondence distances
+ICP_MULTI_ITER = [40,  30,  20 ]   # iterations per pass
+
 
 def register_icp_p2plane(src, tgt, init_T=np.eye(4)):
     t0 = time.perf_counter()
@@ -214,30 +222,36 @@ def register_icp_p2plane(src, tgt, init_T=np.eye(4)):
         t = _to_tpcd(local).voxel_down_sample(ICP_VOXEL)
         s.estimate_normals(radius=NORM_R, max_nn=NORM_NN)
         t.estimate_normals(radius=NORM_R, max_nn=NORM_NN)
-        r = o3d.t.pipelines.registration.icp(
-            s, t, ICP_CORR,
-            o3d.core.Tensor(init_T.astype(np.float64), device=_DEV),
-            o3d.t.pipelines.registration.TransformationEstimationPointToPlane(),
-            o3d.t.pipelines.registration.ICPConvergenceCriteria(
-                relative_fitness=ICP_FIT_TOL, relative_rmse=ICP_RMSE_TOL,
-                max_iteration=ICP_ITER))
-        return r.transformation.cpu().numpy(), r.fitness, r.inlier_rmse, time.perf_counter() - t0
+        T_cur = o3d.core.Tensor(init_T.astype(np.float64), device=_DEV)
+        for corr, iters in zip(ICP_MULTI_CORR, ICP_MULTI_ITER):
+            r = o3d.t.pipelines.registration.icp(
+                s, t, corr, T_cur,
+                o3d.t.pipelines.registration.TransformationEstimationPointToPlane(),
+                o3d.t.pipelines.registration.ICPConvergenceCriteria(
+                    relative_fitness=ICP_FIT_TOL, relative_rmse=ICP_RMSE_TOL,
+                    max_iteration=iters))
+            T_cur = r.transformation
+        return T_cur.cpu().numpy(), r.fitness, r.inlier_rmse, time.perf_counter() - t0
     else:
         sp = _to_pcd(src).voxel_down_sample(ICP_VOXEL)
         tp = _to_pcd(local).voxel_down_sample(ICP_VOXEL)
         sp.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(NORM_R, NORM_NN))
         tp.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(NORM_R, NORM_NN))
-        r = o3d.pipelines.registration.registration_icp(
-            sp, tp, ICP_CORR, init_T.astype(np.float64),
-            o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-            o3d.pipelines.registration.ICPConvergenceCriteria(
-                relative_fitness=ICP_FIT_TOL, relative_rmse=ICP_RMSE_TOL,
-                max_iteration=ICP_ITER))
-        return np.asarray(r.transformation), r.fitness, r.inlier_rmse, time.perf_counter() - t0
+        T_cur = init_T.astype(np.float64)
+        for corr, iters in zip(ICP_MULTI_CORR, ICP_MULTI_ITER):
+            r = o3d.pipelines.registration.registration_icp(
+                sp, tp, corr, T_cur,
+                o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                o3d.pipelines.registration.ICPConvergenceCriteria(
+                    relative_fitness=ICP_FIT_TOL, relative_rmse=ICP_RMSE_TOL,
+                    max_iteration=iters))
+            T_cur = np.asarray(r.transformation)
+        return T_cur, r.fitness, r.inlier_rmse, time.perf_counter() - t0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. Generalized ICP  (plane-to-plane — uses local surface covariances)
+#    Multi-scale coarse→fine, same as point-to-plane ICP above.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def register_gicp(src, tgt, init_T=np.eye(4)):
@@ -251,13 +265,16 @@ def register_gicp(src, tgt, init_T=np.eye(4)):
     sp.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(NORM_R, NORM_NN))
     tp.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(NORM_R, NORM_NN))
 
-    r = o3d.pipelines.registration.registration_generalized_icp(
-        sp, tp, ICP_CORR, init_T.astype(np.float64),
-        o3d.pipelines.registration.TransformationEstimationForGeneralizedICP(),
-        o3d.pipelines.registration.ICPConvergenceCriteria(
-            relative_fitness=ICP_FIT_TOL, relative_rmse=ICP_RMSE_TOL,
-            max_iteration=ICP_ITER))
-    return np.asarray(r.transformation), r.fitness, r.inlier_rmse, time.perf_counter() - t0
+    T_cur = init_T.astype(np.float64)
+    for corr, iters in zip(ICP_MULTI_CORR, ICP_MULTI_ITER):
+        r = o3d.pipelines.registration.registration_generalized_icp(
+            sp, tp, corr, T_cur,
+            o3d.pipelines.registration.TransformationEstimationForGeneralizedICP(),
+            o3d.pipelines.registration.ICPConvergenceCriteria(
+                relative_fitness=ICP_FIT_TOL, relative_rmse=ICP_RMSE_TOL,
+                max_iteration=iters))
+        T_cur = np.asarray(r.transformation)
+    return T_cur, r.fitness, r.inlier_rmse, time.perf_counter() - t0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -496,6 +513,38 @@ class ScanContext:
             return float('inf')
         cos_sims = (shifts[valid] @ f1) / (norms[valid] * n1)
         return float(1.0 - np.max(cos_sims))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Registration registry — importable by other scripts
+# ══════════════════════════════════════════════════════════════════════════════
+
+REGISTRATION_METHODS = {
+    "state_only":    register_state_only,
+    "icp":           register_icp_p2plane,
+    "p2plane":       register_icp_p2plane,
+    "gicp":          register_gicp,
+    "ndt":           register_ndt,
+    "fpfh":          register_fpfh_ransac,
+    "fpfh_ransac":   register_fpfh_ransac,
+}
+
+
+def get_register_fn(method: str):
+    """Return a registration function by keyword.
+
+    Valid keywords: state_only, icp, p2plane, gicp, ndt, fpfh, fpfh_ransac
+
+    Each function has signature:
+        register(source_pts, target_pts, init_T=np.eye(4))
+        -> (T_4x4, fitness, inlier_rmse, elapsed_seconds)
+    """
+    key = method.lower().strip()
+    if key not in REGISTRATION_METHODS:
+        raise ValueError(
+            f"Unknown registration method '{method}'. "
+            f"Choose from: {', '.join(sorted(REGISTRATION_METHODS))}")
+    return REGISTRATION_METHODS[key]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
