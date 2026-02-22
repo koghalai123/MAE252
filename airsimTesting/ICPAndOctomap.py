@@ -22,7 +22,7 @@ from sensorFeed import Viewer3D
 # ── Recording ─────────────────────────────────────────────────────────────────
 RECORDING_DIR   = ""             # empty = latest in flight_recordings/
 MAX_FRAMES      = 0              # 0 = all, >0 = cap
-FRAME_SKIP      = 1              # process every Nth frame
+FRAME_SKIP      = 2              # process every Nth frame
 
 # ── OctoMap ───────────────────────────────────────────────────────────────────
 OCTO_RESOLUTION = 0.10           # leaf voxel size (m)
@@ -40,7 +40,6 @@ ICP_LOCAL_RADIUS     = 30.0      # local window radius (m), 0 = whole map
 USE_GPU              = True      # prefer CUDA tensor ICP
 
 # ── Visualisation ─────────────────────────────────────────────────────────────
-VIS_EVERY = 1                    # update viewer every N frames
 
 # ── GPU detection ─────────────────────────────────────────────────────────────
 _HAS_CUDA = False
@@ -336,12 +335,11 @@ def run_replay(recording_dir: str = ""):
 
         # ── Visualise ─────────────────────────────────────────────────────
         t0 = time.perf_counter()
-        if (i + 1) % VIS_EVERY == 0 or i == len(frames) - 1:
-            vp = _get_vis()
-            if i == 0:
-                viewer.start(initial_points=vp)
-            else:
-                viewer.update(vp)
+        vp = _get_vis()
+        if i == 0:
+            viewer.start(initial_points=vp)
+        else:
+            viewer.update(vp)
         timings["vis"].append(time.perf_counter() - t0)
 
         timings["total"].append(time.perf_counter() - t_frame)
