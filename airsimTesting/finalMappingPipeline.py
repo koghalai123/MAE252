@@ -82,7 +82,7 @@ class SLAMConfig:
     reg_local_radius: float = 40.0    # crop target cloud to this radius (m, 0 = no crop)
 
     # GTSAM noise
-    gps_sigma: float       = 1.0     # GPS position noise (m)
+    gps_sigma: float       = 0.2     # GPS position noise (m)
     icp_noise_scale: float = 1.0     # multiplier on ICP-derived noise model
 
     # Visualisation

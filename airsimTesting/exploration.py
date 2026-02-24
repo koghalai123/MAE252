@@ -31,6 +31,213 @@ from finalMappingPipeline import LiveSLAM, SLAMConfig, SLAMPipeline
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# BufferedSLAM — wraps LiveSLAM with delayed registration
+# ══════════════════════════════════════════════════════════════════════════════
+
+class BufferedSLAM:
+    """Wraps a ``LiveSLAM`` instance with a scan buffer for delayed registration.
+
+    Raw LiDAR scans, poses, and sensor data are collected at the configured
+    scan rate into a FIFO queue.  A scan is only fed to the SLAM pipeline
+    once ``delay_scans`` additional scans have arrived *after* it, giving the
+    high-rate state/IMU/GPS buffers (in ``saveFlightData.py`` style) time to
+    bracket the LiDAR timestamp from both sides.
+
+    Parameters
+    ----------
+    live : LiveSLAM
+        The underlying live SLAM driver (already connected).
+    delay_scans : int
+        How many newer scans must arrive before a queued scan is registered
+        into the SLAM map.  Higher = more temporal coverage for interpolation,
+        but adds latency to the map.
+    max_buffer : int
+        Hard cap on buffer length (safety).
+    """
+
+    def __init__(self, live: LiveSLAM, delay_scans: int = 3, max_buffer: int = 200):
+        self.live = live
+        self.delay_scans = delay_scans
+        self.max_buffer = max_buffer
+
+        # Buffered raw scans: list of dicts with all data needed by process_frame
+        self._scan_buf: list[dict] = []
+        # How many scans have been registered into the pipeline so far
+        self._n_registered: int = 0
+        # Total scans collected
+        self._n_collected: int = 0
+
+    # ── Collect one scan (rate-limited by LiveSLAM) ──────────────────────
+
+    def collect_once(self) -> dict | None:
+        """Grab one LiDAR scan + pose from AirSim and buffer it.
+
+        Does NOT register the scan in the SLAM pipeline yet.
+        Returns the raw scan dict, or None if rate-limited / no data.
+        """
+        import cosysairsim as airsim
+        import time as _time
+
+        now = _time.time()
+        if now - self.live._last_scan_time < self.live._min_interval:
+            return None
+
+        if self.live.client is None:
+            raise RuntimeError("Call live.connect() first")
+
+        # Sample state BEFORE LiDAR
+        state_before = self.live.client.getMultirotorState()
+
+        # Get sensor data
+        lidar_data = self.live.client.getLidarData()
+
+        # Sample state AFTER LiDAR
+        state_after = self.live.client.getMultirotorState()
+
+        if len(lidar_data.point_cloud) < 9:
+            return None
+
+        points = np.array(lidar_data.point_cloud, dtype=np.float32).reshape((-1, 3))
+
+        # Interpolate pose to LiDAR timestamp
+        pos, ori = self.live._interpolate_pose(state_before, state_after, lidar_data)
+
+        # LiDAR mount offset
+        lpos = lidar_data.pose.position
+        lori = lidar_data.pose.orientation
+        lidar_position = np.array([lpos.x_val, lpos.y_val, lpos.z_val])
+        lidar_orientation = np.array([lori.w_val, lori.x_val, lori.y_val, lori.z_val])
+
+        # GPS
+        gps = None
+        try:
+            gps_data = self.live.client.getGpsData()
+            gp = gps_data.gnss.geo_point
+            gps = np.array([gp.latitude, gp.longitude, gp.altitude])
+        except Exception:
+            pass
+
+        lidar_ts = float(lidar_data.time_stamp)
+        state_before_ts = float(state_before.timestamp)
+        state_after_ts = float(state_after.timestamp)
+
+        scan = {
+            "points": points,
+            "position": pos,
+            "orientation": ori,
+            "lidar_position": lidar_position,
+            "lidar_orientation": lidar_orientation,
+            "gps": gps,
+            "lidar_ts": lidar_ts,
+            "state_before_ts": state_before_ts,
+            "state_after_ts": state_after_ts,
+            "collect_time": now,
+            "frame_label": self.live._frame_count,
+        }
+
+        self._scan_buf.append(scan)
+        self._n_collected += 1
+        self.live._frame_count += 1
+        self.live._last_scan_time = now
+
+        # Save raw frame to disk if recording is enabled
+        if self.live.save_dir is not None:
+            self.live._save_frame(points, pos, ori, lidar_position,
+                                  lidar_orientation, gps)
+
+        # Safety trim
+        if len(self._scan_buf) > self.max_buffer:
+            self._scan_buf = self._scan_buf[-self.max_buffer:]
+
+        return scan
+
+    # ── Register buffered scans that are old enough ──────────────────────
+
+    def drain_ready(self) -> list[dict]:
+        """Register any buffered scans that have enough newer scans after them.
+
+        A scan at index *i* is ready when there are at least ``delay_scans``
+        newer scans in the buffer (i.e. scans at indices i+1 … i+delay_scans).
+
+        Returns a list of pipeline results for newly registered scans.
+        """
+        results = []
+        ready_count = len(self._scan_buf) - self.delay_scans
+
+        while self._n_registered < ready_count and self._n_registered < len(self._scan_buf):
+            scan = self._scan_buf[self._n_registered]
+
+            # Print timing: how far the bracketing state samples are from LiDAR
+            near_ms = min(abs(scan["lidar_ts"] - scan["state_before_ts"]),
+                          abs(scan["lidar_ts"] - scan["state_after_ts"])) / 1e6
+            far_ms = max(abs(scan["lidar_ts"] - scan["state_before_ts"]),
+                         abs(scan["lidar_ts"] - scan["state_after_ts"])) / 1e6
+            buf_depth = len(self._scan_buf) - self._n_registered
+            print(f"  [buf] registering scan {scan['frame_label']:03d}  "
+                  f"| bracket: {near_ms:5.1f}/{far_ms:5.1f} ms  "
+                  f"| buf depth: {buf_depth}")
+
+            # Feed to SLAM pipeline
+            self.live.pipeline.set_drone_pos(scan["position"])
+            result = self.live.pipeline.process_frame(
+                scan["points"],
+                scan["position"],
+                scan["orientation"],
+                gps=scan["gps"],
+                lidar_position=scan["lidar_position"],
+                lidar_orientation=scan["lidar_orientation"],
+                frame_label=scan["frame_label"],
+            )
+            results.append(result)
+            self._n_registered += 1
+
+        # Trim fully-registered scans from the front of the buffer,
+        # but keep at least delay_scans entries for context
+        keep = max(self.delay_scans, 10)
+        if self._n_registered > keep:
+            trim = self._n_registered - keep
+            self._scan_buf = self._scan_buf[trim:]
+            self._n_registered -= trim
+
+        return results
+
+    # ── Combined: collect + drain (drop-in for process_once) ─────────────
+
+    def process_once(self) -> dict | None:
+        """Collect a scan (if rate allows) and register any ready scans.
+
+        This is a drop-in replacement for ``live.process_once()`` in any
+        control loop.
+        """
+        self.collect_once()
+        results = self.drain_ready()
+        return results[-1] if results else None
+
+    # ── Flush: force-register remaining buffered scans ───────────────────
+
+    def flush(self):
+        """Register all remaining buffered scans (call at end of flight)."""
+        remaining = len(self._scan_buf) - self._n_registered
+        if remaining > 0:
+            print(f"  [buf] flushing {remaining} remaining scans...")
+        # Temporarily set delay to 0 to drain everything
+        old_delay = self.delay_scans
+        self.delay_scans = 0
+        self.drain_ready()
+        self.delay_scans = old_delay
+
+    @property
+    def buffer_size(self) -> int:
+        """Number of scans currently in the buffer."""
+        return len(self._scan_buf)
+
+    @property
+    def pending(self) -> int:
+        """Number of scans collected but not yet registered."""
+        return len(self._scan_buf) - self._n_registered
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ExplorationPlanner
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -276,6 +483,7 @@ SCAN_HZ         = 1 / 2.5      # scans per second
 PLANNER_RES     = 1.0           # planning grid cell size (m)
 VISITED_RADIUS  = 3.0           # exclude map edges within this range of past poses (m)
 MAX_TARGETS     = 50            # safety cap on autonomous waypoints
+SCAN_DELAY      = 3             # register a scan only after this many newer scans arrive
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Set up SLAM pipeline
@@ -296,6 +504,10 @@ out_dir = os.path.join(SAVE_DIR, f"exploration_{int(time.time())}")
 live.enable_recording(out_dir)
 live.pipeline.start_viewer()
 
+buf = BufferedSLAM(live, delay_scans=SCAN_DELAY)
+print(f"  Scan buffer delay: {SCAN_DELAY} scans "
+      f"({SCAN_DELAY / SCAN_HZ:.1f}s at {SCAN_HZ:.2f} Hz)")
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Takeoff and rise to exploration altitude
 # ══════════════════════════════════════════════════════════════════════════════
@@ -307,11 +519,11 @@ time.sleep(1)
 print(f"Rising to altitude z={FLIGHT_HEIGHT} ...")
 future = live.client.moveToPositionAsync(0, 0, FLIGHT_HEIGHT, velocity=VELOCITY)
 while not future._set_flag:
-    live.process_once()
+    buf.process_once()
     time.sleep(0.001)
 # Collect a few scans at the starting position
 for _ in range(5):
-    live.process_once()
+    buf.process_once()
     time.sleep(0.1)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -368,12 +580,12 @@ while wp_count < MAX_TARGETS:
         velocity=VELOCITY,
     )
     while not future._set_flag:
-        live.process_once()
+        buf.process_once()
         time.sleep(0.001)
 
     # Hover and scan at the waypoint to fill in detail
     for _ in range(5):
-        live.process_once()
+        buf.process_once()
         time.sleep(0.1)
 
 print(f"\nExploration finished after {wp_count} waypoints.")
@@ -381,6 +593,10 @@ print(f"\nExploration finished after {wp_count} waypoints.")
 # ══════════════════════════════════════════════════════════════════════════════
 # Finalise — save outputs but keep the viewer open for inspection
 # ══════════════════════════════════════════════════════════════════════════════
+
+# Flush any remaining buffered scans into the pipeline
+buf.flush()
+print(f"  Buffer stats: {buf._n_collected} total scans collected")
 
 # Correct the map and save, but do NOT stop the viewer
 live.pipeline.get_corrected_map_points()

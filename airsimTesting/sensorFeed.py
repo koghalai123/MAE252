@@ -66,7 +66,7 @@ def _vis_process(shm_name, shape, dtype_str, lock, update_event, stop_event,
     frontier_pcd = _o3d.geometry.PointCloud()
 
     vis = _o3d.visualization.Visualizer()
-    vis.create_window()
+    vis.create_window(window_name="3D Map Viewer", width=1280, height=720)
     vis.add_geometry(pcd)
     vis.add_geometry(frontier_pcd)
 
