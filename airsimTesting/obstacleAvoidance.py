@@ -1064,6 +1064,203 @@ class PathFollower:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ThreadedPathPlanner — background planning while flying
+# ══════════════════════════════════════════════════════════════════════════════
+
+class PlanResult:
+    """Result of a background planning request."""
+    def __init__(self):
+        self.path: np.ndarray | None = None
+        self.goal: np.ndarray = np.zeros(3)
+        self.start: np.ndarray = np.zeros(3)
+        self.plan_time: float = 0.0
+        self.success: bool = False
+
+
+class ThreadedPathPlanner:
+    """Threaded wrapper around :class:`PathPlanner` for concurrent planning.
+
+    Plans paths on a dedicated background thread so the drone can fly one
+    path while the next is being computed — eliminating pauses between
+    waypoint segments.
+
+    Quick usage::
+
+        tp = ThreadedPathPlanner(planner)
+        tp.start()
+
+        # Submit a plan request (returns immediately)
+        tp.request_plan(start_pos, goal_pos)
+
+        # ... fly the current path ...
+
+        # Pick up the result (blocks until ready)
+        result = tp.get_result(timeout=10.0)
+        if result and result.success:
+            follower.follow(result.path, goal=result.goal)
+
+        tp.stop()
+
+    Parameters
+    ----------
+    planner : PathPlanner
+        The underlying synchronous planner instance.
+    """
+
+    def __init__(self, planner: PathPlanner):
+        self.planner = planner
+
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()  # protects request/result state
+        self._plan_lock = threading.Lock()  # serialises plan() + update_map()
+        self._request_event = threading.Event()
+        self._stop_event = threading.Event()
+        self._result_event = threading.Event()
+
+        # Request state
+        self._req_start: np.ndarray | None = None
+        self._req_goal: np.ndarray | None = None
+
+        # Result state
+        self._result: PlanResult | None = None
+        self._is_planning = False
+
+    # ── Lifecycle ─────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        """Start the background planner thread."""
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run, name="ThreadedPlanner", daemon=True)
+        self._thread.start()
+        print("  [ThreadedPathPlanner] Background thread started")
+
+    def stop(self, timeout: float = 5.0) -> None:
+        """Stop the background planner thread."""
+        self._stop_event.set()
+        self._request_event.set()  # wake the thread
+        self._result_event.set()   # unblock any pending get_result()
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+
+    # ── Public API ────────────────────────────────────────────────────
+
+    def request_plan(
+        self, start: np.ndarray, goal: np.ndarray,
+    ) -> None:
+        """Submit a planning request (non-blocking, returns immediately).
+
+        If a previous request is still being computed it will finish
+        first; the new request is queued after it.
+        """
+        with self._lock:
+            self._req_start = np.asarray(start, dtype=float).ravel()[:3].copy()
+            self._req_goal = np.asarray(goal, dtype=float).ravel()[:3].copy()
+            self._result = None
+            self._result_event.clear()
+        self._request_event.set()
+
+    def get_result(self, timeout: float | None = None) -> PlanResult | None:
+        """Block until the current plan result is available.
+
+        Returns ``None`` on timeout.
+        """
+        if not self._result_event.wait(timeout=timeout):
+            return None
+        return self._result
+
+    @property
+    def result_ready(self) -> bool:
+        """True if a plan result is available without blocking."""
+        return self._result_event.is_set()
+
+    @property
+    def last_result(self) -> PlanResult | None:
+        """Most recent plan result (may be ``None``)."""
+        return self._result
+
+    @property
+    def is_planning(self) -> bool:
+        """True if the background thread is currently planning."""
+        return self._is_planning
+
+    def update_map(self, *args, **kwargs) -> None:
+        """Thread-safe proxy for ``planner.update_map(...)``.
+
+        Acquires the plan lock so an in-progress plan finishes before
+        the map is swapped.
+        """
+        with self._plan_lock:
+            self.planner.update_map(*args, **kwargs)
+
+    def plan_sync(self, start: np.ndarray, goal: np.ndarray) -> PlanResult:
+        """Synchronous (blocking) plan — useful for the first path.
+
+        Runs on the calling thread but still acquires the plan lock so
+        it will not collide with a background request.
+        """
+        result = PlanResult()
+        result.start = np.asarray(start, dtype=float).ravel()[:3].copy()
+        result.goal = np.asarray(goal, dtype=float).ravel()[:3].copy()
+        t0 = time.time()
+        with self._plan_lock:
+            path = self.planner.plan(result.start, result.goal)
+        result.plan_time = time.time() - t0
+        result.path = path
+        result.success = path is not None
+        return result
+
+    # ── Background thread ─────────────────────────────────────────────
+
+    def _run(self) -> None:
+        """Background loop: wait for requests, compute paths."""
+        while not self._stop_event.is_set():
+            self._request_event.wait(timeout=0.5)
+            self._request_event.clear()
+
+            if self._stop_event.is_set():
+                break
+
+            # Grab the pending request
+            with self._lock:
+                if self._req_start is None or self._req_goal is None:
+                    continue
+                start = self._req_start.copy()
+                goal = self._req_goal.copy()
+                self._req_start = None
+                self._req_goal = None
+
+            self._is_planning = True
+            result = PlanResult()
+            result.start = start
+            result.goal = goal
+
+            t0 = time.time()
+            try:
+                with self._plan_lock:
+                    path = self.planner.plan(start, goal)
+                result.plan_time = time.time() - t0
+                result.path = path
+                result.success = path is not None
+                if result.success:
+                    print(f"  [ThreadedPlanner] Path ready: "
+                          f"{len(path)} wps in {result.plan_time:.2f}s")
+                else:
+                    print(f"  [ThreadedPlanner] No path found "
+                          f"({result.plan_time:.2f}s)")
+            except Exception as e:
+                result.plan_time = time.time() - t0
+                result.success = False
+                print(f"  [ThreadedPlanner] Error: {e}")
+
+            self._is_planning = False
+            self._result = result
+            self._result_event.set()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Goal sampler (for standalone testing)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1307,7 +1504,7 @@ def main():
     mode_label = ("moveOnPathAsync" if FLIGHT_MODE == "path"
                   else "pure-pursuit velocity")
 
-    # -- 7) Set up PathFollower --------------------------------------------
+    # -- 7) Set up PathFollower + ThreadedPathPlanner ----------------------
     follower = PathFollower(
         client, planner=planner, mode=FLIGHT_MODE,
         velocity=VELOCITY, poll_hz=POLL_HZ,
@@ -1315,7 +1512,21 @@ def main():
     )
     follower.start()
 
-    # -- 8) Main loop: sample goals and fly --------------------------------
+    threaded_planner = ThreadedPathPlanner(planner)
+    threaded_planner.start()
+
+    # -- 8) Main loop: pipelined plan-while-fly ----------------------------
+    #
+    # Strategy: while the drone flies path N, the planner thread is
+    # already computing path N+1.  When the flight finishes the next
+    # path is (usually) ready immediately — no pause.
+    #
+    # If the drone's actual arrival position differs significantly from
+    # the assumed start of the pre-planned path, a quick synchronous
+    # replan is done as a fallback.
+    #
+    REPLAN_THRESHOLD = 3.0  # m — replan if arrival drifts more than this
+
     rng = np.random.default_rng(42)
     goals_reached = 0
     goals_failed = 0
@@ -1329,36 +1540,15 @@ def main():
     print(f"  Inflation: {INFLATION_RADIUS} m  |  Planner: {PLANNER_TYPE}")
     print(f"  Goal sampling: {NEAR_OBS_MIN}-{NEAR_OBS_MAX} m from obstacles")
     print(f"  Flight mode: {mode_label}  |  Poll: {POLL_HZ} Hz")
+    print(f"  Pipelined planning: ON (plan-while-fly)")
     print(f"{'='*60}\n")
 
-    for goal_i in range(NUM_GOALS):
-        current_pos = get_drone_position(client)
-        viewer.update(planner.points, drone_pos=current_pos)
-
-        print(f"[Goal {goal_i+1}/{NUM_GOALS}] Sampling near-obstacle goal ...")
-        goal = sample_near_obstacle_goal(
-            planner, current_pos,
-            min_dist_from_obstacle=NEAR_OBS_MIN,
-            max_dist_from_obstacle=NEAR_OBS_MAX,
-            min_dist_from_drone=MIN_GOAL_DIST,
-            rng=rng,
-        )
-
-        if goal is None:
-            print(f"  SKIP -- could not sample a valid goal")
-            goals_failed += 1
-            continue
-
-        dist = np.linalg.norm(goal - current_pos)
-        print(f"  Goal: ({goal[0]:.1f}, {goal[1]:.1f}, {goal[2]:.1f})  |  "
-              f"Distance: {dist:.1f} m")
-
-        viewer.update(planner.points, drone_pos=current_pos, target_pos=goal)
-
-        # If drone is outside grid or in collision, recover
-        plan_start = current_pos.copy()
-        RECOVERY_MARGIN = 5.0  # metres inside grid edge to avoid overshoot
-        for _recovery in range(3):  # up to 3 attempts
+    # ── Helper: recover drone into valid grid position ────────────────
+    def recover_start(pos: np.ndarray) -> np.ndarray | None:
+        """Try to move the drone to a valid start position."""
+        plan_start = pos.copy()
+        RECOVERY_MARGIN = 5.0
+        for _recovery in range(3):
             need_recovery = False
             reason = ""
             if not planner.is_in_grid(*plan_start):
@@ -1368,53 +1558,38 @@ def main():
                 need_recovery = True
                 reason = "in collision"
             if not need_recovery:
-                break
+                return plan_start
 
             free_pt = planner.find_nearest_free(
                 plan_start, margin=RECOVERY_MARGIN)
             if free_pt is None:
-                # Fall back without margin
                 free_pt = planner.find_nearest_free(plan_start)
             if free_pt is None:
-                break  # give up
+                return None
 
             print(f"  Warning: start {reason} -- flying to "
                   f"({free_pt[0]:.1f}, {free_pt[1]:.1f}, {free_pt[2]:.1f})")
             client.moveToPositionAsync(
                 float(free_pt[0]), float(free_pt[1]), float(free_pt[2]),
                 velocity=VELOCITY).join()
-            time.sleep(1.0)  # extra settle time for inertia
+            time.sleep(1.0)
             plan_start = get_drone_position(client)
-        else:
-            # All 3 attempts exhausted
-            if not planner.is_in_grid(*plan_start):
-                print(f"  SKIP -- could not recover into grid")
-                goals_failed += 1
-                continue
 
-        t_plan = time.time()
-        path = planner.plan(plan_start, goal)
-        dt_plan = time.time() - t_plan
+        # 3 recovery attempts exhausted
+        if not planner.is_in_grid(*plan_start):
+            return None
+        return plan_start
 
-        if path is None:
-            print(f"  FAIL -- no path found ({dt_plan:.2f}s)")
-            goals_failed += 1
-            continue
-
-        print(f"  Path found: {len(path)} waypoints, {dt_plan:.2f}s")
-
-        viewer.update(planner.points, drone_pos=current_pos,
-                      target_pos=goal, frontier_points=path)
-        time.sleep(0.3)
-
-        print(f"  Flying ({mode_label}) ...")
-        follower.follow(path, goal=goal, map_points=planner.points)
-        flight = follower.wait()
+    # ── Helper: process a completed flight ────────────────────────────
+    def process_flight(flight: FlightResult | None, goal_i: int,
+                       goal: np.ndarray) -> bool:
+        """Log flight result. Returns True if goal was reached."""
+        nonlocal goals_reached, goals_failed, total_collisions
 
         if flight is None:
             print(f"  FAIL -- flight returned no result")
             goals_failed += 1
-            continue
+            return False
 
         all_results.append(flight)
 
@@ -1440,10 +1615,172 @@ def main():
             print(f"    Collided with: '{ci.object_name}' "
                   f"(penetration: {ci.penetration_depth:.3f})")
         print()
+        return flight.success or not flight.collided
+
+    # ── First goal: plan synchronously (nothing to overlap with) ─────
+    current_pos = get_drone_position(client)
+    viewer.update(planner.points, drone_pos=current_pos)
+
+    first_path = None
+    first_goal = None
+    for _attempt in range(NUM_GOALS):
+        print(f"[Goal 1/{NUM_GOALS}] Sampling near-obstacle goal ...")
+        first_goal = sample_near_obstacle_goal(
+            planner, current_pos,
+            min_dist_from_obstacle=NEAR_OBS_MIN,
+            max_dist_from_obstacle=NEAR_OBS_MAX,
+            min_dist_from_drone=MIN_GOAL_DIST,
+            rng=rng,
+        )
+        if first_goal is None:
+            print(f"  SKIP -- could not sample a valid goal")
+            goals_failed += 1
+            continue
+
+        plan_start = recover_start(current_pos)
+        if plan_start is None:
+            print(f"  SKIP -- could not recover into grid")
+            goals_failed += 1
+            continue
+
+        pr = threaded_planner.plan_sync(plan_start, first_goal)
+        print(f"  Path {'found' if pr.success else 'FAILED'}: "
+              f"{len(pr.path) if pr.path is not None else 0} wps, "
+              f"{pr.plan_time:.2f}s")
+        if pr.success:
+            first_path = pr.path
+            break
+        else:
+            goals_failed += 1
+
+    if first_path is None or first_goal is None:
+        print("  Could not plan any initial path — aborting.")
+    else:
+        # Start flying the first path
+        viewer.update(planner.points, drone_pos=current_pos,
+                      target_pos=first_goal, frontier_points=first_path)
+        print(f"  Flying ({mode_label}) ...")
+        follower.follow(first_path, goal=first_goal,
+                        map_points=planner.points)
+
+        # Keep track of the "expected arrival position" so the planner
+        # thread can start the next plan from it.
+        prev_goal = first_goal.copy()
+        goals_sampled = 1  # how many goals consumed from NUM_GOALS budget
+
+        # ── Pipeline: plan next while flying current ─────────────────
+        while goals_sampled < NUM_GOALS:
+            next_goal_idx = goals_sampled + 1  # 1-based display index
+
+            # (a) Sample + request next plan while drone is still flying
+            print(f"[Goal {next_goal_idx}/{NUM_GOALS}] "
+                  f"Sampling next goal (planner thread) ...")
+            next_goal = sample_near_obstacle_goal(
+                planner, prev_goal,  # use expected arrival as reference
+                min_dist_from_obstacle=NEAR_OBS_MIN,
+                max_dist_from_obstacle=NEAR_OBS_MAX,
+                min_dist_from_drone=MIN_GOAL_DIST,
+                rng=rng,
+            )
+            if next_goal is not None:
+                dist = np.linalg.norm(next_goal - prev_goal)
+                print(f"  Goal: ({next_goal[0]:.1f}, {next_goal[1]:.1f}, "
+                      f"{next_goal[2]:.1f})  |  Distance: {dist:.1f} m")
+                threaded_planner.request_plan(prev_goal, next_goal)
+            else:
+                print(f"  SKIP -- could not sample a valid goal")
+
+            # (b) Wait for current flight to finish
+            flight = follower.wait()
+            process_flight(flight, goals_sampled, prev_goal)
+            goals_sampled += 1
+
+            if next_goal is None:
+                goals_failed += 1  # already counted skip above
+                # Need a fresh synchronous plan from actual position
+                current_pos = get_drone_position(client)
+                viewer.update(planner.points, drone_pos=current_pos)
+                # Try to sample again from actual position
+                next_goal = sample_near_obstacle_goal(
+                    planner, current_pos,
+                    min_dist_from_obstacle=NEAR_OBS_MIN,
+                    max_dist_from_obstacle=NEAR_OBS_MAX,
+                    min_dist_from_drone=MIN_GOAL_DIST,
+                    rng=rng,
+                )
+                if next_goal is None:
+                    prev_goal = current_pos
+                    continue
+                plan_start = recover_start(current_pos)
+                if plan_start is None:
+                    prev_goal = current_pos
+                    continue
+                pr = threaded_planner.plan_sync(plan_start, next_goal)
+                if not pr.success:
+                    prev_goal = current_pos
+                    continue
+                follower.follow(pr.path, goal=next_goal,
+                                map_points=planner.points)
+                prev_goal = next_goal.copy()
+                continue
+
+            # (c) Collect the pre-planned result
+            plan_result = threaded_planner.get_result(timeout=30.0)
+
+            actual_pos = get_drone_position(client)
+            viewer.update(planner.points, drone_pos=actual_pos,
+                          target_pos=next_goal)
+
+            path = None
+
+            if plan_result is not None and plan_result.success:
+                drift = np.linalg.norm(actual_pos - plan_result.start)
+                if drift <= REPLAN_THRESHOLD:
+                    # Pre-planned path is usable
+                    path = plan_result.path
+                    print(f"  Using pre-planned path "
+                          f"(drift {drift:.2f} m <= {REPLAN_THRESHOLD} m)")
+                else:
+                    # Arrival drifted — quick synchronous replan
+                    print(f"  Drift {drift:.2f} m > {REPLAN_THRESHOLD} m "
+                          f"— replanning from actual position ...")
+                    plan_start = recover_start(actual_pos)
+                    if plan_start is not None:
+                        pr = threaded_planner.plan_sync(plan_start, next_goal)
+                        if pr.success:
+                            path = pr.path
+                            print(f"  Replan OK: {len(path)} wps, "
+                                  f"{pr.plan_time:.2f}s")
+            else:
+                # Background plan failed — try synchronous from actual pos
+                print(f"  Pre-plan failed — replanning synchronously ...")
+                plan_start = recover_start(actual_pos)
+                if plan_start is not None:
+                    pr = threaded_planner.plan_sync(plan_start, next_goal)
+                    if pr.success:
+                        path = pr.path
+
+            if path is None:
+                print(f"  FAIL -- no usable path to goal")
+                goals_failed += 1
+                prev_goal = actual_pos
+                continue
+
+            # (d) Immediately start flying the next path (no pause!)
+            viewer.update(planner.points, drone_pos=actual_pos,
+                          target_pos=next_goal, frontier_points=path)
+            print(f"  Flying ({mode_label}) ...")
+            follower.follow(path, goal=next_goal,
+                            map_points=planner.points)
+            prev_goal = next_goal.copy()
+
+        # Wait for the very last flight to finish
+        if follower.is_busy:
+            flight = follower.wait()
+            process_flight(flight, goals_sampled, prev_goal)
 
         final_pos = get_drone_position(client)
-        viewer.update(planner.points, drone_pos=final_pos, target_pos=goal)
-        time.sleep(0.5)
+        viewer.update(planner.points, drone_pos=final_pos)
 
     # -- Summary -----------------------------------------------------------
     total_time = time.time() - t_start
@@ -1465,6 +1802,7 @@ def main():
     print(f"{'='*60}")
 
     follower.stop()
+    threaded_planner.stop()
 
     print("\nViewer is still open -- press Enter to land and exit.")
     try:
