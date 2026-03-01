@@ -32,7 +32,7 @@ import bisect
 from scipy import ndimage
 from scipy.spatial.transform import Rotation
 
-from finalMappingPipeline import LiveSLAM, SLAMConfig, SLAMPipeline
+from finalMappingPipeline import LiveSLAM, SLAMConfig, SLAMPipeline, _QualityPlot
 from RegistrationComparison import resolve_recording_dir, filter_valid, xform_pts
 from obstacleAvoidance import (
     PathPlanner, PathFollower, FollowerState, FlightResult,
@@ -239,7 +239,7 @@ class BufferedSLAM:
             # ── GPS quality gate ──────────────────────────────────────
             # Reject scan if the nearest GPS sample is >20 ms away or
             # the furthest bracket sample is >40 ms away.
-            GPS_NEAR_MAX_MS = 20.0
+            GPS_NEAR_MAX_MS = 10.0
             GPS_FAR_MAX_MS  = 40.0
             if gps_bracket_ms is not None:
                 gps_near, gps_far = gps_bracket_ms
@@ -1305,7 +1305,7 @@ MIN_WP_SPACING      = 1.0
 
 # ── Exploration scoring (live mode) ──────────────────────────────────────
 UNKNOWN_GAIN_RADIUS = 3         # voxels: box radius for counting unknown neighbours
-DISTANCE_EXPONENT   = 0.5       # softer distance penalty (1.0 = original linear)
+DISTANCE_EXPONENT   = 1.0       # softer distance penalty (1.0 = original linear)
 LIDAR_ALT_OFFSET    = 2.0       # fly this many metres above frontier centroid (NED)
 MIN_TARGET_DIST     = 3.0       # skip targets closer than this (m) to avoid re-visiting
 WP_EXCLUSION_RADIUS = 3.0       # avoid re-selecting waypoints within this radius (m)
@@ -1494,6 +1494,9 @@ def run_live():
     print(f"  Scan buffer delay: {SCAN_DELAY} scans "
           f"({SCAN_DELAY / SCAN_HZ:.1f}s at {SCAN_HZ:.2f} Hz)")
 
+    # Live quality plot (RMSE / fitness / rejections)
+    quality_plot = _QualityPlot(cfg.registration)
+
     # Start background scan collection immediately so the viewer
     # and SLAM map are populated from the very first moment.
     buf.start_collection()
@@ -1548,6 +1551,7 @@ def run_live():
     print(f"  Collecting initial scans at cruise altitude (need {MIN_INITIAL_SCANS})...")
     t0 = time.time()
     while buf._n_collected < MIN_INITIAL_SCANS and (time.time() - t0) < INITIAL_TIMEOUT:
+        quality_plot.update(live.pipeline)
         time.sleep(0.05)
     print(f"  Collected {buf._n_collected} scans in {time.time() - t0:.1f}s")
 
@@ -1593,6 +1597,8 @@ def run_live():
     while wp_count < MAX_TARGETS:
         # The PathFollower background thread automatically holds altitude
         # between paths — no explicit hover command needed here.
+
+        quality_plot.update(live.pipeline)
 
         state = live.client.getMultirotorState()
         p = state.kinematics_estimated.position
@@ -1644,6 +1650,7 @@ def run_live():
             # Wait for the follower to finish — scans are collected
             # continuously by the BufferedSLAM background thread.
             while follower.is_busy:
+                quality_plot.update(live.pipeline)
                 time.sleep(0.05)
 
             # Log the flight result
@@ -1665,6 +1672,7 @@ def run_live():
             straight_path = np.array([current_pos, target], dtype=np.float64)
             follower.follow(straight_path, goal=target)
             while follower.is_busy:
+                quality_plot.update(live.pipeline)
                 time.sleep(0.05)
 
         # Brief pause to let the scan thread populate the map
@@ -1679,6 +1687,13 @@ def run_live():
     print(f"  Buffer stats: {buf._n_collected} total scans collected")
 
     live.pipeline.get_corrected_map_points()
+
+    # Save the quality plot
+    if out_dir:
+        qp_path = os.path.join(out_dir, "quality.png")
+        quality_plot.save(qp_path, live.pipeline)
+        print(f"  Quality plot saved to {qp_path}")
+
     if out_dir:
         bt_path = os.path.join(out_dir, "map.bt")
         try:
