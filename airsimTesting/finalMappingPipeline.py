@@ -74,7 +74,7 @@ class SLAMConfig:
 
     # Registration outlier rejection
     reject_outliers: bool  = True
-    reject_warmup: int     = 4
+    reject_warmup: int     = 7
     reject_rmse_ci: float  = 0.80
     reject_rot_ci: float   = 0.0
 

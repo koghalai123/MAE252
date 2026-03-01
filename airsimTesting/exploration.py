@@ -26,6 +26,7 @@ import numpy as np
 import time
 import os
 import glob
+import threading
 
 from scipy import ndimage
 from scipy.spatial.transform import Rotation
@@ -80,6 +81,12 @@ class BufferedSLAM:
         # planner can raycast through real LiDAR data.
         self._planner: "ExplorationPlanner | None" = None
 
+        # Threading
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._thread_client = None  # thread-local AirSim client
+
     def set_planner(self, planner: "ExplorationPlanner") -> None:
         """Attach an ExplorationPlanner to receive per-scan world-frame data."""
         self._planner = planner
@@ -91,6 +98,8 @@ class BufferedSLAM:
 
         Does NOT register the scan in the SLAM pipeline yet.
         Returns the raw scan dict, or None if rate-limited / no data.
+        Uses the thread-local AirSim client when running in background
+        mode, otherwise falls back to ``self.live.client``.
         """
         import cosysairsim as airsim
         import time as _time
@@ -99,17 +108,18 @@ class BufferedSLAM:
         if now - self.live._last_scan_time < self.live._min_interval:
             return None
 
-        if self.live.client is None:
+        client = self._thread_client if self._thread_client is not None else self.live.client
+        if client is None:
             raise RuntimeError("Call live.connect() first")
 
         # Sample state BEFORE LiDAR
-        state_before = self.live.client.getMultirotorState()
+        state_before = client.getMultirotorState()
 
         # Get sensor data
-        lidar_data = self.live.client.getLidarData()
+        lidar_data = client.getLidarData()
 
         # Sample state AFTER LiDAR
-        state_after = self.live.client.getMultirotorState()
+        state_after = client.getMultirotorState()
 
         if len(lidar_data.point_cloud) < 9:
             return None
@@ -125,16 +135,26 @@ class BufferedSLAM:
         lidar_position = np.array([lpos.x_val, lpos.y_val, lpos.z_val])
         lidar_orientation = np.array([lori.w_val, lori.x_val, lori.y_val, lori.z_val])
 
-        # GPS
+        # GPS — also grab GPS timestamp for freshness check
         gps = None
+        gps_ts = None
         try:
-            gps_data = self.live.client.getGpsData()
+            gps_data = client.getGpsData()
             gp = gps_data.gnss.geo_point
             gps = np.array([gp.latitude, gp.longitude, gp.altitude])
+            gps_ts = float(gps_data.time_stamp)
         except Exception:
             pass
 
         lidar_ts = float(lidar_data.time_stamp)
+
+        # Reject scan if GPS is stale (>20 ms from LiDAR timestamp).
+        # Timestamps are in nanoseconds.
+        GPS_MAX_OFFSET_NS = 20e6  # 20 ms
+        if gps_ts is not None and abs(lidar_ts - gps_ts) > GPS_MAX_OFFSET_NS:
+            # GPS data is too old / too new — skip this scan entirely
+            self.live._last_scan_time = now
+            return None
         state_before_ts = float(state_before.timestamp)
         state_after_ts = float(state_after.timestamp)
 
@@ -194,8 +214,8 @@ class BufferedSLAM:
                   f"| bracket: {near_ms:5.1f}/{far_ms:5.1f} ms  "
                   f"| buf depth: {buf_depth}")
 
-            # Feed to SLAM pipeline
-            self.live.pipeline.set_drone_pos(scan["position"])
+            # Feed to SLAM pipeline (drone pos updated below after
+            # all per-scan work so the viewer gets one consistent update)
             result = self.live.pipeline.process_frame(
                 scan["points"],
                 scan["position"],
@@ -225,6 +245,16 @@ class BufferedSLAM:
                         scan["position"].copy(),
                         world_pts.astype(np.float32),
                     )
+                    # Push updated frontier overlay to the viewer
+                    frontier_pts = self._planner.get_frontier_points()
+                    self.live.pipeline.set_frontier_points(
+                        frontier_pts if len(frontier_pts) > 0 else None)
+
+            # Single authoritative drone-position update per scan.
+            # This is the ONLY place that should call set_drone_pos
+            # during live collection so the viewer marker doesn't jump.
+            self.live.pipeline.set_drone_pos(scan["position"])
+            self.live.pipeline.refresh_overlays()
 
         # Trim fully-registered scans from the front of the buffer,
         # but keep at least delay_scans entries for context
@@ -270,6 +300,53 @@ class BufferedSLAM:
     def pending(self) -> int:
         """Number of scans collected but not yet registered."""
         return len(self._scan_buf) - self._n_registered
+
+    # ── Background-thread scan collection ────────────────────────────
+
+    def start_collection(self) -> None:
+        """Launch a background thread that continuously collects scans
+        and registers them into the SLAM pipeline.
+
+        The thread creates its own AirSim client (required by the
+        msgpack-rpc transport) and runs ``collect_once`` + ``drain_ready``
+        in a tight loop, sleeping only for the configured scan interval.
+        All pipeline / planner writes happen under ``_lock`` so the main
+        thread can safely read the map and grids.
+        """
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._collection_loop, name="BufferedSLAM", daemon=True)
+        self._thread.start()
+
+    def stop_collection(self, timeout: float = 5.0) -> None:
+        """Signal the background collection thread to stop and wait."""
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+            self._thread = None
+        self._thread_client = None
+
+    def _collection_loop(self) -> None:
+        """Background thread entry point."""
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        import cosysairsim as airsim
+        self._thread_client = airsim.MultirotorClient()
+        self._thread_client.confirmConnection()
+        print("  [BufferedSLAM] Thread-local AirSim client connected")
+
+        while not self._stop_event.is_set():
+            try:
+                self.collect_once()
+                self.drain_ready()
+            except Exception as e:
+                print(f"  [BufferedSLAM] Error: {e}")
+            # Sleep just under the scan interval so we never miss a window
+            time.sleep(self.live._min_interval * 0.5)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -326,6 +403,15 @@ class ExplorationPlanner:
         lidar_altitude_offset: float = 0.0,
         min_target_distance: float = 3.0,
         inflation_margin: float = 2.0,
+        # ── NBV parameters ────────────────────────────────────────
+        use_nbv: bool = False,
+        nbv_sensor_half_angle: float = 45.0,
+        nbv_cruise_altitude: float | None = None,
+        nbv_n_unknown_columns: int = 10,
+        nbv_n_local_samples: int = 15,
+        nbv_local_radius: float = 10.0,
+        above_grid_margin: float = 0.0,
+        nbv_lidar_max_range: float = 40.0,
     ):
         self.xmin, self.xmax, self.ymin, self.ymax, self.zmin, self.zmax = bounds
         self.resolution = resolution
@@ -337,6 +423,16 @@ class ExplorationPlanner:
         self.lidar_altitude_offset = lidar_altitude_offset
         self.min_target_distance = min_target_distance
         self.inflation_margin = inflation_margin
+
+        # NBV settings
+        self.use_nbv = use_nbv
+        self.nbv_sensor_half_angle = nbv_sensor_half_angle
+        self.nbv_cruise_altitude = nbv_cruise_altitude
+        self.nbv_n_unknown_columns = nbv_n_unknown_columns
+        self.nbv_n_local_samples = nbv_n_local_samples
+        self.nbv_local_radius = nbv_local_radius
+        self.above_grid_margin = above_grid_margin
+        self.nbv_lidar_max_range = nbv_lidar_max_range
 
         self.nx = int(np.ceil((self.xmax - self.xmin) / resolution))
         self.ny = int(np.ceil((self.ymax - self.ymin) / resolution))
@@ -373,7 +469,11 @@ class ExplorationPlanner:
     # ── Scan data input ───────────────────────────────────────────────────
 
     def feed_scan(self, sensor_origin: np.ndarray, world_pts: np.ndarray) -> None:
-        """Store a LiDAR scan for raycasting at the next planning step.
+        """Store a LiDAR scan and immediately raycast it into the observed grid.
+
+        Also marks the scan's hit-points as occupied so the frontier overlay
+        (observed & not-occupied neighbours unknown) stays current between
+        planning calls.
 
         Parameters
         ----------
@@ -382,10 +482,48 @@ class ExplorationPlanner:
         world_pts : ndarray, shape (N, 3)
             LiDAR hit-points already in NED world frame.
         """
+        wpts = np.asarray(world_pts, dtype=np.float32)
         self._scan_data.append((
             np.asarray(sensor_origin, dtype=np.float32).ravel()[:3],
-            np.asarray(world_pts, dtype=np.float32),
+            wpts,
         ))
+        # Raycast immediately so the observed grid stays current.
+        self._raycast_update_observed()
+
+        # Mark hit-points as occupied so frontier derivation is up-to-date
+        if len(wpts) > 0:
+            res = self.resolution
+            ix = np.clip(((wpts[:, 0] - self.xmin) / res).astype(np.intp),
+                         0, self.nx - 1)
+            iy = np.clip(((wpts[:, 1] - self.ymin) / res).astype(np.intp),
+                         0, self.ny - 1)
+            iz = np.clip(((wpts[:, 2] - self.zmin) / res).astype(np.intp),
+                         0, self.nz - 1)
+            self._last_occupied_grid[ix, iy, iz] = True
+
+    # ── Frontier overlay (cheap, no BFS) ──────────────────────────────────
+
+    def get_frontier_points(self) -> np.ndarray:
+        """Return world-frame frontier voxel centres from the current grids.
+
+        Cheap to call — only uses the already-maintained ``_observed`` and
+        ``_last_occupied_grid`` arrays (no pipeline query, no BFS).
+
+        Returns (N, 3) float64 or empty (0, 3).
+        """
+        free = self._observed & ~self._last_occupied_grid
+        unknown = ~self._observed
+        struct = ndimage.generate_binary_structure(3, 1)
+        unknown_adj = ndimage.binary_dilation(unknown, structure=struct)
+        is_frontier = free & unknown_adj
+        frt = np.argwhere(is_frontier)
+        if len(frt) == 0:
+            return np.empty((0, 3), dtype=np.float64)
+        return np.column_stack([
+            self.xmin + (frt[:, 0] + 0.5) * self.resolution,
+            self.ymin + (frt[:, 1] + 0.5) * self.resolution,
+            self.zmin + (frt[:, 2] + 0.5) * self.resolution,
+        ])
 
     # ── Raycasting-based observed-zone update ─────────────────────────────
 
@@ -528,6 +666,264 @@ class ExplorationPlanner:
 
         return clusters
 
+    # ── Next-Best-View (NBV) target selection ─────────────────────────────
+
+    def _nbv_generate_candidates(
+        self,
+        current_pos: np.ndarray,
+        occupied_grid: np.ndarray,
+        free: np.ndarray,
+        unknown: np.ndarray,
+        is_frontier: np.ndarray,
+        start: tuple[int, int, int],
+    ) -> np.ndarray:
+        """Generate candidate viewpoints from multiple heuristics.
+
+        Heuristic 1 — **Frontier cluster viewpoints** at multiple altitudes:
+            For each WFD frontier cluster centroid, generate candidates at
+            the frontier Z, at half/full/double ``lidar_altitude_offset``
+            above it, and at ``nbv_cruise_altitude``.  The multi-altitude
+            spread lets the drone fly under overhangs at lower Z or scan
+            wide from higher up.
+
+        Heuristic 2 — **High-unknown columns**:
+            Find the ``nbv_n_unknown_columns`` columns (ix, iy) with the
+            most unknown voxels.  Place a candidate at the topmost free
+            voxel in each column (and at cruise altitude).
+
+        Heuristic 3 — **Local neighbourhood samples**:
+            Random positions within ``nbv_local_radius`` of the drone in
+            free space, for immediate opportunities.
+
+        Returns
+        -------
+        candidates : ndarray (N, 3)
+            De-duplicated candidate viewpoints in NED world frame.
+        """
+        raw: list[np.ndarray] = []
+        margin = self.inflation_margin
+        cruise_z = (self.nbv_cruise_altitude
+                    if self.nbv_cruise_altitude is not None
+                    else current_pos[2])
+
+        # ── H1: Frontier cluster viewpoints at multiple altitudes ─────
+        clusters = self._wfd_bfs(start, free, is_frontier)
+        valid_clusters = [c for c in clusters
+                          if len(c) >= self.min_frontier_size]
+
+        z_offsets = [0.0]
+        if self.lidar_altitude_offset > 0:
+            z_offsets += [
+                self.lidar_altitude_offset * 0.5,
+                self.lidar_altitude_offset,
+                self.lidar_altitude_offset * 2.0,
+            ]
+
+        for cells in valid_clusters:
+            cx_ = float(cells[:, 0].mean())
+            cy_ = float(cells[:, 1].mean())
+            cz_ = float(cells[:, 2].mean())
+            wx, wy, wz_f = self._grid_to_world(cx_, cy_, cz_)
+            for zo in z_offsets:
+                raw.append(np.array([wx, wy, wz_f - zo]))
+            raw.append(np.array([wx, wy, cruise_z]))
+
+        # ── H2: Columns with most unknown voxels ─────────────────────
+        unknown_per_col = unknown.sum(axis=2)              # (nx, ny)
+        n_cols = min(self.nbv_n_unknown_columns,
+                     self.nx * self.ny)
+        flat_top = np.argsort(unknown_per_col.ravel())[::-1][:n_cols]
+
+        for fi in flat_top:
+            if unknown_per_col.ravel()[fi] == 0:
+                break
+            ix_, iy_ = np.unravel_index(fi, unknown_per_col.shape)
+            wx, wy, _ = self._grid_to_world(ix_, iy_, 0)
+            # Topmost free voxel in column (smallest iz ⇒ most negative z)
+            for iz_ in range(self.nz):
+                if free[ix_, iy_, iz_]:
+                    _, _, wz = self._grid_to_world(ix_, iy_, iz_)
+                    raw.append(np.array([wx, wy, wz]))
+                    break
+            raw.append(np.array([wx, wy, cruise_z]))
+
+        # ── H3: Local random samples around drone ────────────────────
+        for _ in range(self.nbv_n_local_samples):
+            offset = np.random.uniform(
+                -self.nbv_local_radius, self.nbv_local_radius, 3)
+            cand = current_pos[:3] + offset
+            if not (self.xmin + margin <= cand[0] <= self.xmax - margin and
+                    self.ymin + margin <= cand[1] <= self.ymax - margin):
+                continue
+            gx, gy, gz = self._world_to_grid(*cand)
+            if occupied_grid[gx, gy, gz]:
+                continue
+            raw.append(cand)
+
+        if not raw:
+            return np.empty((0, 3), dtype=np.float64)
+
+        # ── De-duplicate: snap to half-resolution grid ───────────────
+        pts = np.array(raw, dtype=np.float64)
+        snap = self.resolution * 0.5
+        keys = np.round(pts / snap).astype(np.int64)
+        _, idx = np.unique(keys, axis=0, return_index=True)
+        pts = pts[np.sort(idx)]
+
+        # ── Clamp Z to valid OMPL range ──────────────────────────────
+        # The PathPlanner extends zmin upward by above_grid_margin.
+        # In NED more negative = higher, so the plannable ceiling is
+        # zmin - above_grid_margin.  Keep a 0.5 m buffer inside.
+        z_ceil = self.zmin - self.above_grid_margin + 0.5
+        z_floor = self.zmax - 0.5
+        pts[:, 2] = np.clip(pts[:, 2], z_ceil, z_floor)
+        return pts
+
+    def _nbv_score_candidate(
+        self,
+        cand: np.ndarray,
+        occupied_grid: np.ndarray,
+        unknown: np.ndarray,
+    ) -> int:
+        """Score *one* viewpoint by simulating its downward-facing LiDAR cone.
+
+        Works at *any* altitude (above the grid, inside it, etc.).  For each
+        column (ix, iy) within the cone footprint the method walks downward
+        from the candidate's Z level and counts unknown voxels until an
+        occupied voxel occludes the rest of the column.  This correctly
+        handles overhangs: a candidate *below* an overhang can see the
+        voxels beneath it that a higher candidate cannot.
+
+        Returns the total visible-unknown-voxel count (information gain).
+        """
+        cx, cy, cz = cand
+        tan_ha = np.tan(np.radians(self.nbv_sensor_half_angle))
+        res = self.resolution
+        max_range = self.nbv_lidar_max_range
+        max_range_sq = max_range * max_range
+
+        # Grid iz just at or above the candidate altitude
+        ciz_float = (cz - self.zmin) / res
+        ciz = int(np.clip(np.floor(ciz_float), -1, self.nz - 1))
+        # Start scanning from ciz+1 (first layer strictly below)
+        iz_start = max(ciz + 1, 0)
+        if iz_start >= self.nz:
+            return 0  # candidate below entire grid in NED → nothing to see
+
+        # Column world coordinates
+        col_x = self.xmin + (np.arange(self.nx) + 0.5) * res  # (nx,)
+        col_y = self.ymin + (np.arange(self.ny) + 0.5) * res  # (ny,)
+        dx2 = (col_x - cx) ** 2                               # (nx,)
+        dy2 = (col_y - cy) ** 2                               # (ny,)
+        dist_sq_xy = dx2[:, np.newaxis] + dy2[np.newaxis, :]   # (nx, ny)
+
+        # Per-column first-occupied below candidate
+        first_occ = np.full((self.nx, self.ny), self.nz, dtype=np.intp)
+        for iz in range(iz_start, self.nz):
+            mask = occupied_grid[:, :, iz] & (first_occ == self.nz)
+            first_occ[mask] = iz
+
+        # Z centres for levels below the candidate
+        wz_levels = self.zmin + (np.arange(iz_start, self.nz) + 0.5) * res
+        depths = wz_levels - cz                               # positive = below
+        cone_r_sq = np.where(depths > 0,
+                             (depths * tan_ha) ** 2, -1.0)    # (n_levels,)
+
+        # 3-D distance² from candidate to each voxel centre:
+        # dist² = dx² + dy² + dz²  where dz = depth for each level.
+        # Voxels beyond the LiDAR max range produce unreliable returns.
+        dz2 = depths ** 2                                      # (n_levels,)
+        dist3d_sq = (dist_sq_xy[:, :, np.newaxis]
+                     + dz2[np.newaxis, np.newaxis, :])         # (nx,ny,n_levels)
+
+        iz_abs = np.arange(iz_start, self.nz)                 # absolute indices
+        # Broadcast: (nx, ny, 1) vs (1, 1, n_levels)
+        in_cone = (dist_sq_xy[:, :, np.newaxis]
+                   <= cone_r_sq[np.newaxis, np.newaxis, :])    # (nx,ny,n_levels)
+        in_range = dist3d_sq <= max_range_sq                   # (nx,ny,n_levels)
+        not_occ = (iz_abs[np.newaxis, np.newaxis, :]
+                   < first_occ[:, :, np.newaxis])              # (nx,ny,n_levels)
+        unk = unknown[:, :, iz_start:]                         # (nx,ny,n_levels)
+
+        return int((in_cone & in_range & not_occ & unk).sum())
+
+    def _nbv_select_target(
+        self,
+        current_pos: np.ndarray,
+        occupied_grid: np.ndarray,
+        free: np.ndarray,
+        unknown: np.ndarray,
+        is_frontier: np.ndarray,
+        start: tuple[int, int, int],
+    ) -> np.ndarray | None:
+        """Select next target using heuristic-generated candidates + frustum scoring.
+
+        1. Generate candidate viewpoints via ``_nbv_generate_candidates``.
+           Candidates come from frontier cluster centroids at multiple
+           altitudes, high-unknown columns, and random local samples.
+        2. Filter candidates (occupied, too close, revisited).
+        3. Score each surviving candidate with ``_nbv_score_candidate``
+           (downward cone raycasting with per-candidate occlusion).
+        4. Return the candidate with the highest gain / distance^exp.
+
+        Parameters
+        ----------
+        current_pos, occupied_grid, free, unknown, is_frontier, start
+            Same grids / masks built by ``next_target``.
+
+        Returns
+        -------
+        target : ndarray (3,) or None
+        """
+        candidates = self._nbv_generate_candidates(
+            current_pos, occupied_grid, free, unknown, is_frontier, start)
+
+        if len(candidates) == 0:
+            print("    [nbv] 0 candidates generated")
+            return None
+
+        cur_xyz = current_pos[:3]
+        best_score = -np.inf
+        best_candidate = None
+        n_evaluated = 0
+
+        for cand in candidates:
+            dist = float(np.linalg.norm(cand - cur_xyz))
+            if dist < self.min_target_distance:
+                continue
+
+            if self._waypoint_history:
+                prev = np.array(self._waypoint_history)
+                if np.any(np.linalg.norm(prev - cand, axis=1)
+                          < self.waypoint_exclusion_radius):
+                    continue
+
+            # Check that the candidate voxel (if inside grid) is not occupied
+            if (self.xmin <= cand[0] <= self.xmax and
+                    self.ymin <= cand[1] <= self.ymax and
+                    self.zmin <= cand[2] <= self.zmax):
+                gx, gy, gz = self._world_to_grid(*cand)
+                if occupied_grid[gx, gy, gz]:
+                    continue
+
+            gain = self._nbv_score_candidate(cand, occupied_grid, unknown)
+            if gain == 0:
+                continue
+
+            score = gain / max(dist, 0.01) ** self.distance_exponent
+            n_evaluated += 1
+
+            if score > best_score:
+                best_score = score
+                best_candidate = cand.copy()
+
+        print(f"    [nbv] {len(candidates)} candidates, "
+              f"{n_evaluated} scored, best gain/cost={best_score:.1f}")
+
+        if best_candidate is not None:
+            self._waypoint_history.append(best_candidate.copy())
+        return best_candidate
+
     # ── Core planner ──────────────────────────────────────────────────────
 
     def next_target(
@@ -554,8 +950,8 @@ class ExplorationPlanner:
         """
         current_pos = np.asarray(current_pos, dtype=float)
 
-        # 1) Update observed grid via raycasting through real scan data ───
-        self._raycast_update_observed()
+        # 1) Observed grid is updated continuously via feed_scan() on the
+        #    collection thread — no batch raycast needed here.
 
         # 2) Build 3-D occupied grid from SLAM map points ────────────────
         occupied_grid = np.zeros((self.nx, self.ny, self.nz), dtype=bool)
@@ -627,7 +1023,29 @@ class ExplorationPlanner:
         unknown_adjacent = ndimage.binary_dilation(unknown, structure=struct)
         is_frontier = free & unknown_adjacent
 
-        # 4) Wavefront Frontier Detection BFS ─────────────────────────────
+        # ── Branch: NBV or WFD ────────────────────────────────────────
+        if self.use_nbv:
+            # ── 4a) NBV — frustum-based viewpoint scoring ────────────
+            best_target = self._nbv_select_target(
+                current_pos, occupied_grid, free, unknown,
+                is_frontier, start)
+
+            # Populate frontier overlay from the frontier mask so the
+            # viewer still shows frontier voxels even in NBV mode.
+            frt_ijs = np.argwhere(is_frontier)  # (N, 3)
+            if len(frt_ijs) > 0:
+                frontier_world = np.column_stack([
+                    self.xmin + (frt_ijs[:, 0] + 0.5) * self.resolution,
+                    self.ymin + (frt_ijs[:, 1] + 0.5) * self.resolution,
+                    self.zmin + (frt_ijs[:, 2] + 0.5) * self.resolution,
+                ])
+                info["frontier_world_pts"] = frontier_world
+                info["n_frontier_cells"] = len(frt_ijs)
+                info["n_frontier_cells_raw"] = len(frt_ijs)
+
+            return best_target, info
+
+        # ── 4b) Wavefront Frontier Detection BFS (original) ──────────
         all_clusters = self._wfd_bfs(start, free, is_frontier)
 
         # Raw count (all clusters, any size)
@@ -771,7 +1189,7 @@ REPLAY_DIR      = ""
 EXPLORE_BOUNDS  = (-20, 20, -50, 10, -20, 0)   # (xmin,xmax,ymin,ymax,zmin,zmax) NED
 TAKEOFF_HEIGHT  = EXPLORE_BOUNDS[4] - 5         # NED z, 5 m above grid ceiling (LiDAR points down)
 VELOCITY        = 3             # m/s (live mode only)
-SCAN_HZ         = 1 / 2.5      # scans per second (live mode only)
+SCAN_HZ         = 1 / 1.5      # scans per second (live mode only)
 PLANNER_RES     = 1.0           # planning grid voxel size (m)
 MAX_TARGETS     = 50            # safety cap on autonomous waypoints
 SCAN_DELAY      = 3             # register a scan only after N newer scans (live mode)
@@ -793,6 +1211,19 @@ DISTANCE_EXPONENT   = 0.5       # softer distance penalty (1.0 = original linear
 LIDAR_ALT_OFFSET    = 2.0       # fly this many metres above frontier centroid (NED)
 MIN_TARGET_DIST     = 3.0       # skip targets closer than this (m) to avoid re-visiting
 WP_EXCLUSION_RADIUS = 3.0       # avoid re-selecting waypoints within this radius (m)
+
+# ── Target selection algorithm ───────────────────────────────────────────
+# Set USE_NBV = True to use Next-Best-View frustum scoring instead of WFD
+# frontier-centroid scoring.  NBV generates candidate viewpoints on a grid
+# at cruise altitude and picks the one that maximises the number of unknown
+# voxels visible through a simulated downward-facing LiDAR cone.
+USE_NBV                 = True
+NBV_SENSOR_HALF_ANGLE   = 45.0  # half-angle (deg) of the LiDAR cone
+NBV_CRUISE_ALTITUDE     = TAKEOFF_HEIGHT  # one of the altitude options for candidates (NED)
+NBV_N_UNKNOWN_COLUMNS   = 10    # top-K columns by unknown-voxel count to sample
+NBV_N_LOCAL_SAMPLES     = 15    # random free-space samples near the drone
+NBV_LOCAL_RADIUS        = 10.0  # world-space radius for local samples (m)
+NBV_LIDAR_MAX_RANGE     = 40.0  # LiDAR max range (m); voxels beyond this are not scored
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Replay mode — offline exploration on saved LiDAR data
@@ -830,6 +1261,12 @@ def run_replay(recording_dir: str):
         bounds=EXPLORE_BOUNDS,
         resolution=PLANNER_RES,
         min_frontier_size=3,
+        use_nbv=USE_NBV,
+        nbv_sensor_half_angle=NBV_SENSOR_HALF_ANGLE,
+        nbv_cruise_altitude=NBV_CRUISE_ALTITUDE,
+        nbv_n_unknown_columns=NBV_N_UNKNOWN_COLUMNS,
+        nbv_n_local_samples=NBV_N_LOCAL_SAMPLES,
+        nbv_local_radius=NBV_LOCAL_RADIUS,
     )
 
     print(f"\n{'='*60}")
@@ -945,15 +1382,23 @@ def run_live():
     )
 
     live = LiveSLAM(cfg)
+
+    # Start the 3-D viewer as early as possible so the user can see
+    # the map being populated from the very first scan.
+    live.pipeline.start_viewer()
+
     live.connect()
 
     out_dir = os.path.join(SAVE_DIR, f"exploration_{int(time.time())}")
     live.enable_recording(out_dir)
-    live.pipeline.start_viewer()
 
     buf = BufferedSLAM(live, delay_scans=SCAN_DELAY)
     print(f"  Scan buffer delay: {SCAN_DELAY} scans "
           f"({SCAN_DELAY / SCAN_HZ:.1f}s at {SCAN_HZ:.2f} Hz)")
+
+    # Start background scan collection immediately so the viewer
+    # and SLAM map are populated from the very first moment.
+    buf.start_collection()
 
     # ── Exploration planner (must be created before takeoff so scans are forwarded)
     exploration = ExplorationPlanner(
@@ -966,6 +1411,14 @@ def run_live():
         min_target_distance=MIN_TARGET_DIST,
         waypoint_exclusion_radius=WP_EXCLUSION_RADIUS,
         inflation_margin=INFLATION_RADIUS + 0.5,
+        use_nbv=USE_NBV,
+        nbv_sensor_half_angle=NBV_SENSOR_HALF_ANGLE,
+        nbv_cruise_altitude=NBV_CRUISE_ALTITUDE,
+        nbv_n_unknown_columns=NBV_N_UNKNOWN_COLUMNS,
+        nbv_n_local_samples=NBV_N_LOCAL_SAMPLES,
+        nbv_local_radius=NBV_LOCAL_RADIUS,
+        above_grid_margin=ABOVE_GRID_MARGIN,
+        nbv_lidar_max_range=NBV_LIDAR_MAX_RANGE,
     )
     buf.set_planner(exploration)
 
@@ -979,45 +1432,46 @@ def run_live():
     )
 
     # ── Takeoff ──────────────────────────────────────────────────────────
+    # Scan collection thread is already running (started above).
+
     print("Taking off...")
     live.client.takeoffAsync().join()
-    time.sleep(1)
+    live.client.hoverAsync().join()
 
     print(f"Rising to altitude z={TAKEOFF_HEIGHT} ...")
     future = live.client.moveToPositionAsync(0, 0, TAKEOFF_HEIGHT, velocity=VELOCITY)
     while not future._set_flag:
-        buf.process_once()
-        p = live.client.getMultirotorState().kinematics_estimated.position
-        live.pipeline.set_drone_pos(np.array([p.x_val, p.y_val, p.z_val]))
-        live.pipeline.refresh_overlays()
-        time.sleep(0.001)
+        # Drone position in the viewer is updated by the BufferedSLAM
+        # collection thread — no need to call set_drone_pos here.
+        time.sleep(0.05)
     live.client.hoverAsync().join()
 
     # Hover at cruise altitude and collect several scans so the planner
     # has a proper observed region centred at the operating height.
+    # Scan collection is running in the background thread already.
     MIN_INITIAL_SCANS = 5
     INITIAL_TIMEOUT   = 30.0   # seconds — safety cap
     print(f"  Collecting initial scans at cruise altitude (need {MIN_INITIAL_SCANS})...")
     t0 = time.time()
     while buf._n_collected < MIN_INITIAL_SCANS and (time.time() - t0) < INITIAL_TIMEOUT:
-        buf.process_once()
-        p = live.client.getMultirotorState().kinematics_estimated.position
-        live.pipeline.set_drone_pos(np.array([p.x_val, p.y_val, p.z_val]))
-        live.pipeline.refresh_overlays()
         time.sleep(0.05)
     print(f"  Collected {buf._n_collected} scans in {time.time() - t0:.1f}s")
 
-    # Flush all buffered scans so the planner has raycasting data
-    # from every scan collected during ascent (not just the N-delay ones)
-    buf.flush()
+    # Do NOT flush — scans must stay in the buffer for the full delay
+    # so GPS coordinates have time to settle.  The background thread
+    # drains them naturally once enough newer scans arrive.
     print(f"  Initial scans forwarded to planner: {exploration._n_scans_raycasted} raycasted, "
           f"{len(exploration._scan_data)} total")
 
     # ── Path follower (threaded flight executor) ─────────────────────────
     def _viewer_tick(pos, _follower):
-        """Called at POLL_HZ on the follower thread — update drone marker."""
-        live.pipeline.set_drone_pos(pos)
-        live.pipeline.refresh_overlays()
+        """Called at POLL_HZ on the follower thread.
+
+        Drone position in the viewer is managed exclusively by the
+        BufferedSLAM collection thread so the marker doesn't jump
+        between competing position sources.  This callback is kept
+        for any future per-tick work but does NOT touch the viewer."""
+        pass
 
     follower = PathFollower(
         live.client, planner=path_planner,
@@ -1043,6 +1497,9 @@ def run_live():
     wp_count = 0
 
     while wp_count < MAX_TARGETS:
+        # The PathFollower background thread automatically holds altitude
+        # between paths — no explicit hover command needed here.
+
         state = live.client.getMultirotorState()
         p = state.kinematics_estimated.position
         current_pos = np.array([p.x_val, p.y_val, p.z_val])
@@ -1090,10 +1547,10 @@ def run_live():
             # Fly the planned path with the threaded PathFollower
             follower.follow(path, goal=target)
 
-            # Collect scans while the follower flies
+            # Wait for the follower to finish — scans are collected
+            # continuously by the BufferedSLAM background thread.
             while follower.is_busy:
-                buf.process_once()
-                time.sleep(0.001)
+                time.sleep(0.05)
 
             # Log the flight result
             result = follower.last_result
@@ -1109,29 +1566,20 @@ def run_live():
         else:
             print(f"       No path found ({dt_plan:.2f}s) — flying direct")
             live.set_path_points(None)  # clear path line from viewer
-            # Fall back to straight-line flight if OMPL cannot find a route
-            future = live.client.moveToPositionAsync(
-                float(target[0]), float(target[1]), float(target[2]),
-                velocity=VELOCITY,
-            )
-            while not future._set_flag:
-                buf.process_once()
-                p = live.client.getMultirotorState().kinematics_estimated.position
-                live.pipeline.set_drone_pos(np.array([p.x_val, p.y_val, p.z_val]))
-                live.pipeline.refresh_overlays()
-                time.sleep(0.001)
+            # Fall back to straight-line flight routed through the
+            # PathFollower so it uses the correct thread-local client.
+            straight_path = np.array([current_pos, target], dtype=np.float64)
+            follower.follow(straight_path, goal=target)
+            while follower.is_busy:
+                time.sleep(0.05)
 
-        # Hover to hold position while the next planning step runs
-        live.client.hoverAsync().join()
-
-        # Extra scans after arrival — let the map settle
-        for _ in range(5):
-            buf.process_once()
-            time.sleep(0.1)
+        # Brief pause to let the scan thread populate the map
+        time.sleep(0.5)
 
     print(f"\nExploration finished after {wp_count} waypoints.")
 
     # ── Finalise ─────────────────────────────────────────────────────────
+    buf.stop_collection()
     follower.stop()
     buf.flush()
     print(f"  Buffer stats: {buf._n_collected} total scans collected")

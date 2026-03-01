@@ -865,6 +865,13 @@ class PathFollower:
             # Grab the pending path
             with self._lock:
                 if self._waypoints is None:
+                    # No new path — actively hold position so the drone
+                    # doesn't fall.  This client is the one that "owns"
+                    # the drone's movement, so it must keep commanding.
+                    try:
+                        self._thread_client.hoverAsync()
+                    except Exception:
+                        pass
                     continue
                 waypoints = self._waypoints.copy()
                 goal = self._goal.copy() if self._goal is not None else None
