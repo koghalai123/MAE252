@@ -27,6 +27,7 @@ import time
 import os
 import glob
 import threading
+import bisect
 
 from scipy import ndimage
 from scipy.spatial.transform import Rotation
@@ -76,16 +77,27 @@ class BufferedSLAM:
         # Total scans collected
         self._n_collected: int = 0
 
+        # High-rate GPS ring buffer (populated by _gps_loop on its own
+        # thread, interpolated in drain_ready).  Protected by _gps_lock.
+        self._gps_buf_ts: list[float] = []   # sorted AirSim timestamps (ns)
+        self._gps_buf_geo: list[np.ndarray] = []  # [lat, lon, alt]
+        self._GPS_BUF_MAX = 2000             # trim safety cap
+        self._gps_lock = threading.Lock()    # guards _gps_buf_*
+
         # Optional planner reference — when set, each registered scan's
         # world-frame points are forwarded via planner.feed_scan() so the
         # planner can raycast through real LiDAR data.
         self._planner: "ExplorationPlanner | None" = None
 
-        # Threading
+        # Threading — two threads:
+        #   _thread      : LiDAR collect + drain (SLAM processing)
+        #   _gps_thread  : high-rate GPS polling (never blocked by SLAM)
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
+        self._gps_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
-        self._thread_client = None  # thread-local AirSim client
+        self._thread_client = None   # collection thread AirSim client
+        self._gps_client = None      # GPS thread AirSim client
 
     def set_planner(self, planner: "ExplorationPlanner") -> None:
         """Attach an ExplorationPlanner to receive per-scan world-frame data."""
@@ -135,26 +147,11 @@ class BufferedSLAM:
         lidar_position = np.array([lpos.x_val, lpos.y_val, lpos.z_val])
         lidar_orientation = np.array([lori.w_val, lori.x_val, lori.y_val, lori.z_val])
 
-        # GPS — also grab GPS timestamp for freshness check
-        gps = None
-        gps_ts = None
-        try:
-            gps_data = client.getGpsData()
-            gp = gps_data.gnss.geo_point
-            gps = np.array([gp.latitude, gp.longitude, gp.altitude])
-            gps_ts = float(gps_data.time_stamp)
-        except Exception:
-            pass
+        # GPS — grabbed at high rate by _sample_gps(); NOT grabbed here.
+        # A placeholder None is stored; drain_ready() will interpolate
+        # from the high-rate GPS buffer.
 
         lidar_ts = float(lidar_data.time_stamp)
-
-        # Reject scan if GPS is stale (>20 ms from LiDAR timestamp).
-        # Timestamps are in nanoseconds.
-        GPS_MAX_OFFSET_NS = 20e6  # 20 ms
-        if gps_ts is not None and abs(lidar_ts - gps_ts) > GPS_MAX_OFFSET_NS:
-            # GPS data is too old / too new — skip this scan entirely
-            self.live._last_scan_time = now
-            return None
         state_before_ts = float(state_before.timestamp)
         state_after_ts = float(state_after.timestamp)
 
@@ -164,7 +161,7 @@ class BufferedSLAM:
             "orientation": ori,
             "lidar_position": lidar_position,
             "lidar_orientation": lidar_orientation,
-            "gps": gps,
+            "gps": None,  # filled by drain_ready via GPS buffer interpolation
             "lidar_ts": lidar_ts,
             "state_before_ts": state_before_ts,
             "state_after_ts": state_after_ts,
@@ -180,7 +177,7 @@ class BufferedSLAM:
         # Save raw frame to disk if recording is enabled
         if self.live.save_dir is not None:
             self.live._save_frame(points, pos, ori, lidar_position,
-                                  lidar_orientation, gps)
+                                  lidar_orientation, None)
 
         # Safety trim
         if len(self._scan_buf) > self.max_buffer:
@@ -204,14 +201,73 @@ class BufferedSLAM:
         while self._n_registered < ready_count and self._n_registered < len(self._scan_buf):
             scan = self._scan_buf[self._n_registered]
 
+            # ── Interpolate GPS from the high-rate buffer ─────────────
+            lidar_ts = scan["lidar_ts"]
+            gps_interp = None
+            gps_bracket_ms = None
+            with self._gps_lock:
+                buf_ts = list(self._gps_buf_ts)    # snapshot
+                buf_geo = list(self._gps_buf_geo)
+            if len(buf_ts) >= 2:
+                idx = bisect.bisect_right(buf_ts, lidar_ts)
+                i_before = max(idx - 1, 0)
+                i_after = min(idx, len(buf_ts) - 1)
+                ts_a = buf_ts[i_before]
+                ts_b = buf_ts[i_after]
+                near_ms = min(abs(lidar_ts - ts_a),
+                              abs(lidar_ts - ts_b)) / 1e6
+                far_ms = max(abs(lidar_ts - ts_a),
+                             abs(lidar_ts - ts_b)) / 1e6
+                gps_bracket_ms = (near_ms, far_ms)
+                if ts_b != ts_a:
+                    t = np.clip((lidar_ts - ts_a) / (ts_b - ts_a), 0.0, 1.0)
+                    gps_interp = ((1 - t) * buf_geo[i_before]
+                                  + t * buf_geo[i_after])
+                else:
+                    gps_interp = buf_geo[i_before].copy()
+            scan["gps"] = gps_interp
+
             # Print timing: how far the bracketing state samples are from LiDAR
-            near_ms = min(abs(scan["lidar_ts"] - scan["state_before_ts"]),
-                          abs(scan["lidar_ts"] - scan["state_after_ts"])) / 1e6
-            far_ms = max(abs(scan["lidar_ts"] - scan["state_before_ts"]),
-                         abs(scan["lidar_ts"] - scan["state_after_ts"])) / 1e6
+            state_near_ms = min(abs(scan["lidar_ts"] - scan["state_before_ts"]),
+                                abs(scan["lidar_ts"] - scan["state_after_ts"])) / 1e6
+            state_far_ms = max(abs(scan["lidar_ts"] - scan["state_before_ts"]),
+                               abs(scan["lidar_ts"] - scan["state_after_ts"])) / 1e6
+            gps_str = (f"GPS: {gps_bracket_ms[0]:5.1f}/{gps_bracket_ms[1]:5.1f} ms"
+                       if gps_bracket_ms else "GPS: n/a")
             buf_depth = len(self._scan_buf) - self._n_registered
+
+            # ── GPS quality gate ──────────────────────────────────────
+            # Reject scan if the nearest GPS sample is >20 ms away or
+            # the furthest bracket sample is >40 ms away.
+            GPS_NEAR_MAX_MS = 20.0
+            GPS_FAR_MAX_MS  = 40.0
+            if gps_bracket_ms is not None:
+                gps_near, gps_far = gps_bracket_ms
+                if gps_near > GPS_NEAR_MAX_MS or gps_far > GPS_FAR_MAX_MS:
+                    self._n_gps_rejected = getattr(self, '_n_gps_rejected', 0) + 1
+                    if self._n_gps_rejected <= 5 or self._n_gps_rejected % 20 == 0:
+                        print(f"  [buf] REJECTED scan {scan['frame_label']:03d}  "
+                              f"| state: {state_near_ms:5.1f}/{state_far_ms:5.1f} ms  "
+                              f"| {gps_str}  "
+                              f"| reason: GPS bracket too wide  "
+                              f"(total rejected: {self._n_gps_rejected})")
+                    self._n_registered += 1
+                    continue
+            elif gps_interp is None:
+                # No GPS data at all — also reject
+                self._n_gps_rejected = getattr(self, '_n_gps_rejected', 0) + 1
+                if self._n_gps_rejected <= 5 or self._n_gps_rejected % 20 == 0:
+                    print(f"  [buf] REJECTED scan {scan['frame_label']:03d}  "
+                          f"| state: {state_near_ms:5.1f}/{state_far_ms:5.1f} ms  "
+                          f"| GPS: n/a  "
+                          f"| reason: no GPS data  "
+                          f"(total rejected: {self._n_gps_rejected})")
+                self._n_registered += 1
+                continue
+
             print(f"  [buf] registering scan {scan['frame_label']:03d}  "
-                  f"| bracket: {near_ms:5.1f}/{far_ms:5.1f} ms  "
+                  f"| state: {state_near_ms:5.1f}/{state_far_ms:5.1f} ms  "
+                  f"| {gps_str}  "
                   f"| buf depth: {buf_depth}")
 
             # Feed to SLAM pipeline (drone pos updated below after
@@ -304,32 +360,38 @@ class BufferedSLAM:
     # ── Background-thread scan collection ────────────────────────────
 
     def start_collection(self) -> None:
-        """Launch a background thread that continuously collects scans
-        and registers them into the SLAM pipeline.
+        """Launch background threads for scan collection and GPS polling.
 
-        The thread creates its own AirSim client (required by the
-        msgpack-rpc transport) and runs ``collect_once`` + ``drain_ready``
-        in a tight loop, sleeping only for the configured scan interval.
-        All pipeline / planner writes happen under ``_lock`` so the main
-        thread can safely read the map and grids.
+        Two threads are started, each with its own AirSim client:
+          * **collection thread** — grabs LiDAR + state, runs SLAM
+          * **GPS thread** — polls GPS at high rate (~5 ms) so the ring
+            buffer always brackets every LiDAR timestamp tightly, even
+            while SLAM registration is blocking the collection thread.
         """
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop_event.clear()
+        self._gps_thread = threading.Thread(
+            target=self._gps_loop, name="BufferedSLAM-GPS", daemon=True)
+        self._gps_thread.start()
         self._thread = threading.Thread(
             target=self._collection_loop, name="BufferedSLAM", daemon=True)
         self._thread.start()
 
     def stop_collection(self, timeout: float = 5.0) -> None:
-        """Signal the background collection thread to stop and wait."""
+        """Signal both background threads to stop and wait."""
         self._stop_event.set()
+        if self._gps_thread is not None:
+            self._gps_thread.join(timeout=timeout)
+            self._gps_thread = None
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             self._thread = None
         self._thread_client = None
+        self._gps_client = None
 
     def _collection_loop(self) -> None:
-        """Background thread entry point."""
+        """Background thread: LiDAR collection + SLAM registration."""
         import asyncio
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -337,7 +399,7 @@ class BufferedSLAM:
         import cosysairsim as airsim
         self._thread_client = airsim.MultirotorClient()
         self._thread_client.confirmConnection()
-        print("  [BufferedSLAM] Thread-local AirSim client connected")
+        print("  [BufferedSLAM] Collection thread AirSim client connected")
 
         while not self._stop_event.is_set():
             try:
@@ -347,6 +409,42 @@ class BufferedSLAM:
                 print(f"  [BufferedSLAM] Error: {e}")
             # Sleep just under the scan interval so we never miss a window
             time.sleep(self.live._min_interval * 0.5)
+
+    def _gps_loop(self) -> None:
+        """Background thread: high-rate GPS polling.
+
+        Runs on its own AirSim client so it is never blocked by the
+        SLAM processing in ``drain_ready()``.
+        """
+        import cosysairsim as airsim
+        self._gps_client = airsim.MultirotorClient()
+        self._gps_client.confirmConnection()
+        print("  [BufferedSLAM] GPS thread AirSim client connected")
+
+        while not self._stop_event.is_set():
+            self._sample_gps()
+            time.sleep(0.005)  # ~200 Hz
+
+    def _sample_gps(self) -> None:
+        """Poll GPS once and append to the high-rate ring buffer."""
+        client = self._gps_client if self._gps_client is not None else self.live.client
+        if client is None:
+            return
+        try:
+            gps_data = client.getGpsData()
+            ts = float(gps_data.time_stamp)
+            gp = gps_data.gnss.geo_point
+            geo = np.array([gp.latitude, gp.longitude, gp.altitude])
+            with self._gps_lock:
+                self._gps_buf_ts.append(ts)
+                self._gps_buf_geo.append(geo)
+                # Trim if too large
+                if len(self._gps_buf_ts) > self._GPS_BUF_MAX:
+                    trim = len(self._gps_buf_ts) - self._GPS_BUF_MAX
+                    self._gps_buf_ts = self._gps_buf_ts[trim:]
+                    self._gps_buf_geo = self._gps_buf_geo[trim:]
+        except Exception:
+            pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1439,11 +1537,7 @@ def run_live():
     live.client.hoverAsync().join()
 
     print(f"Rising to altitude z={TAKEOFF_HEIGHT} ...")
-    future = live.client.moveToPositionAsync(0, 0, TAKEOFF_HEIGHT, velocity=VELOCITY)
-    while not future._set_flag:
-        # Drone position in the viewer is updated by the BufferedSLAM
-        # collection thread — no need to call set_drone_pos here.
-        time.sleep(0.05)
+    live.client.moveToPositionAsync(0, 0, TAKEOFF_HEIGHT, velocity=VELOCITY).join()
     live.client.hoverAsync().join()
 
     # Hover at cruise altitude and collect several scans so the planner
