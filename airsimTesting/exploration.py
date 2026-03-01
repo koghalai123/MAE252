@@ -2,32 +2,36 @@
 """Autonomous frontier-based exploration with live SLAM mapping.
 
 Uses LiveSLAM from finalMappingPipeline.py for real-time mapping and an
-``ExplorationPlanner`` that identifies frontiers directly from the voxel map
-to drive the drone toward un-mapped regions.
+``ExplorationPlanner`` that uses the Wavefront Frontier Detection (WFD)
+algorithm to drive the drone toward un-mapped regions.
 
-The planner works on a coarse 2-D occupancy grid projected from the 3-D voxel
-map.  At each decision step it:
+The planner operates on a full 3-D voxel grid with three cell states:
+observed-free, observed-occupied, and unknown.  At each decision step it:
 
-1. Projects occupied voxels from the SLAM map onto a 2-D grid.
-2. Finds *frontier* cells — unoccupied cells that are neighbours of occupied
-   cells (i.e. the edges of the known map).
-3. Removes frontiers the drone has already visited (within ``visited_radius``
-   of any past scan pose).
-4. Clusters the remaining frontiers, scores each cluster by
-   information-gain / travel-cost, and returns the best centroid as the
-   next waypoint.
+1. Uses **raycasting** through actual LiDAR point-cloud data to mark voxels
+   along each sensor ray as *observed*.  This replaces the fixed-radius
+   sphere approach, giving an accurate observed region that reflects real
+   sensor coverage (limited by walls, range, and field of view).
+2. Builds a 3-D occupied grid from the SLAM map and derives the *frontier*
+   mask — free voxels with at least one 6-connected unknown neighbour.
+3. Runs a BFS from the drone through free space (outer wavefront) and
+   extracts connected frontier clusters via inner BFS sweeps.
+4. Scores each reachable frontier cluster by information-gain / travel-cost
+   and returns the best 3-D centroid as the next waypoint.
 """
 
 from __future__ import annotations
 
-import cosysairsim as airsim
 import numpy as np
 import time
 import os
+import glob
 
 from scipy import ndimage
+from scipy.spatial.transform import Rotation
 
 from finalMappingPipeline import LiveSLAM, SLAMConfig, SLAMPipeline
+from RegistrationComparison import resolve_recording_dir, filter_valid, xform_pts
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -66,6 +70,15 @@ class BufferedSLAM:
         self._n_registered: int = 0
         # Total scans collected
         self._n_collected: int = 0
+
+        # Optional planner reference — when set, each registered scan's
+        # world-frame points are forwarded via planner.feed_scan() so the
+        # planner can raycast through real LiDAR data.
+        self._planner: "ExplorationPlanner | None" = None
+
+    def set_planner(self, planner: "ExplorationPlanner") -> None:
+        """Attach an ExplorationPlanner to receive per-scan world-frame data."""
+        self._planner = planner
 
     # ── Collect one scan (rate-limited by LiveSLAM) ──────────────────────
 
@@ -191,6 +204,24 @@ class BufferedSLAM:
             results.append(result)
             self._n_registered += 1
 
+            # Forward world-frame points to the planner for raycasting
+            if self._planner is not None:
+                pts = scan["points"][np.any(scan["points"] != 0, axis=1)]
+                if len(pts) > 0:
+                    lp = scan["lidar_position"]
+                    lo = scan["lidar_orientation"]
+                    R_l = Rotation.from_quat(
+                        [lo[1], lo[2], lo[3], lo[0]]).as_matrix()
+                    body = (R_l @ pts.T).T + lp
+                    ori = scan["orientation"]
+                    R_b = Rotation.from_quat(
+                        [ori[1], ori[2], ori[3], ori[0]]).as_matrix()
+                    world_pts = (R_b @ body.T).T + scan["position"]
+                    self._planner.feed_scan(
+                        scan["position"].copy(),
+                        world_pts.astype(np.float32),
+                    )
+
         # Trim fully-registered scans from the front of the buffer,
         # but keep at least delay_scans entries for context
         keep = max(self.delay_scans, 10)
@@ -242,90 +273,243 @@ class BufferedSLAM:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ExplorationPlanner:
-    """Map-edge frontier planner for autonomous drone exploration.
+    """3-D Wavefront Frontier Detection (WFD) planner for autonomous exploration.
 
-    Frontiers are derived entirely from the live voxel map: any unoccupied
-    grid cell that neighbours an occupied cell is a frontier.  Cells that the
-    drone has already flown near (within ``visited_radius``) are excluded so
-    the planner does not re-target already-scanned edges.
+    Uses the Wavefront Frontier Detection algorithm (Keidar & Kaminka, 2012)
+    adapted for 3-D voxel grids.  Three voxel states are distinguished:
+
+    - *Observed*: voxels through which a LiDAR ray has passed (raycasting).
+    - *Occupied*: observed voxels that contain SLAM map points.
+    - *Free*: observed voxels that are **not** occupied.
+    - *Unknown*: voxels that no LiDAR ray has ever traversed.
+
+    The *observed* region is determined by **raycasting** from each scan's
+    sensor origin through the actual LiDAR point cloud.  Every voxel on the
+    line-of-sight from sensor to hit-point is marked as observed, giving an
+    accurate representation of what the LiDAR has actually seen — walls
+    block the rays, and unscanned directions remain *unknown*.
+
+    A *frontier* voxel is a free voxel with at least one 6-connected unknown
+    neighbour.  The algorithm performs a BFS from the drone's current grid
+    cell through free space, grouping contiguous frontier voxels into
+    clusters as they are discovered.  Only frontiers that are **reachable**
+    from the drone through known free space are returned.
 
     Parameters
     ----------
-    bounds : tuple of four floats ``(xmin, xmax, ymin, ymax)``
-        Horizontal bounding box of the area to explore (NED frame).
+    bounds : tuple of six floats ``(xmin, xmax, ymin, ymax, zmin, zmax)``
+        Axis-aligned bounding box of the exploration volume (NED frame).
     resolution : float
-        Grid cell size in metres for the 2-D planning grid (default 1 m).
-    flight_height : float
-        NED *z*-coordinate used for all generated waypoints (default -15).
+        Voxel edge length in metres for the 3-D planning grid (default 1 m).
     min_frontier_size : int
-        Minimum cells in a frontier cluster for it to be a valid target.
-    visited_radius : float
-        Cells within this distance (m) of any past scan pose are marked as
-        *visited* and excluded from frontier detection.  Increase to avoid
-        revisiting; decrease to allow re-scanning the same edges.
+        Minimum voxels in a frontier cluster for it to be a valid target.
+    ray_subsample : float
+        Voxel size (m) for downsampling LiDAR endpoints before raycasting.
+        Smaller → more rays → slower but higher fidelity.  A value equal
+        to ``resolution`` is a good starting point (one ray per planning
+        voxel).
     """
 
     def __init__(
         self,
-        bounds: tuple[float, float, float, float],
+        bounds: tuple[float, float, float, float, float, float],
         resolution: float = 1.0,
-        flight_height: float = -15.0,
         min_frontier_size: int = 3,
-        visited_radius: float = 3.0,
+        ray_subsample: float | None = None,
+        waypoint_exclusion_radius: float = 1.0,
     ):
-        self.xmin, self.xmax, self.ymin, self.ymax = bounds
+        self.xmin, self.xmax, self.ymin, self.ymax, self.zmin, self.zmax = bounds
         self.resolution = resolution
-        self.flight_height = flight_height
         self.min_frontier_size = min_frontier_size
-        self.visited_radius = visited_radius
+        self.ray_subsample = ray_subsample if ray_subsample is not None else resolution
+        self.waypoint_exclusion_radius = waypoint_exclusion_radius
 
         self.nx = int(np.ceil((self.xmax - self.xmin) / resolution))
         self.ny = int(np.ceil((self.ymax - self.ymin) / resolution))
+        self.nz = int(np.ceil((self.zmax - self.zmin) / resolution))
 
-        # Pre-compute circular kernel for visited-zone stamping
-        r_cells = int(np.ceil(visited_radius / resolution))
-        y_k, x_k = np.ogrid[-r_cells : r_cells + 1, -r_cells : r_cells + 1]
-        self._visit_kernel = (
-            (x_k ** 2 + y_k ** 2) <= (visited_radius / resolution) ** 2
-        )
+        # Persistent observed grid — once observed, always observed
+        self._observed = np.zeros((self.nx, self.ny, self.nz), dtype=bool)
 
-        # Persistent visited grid — grows monotonically as the drone flies
-        self._visited = np.zeros((self.nx, self.ny), dtype=bool)
+        # Raw scan data fed from BufferedSLAM: (sensor_origin(3,), world_pts(N,3))
+        self._scan_data: list[tuple[np.ndarray, np.ndarray]] = []
+        # How many scans have already been raycasted into _observed
+        self._n_scans_raycasted: int = 0
 
-        # How many past poses we've already stamped into _visited
-        self._n_poses_processed: int = 0
+        # History of all selected waypoints — used to avoid revisiting
+        self._waypoint_history: list[np.ndarray] = []
 
     # ── Coordinate helpers ────────────────────────────────────────────────
 
-    def _world_to_grid(self, x: float, y: float) -> tuple[int, int]:
-        ix = int((x - self.xmin) / self.resolution)
-        iy = int((y - self.ymin) / self.resolution)
-        return (
-            int(np.clip(ix, 0, self.nx - 1)),
-            int(np.clip(iy, 0, self.ny - 1)),
-        )
+    def _world_to_grid(self, x: float, y: float, z: float) -> tuple[int, int, int]:
+        ix = int(np.clip(int((x - self.xmin) / self.resolution), 0, self.nx - 1))
+        iy = int(np.clip(int((y - self.ymin) / self.resolution), 0, self.ny - 1))
+        iz = int(np.clip(int((z - self.zmin) / self.resolution), 0, self.nz - 1))
+        return ix, iy, iz
 
-    def _grid_to_world(self, ix: float, iy: float) -> tuple[float, float]:
+    def _grid_to_world(self, ix: float, iy: float, iz: float) -> tuple[float, float, float]:
         x = self.xmin + (ix + 0.5) * self.resolution
         y = self.ymin + (iy + 0.5) * self.resolution
-        return x, y
+        z = self.zmin + (iz + 0.5) * self.resolution
+        return x, y, z
 
-    # ── Visited-zone stamping ─────────────────────────────────────────────
+    # ── Scan data input ───────────────────────────────────────────────────
 
-    def _stamp_visited(self, pos) -> None:
-        """Mark grid cells within *visited_radius* of *pos* as visited."""
-        cx, cy = self._world_to_grid(float(pos[0]), float(pos[1]))
-        r = self._visit_kernel.shape[0] // 2
+    def feed_scan(self, sensor_origin: np.ndarray, world_pts: np.ndarray) -> None:
+        """Store a LiDAR scan for raycasting at the next planning step.
 
-        x0, x1 = max(cx - r, 0), min(cx + r + 1, self.nx)
-        y0, y1 = max(cy - r, 0), min(cy + r + 1, self.ny)
+        Parameters
+        ----------
+        sensor_origin : ndarray, shape (3,)
+            Position of the sensor in NED world frame when the scan was taken.
+        world_pts : ndarray, shape (N, 3)
+            LiDAR hit-points already in NED world frame.
+        """
+        self._scan_data.append((
+            np.asarray(sensor_origin, dtype=np.float32).ravel()[:3],
+            np.asarray(world_pts, dtype=np.float32),
+        ))
 
-        kx0 = x0 - (cx - r)
-        kx1 = kx0 + (x1 - x0)
-        ky0 = y0 - (cy - r)
-        ky1 = ky0 + (y1 - y0)
+    # ── Raycasting-based observed-zone update ─────────────────────────────
 
-        self._visited[x0:x1, y0:y1] |= self._visit_kernel[kx0:kx1, ky0:ky1]
+    def _raycast_update_observed(self) -> None:
+        """Mark voxels along LiDAR rays as *observed* for all new scans.
+
+        For each unprocessed scan the method:
+        1. Down-samples the hit-points to ~1 per ``ray_subsample`` voxel to
+           limit the number of rays.
+        2. Densely samples points along each ray (origin → hit-point) at
+           ``resolution / 2`` spacing.
+        3. Converts the sample coordinates to grid indices and marks those
+           cells as observed.
+
+        This is a vectorised NumPy implementation — no per-ray Python loop.
+        """
+        res = self.resolution
+        half_step = res * 0.5          # sampling interval along rays
+        sub_inv = 1.0 / self.ray_subsample
+
+        for origin, world_pts in self._scan_data[self._n_scans_raycasted:]:
+            if len(world_pts) == 0:
+                self._n_scans_raycasted += 1
+                continue
+
+            # ── Subsample endpoints: keep one per subsample-voxel ─────
+            ijk = np.floor(world_pts * sub_inv).astype(np.int32)
+            _, idx = np.unique(ijk, axis=0, return_index=True)
+            endpoints = world_pts[idx]            # (M, 3)
+
+            # ── Dense sampling along each ray ─────────────────────────
+            dirs = endpoints - origin              # (M, 3)
+            lengths = np.linalg.norm(dirs, axis=1) # (M,)
+
+            # Max sample count across all rays (ensures no cell is missed)
+            max_steps = max(2, int(np.ceil(lengths.max() / half_step)) + 1)
+            t_vals = np.linspace(0.0, 1.0, max_steps)  # (S,)
+
+            # Broadcast: (M, S, 3) = (1,1,3) + (1,S,1) * (M,1,3)
+            samples = (origin[None, None, :]
+                       + t_vals[None, :, None] * dirs[:, None, :])
+
+            # Flatten to (M*S, 3) and convert to grid indices
+            flat = samples.reshape(-1, 3)
+            gx = np.clip(((flat[:, 0] - self.xmin) / res).astype(np.intp),
+                          0, self.nx - 1)
+            gy = np.clip(((flat[:, 1] - self.ymin) / res).astype(np.intp),
+                          0, self.ny - 1)
+            gz = np.clip(((flat[:, 2] - self.zmin) / res).astype(np.intp),
+                          0, self.nz - 1)
+
+            self._observed[gx, gy, gz] = True
+            self._n_scans_raycasted += 1
+
+    # ── Wavefront Frontier Detection BFS ─────────────────────────────────
+
+    def _wfd_bfs(
+        self,
+        start: tuple[int, int, int],
+        free: np.ndarray,
+        is_frontier: np.ndarray,
+    ) -> list[np.ndarray]:
+        """Run Wavefront Frontier Detection BFS from *start* through *free*.
+
+        The outer BFS expands through free voxels starting at the drone's
+        position.  When a frontier voxel is reached, an inner BFS extracts
+        the entire connected frontier cluster before the outer BFS continues.
+
+        Parameters
+        ----------
+        start : (ix, iy, iz)
+            Grid index of the drone's current cell.
+        free : bool ndarray (nx, ny, nz)
+            True for free (observed & not occupied) voxels.
+        is_frontier : bool ndarray (nx, ny, nz)
+            True for frontier voxels (free with ≥1 unknown 6-neighbour).
+
+        Returns
+        -------
+        list of ndarray, each shape (N, 3) int
+            All frontier clusters found (no size filter applied here).
+        """
+        from collections import deque
+
+        NBRS = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))
+        _MAP_OPEN = 1;  _MAP_CLOSE = 2
+        _FRT_OPEN = 3;  _FRT_CLOSE = 4
+
+        nx, ny, nz = self.nx, self.ny, self.nz
+        cell_state = np.zeros((nx, ny, nz), dtype=np.int8)
+
+        sx, sy, sz = start
+        queue_m: deque[tuple[int, int, int]] = deque([(sx, sy, sz)])
+        cell_state[sx, sy, sz] = _MAP_OPEN
+
+        clusters: list[np.ndarray] = []
+
+        while queue_m:
+            px, py, pz = queue_m.popleft()
+            if cell_state[px, py, pz] == _MAP_CLOSE:
+                continue
+
+            if is_frontier[px, py, pz]:
+                # ── Inner BFS: extract connected frontier cluster ────
+                queue_f: deque[tuple[int, int, int]] = deque([(px, py, pz)])
+                cluster: list[tuple[int, int, int]] = []
+                cell_state[px, py, pz] = _FRT_OPEN
+
+                while queue_f:
+                    qx, qy, qz = queue_f.popleft()
+                    if cell_state[qx, qy, qz] in (_MAP_CLOSE, _FRT_CLOSE):
+                        continue
+                    if is_frontier[qx, qy, qz]:
+                        cluster.append((qx, qy, qz))
+                        for dx, dy, dz in NBRS:
+                            rx, ry, rz = qx + dx, qy + dy, qz + dz
+                            if (0 <= rx < nx and 0 <= ry < ny and 0 <= rz < nz
+                                    and cell_state[rx, ry, rz] not in
+                                    (_FRT_CLOSE, _MAP_CLOSE, _FRT_OPEN)):
+                                queue_f.append((rx, ry, rz))
+                                cell_state[rx, ry, rz] = _FRT_OPEN
+                    cell_state[qx, qy, qz] = _FRT_CLOSE
+
+                if cluster:
+                    clusters.append(np.array(cluster, dtype=int))
+                # Mark frontier voxels as closed for the outer BFS
+                for fx, fy, fz in cluster:
+                    cell_state[fx, fy, fz] = _MAP_CLOSE
+
+            # ── Expand outer BFS through free space ──────────────────
+            for dx, dy, dz in NBRS:
+                vx, vy, vz = px + dx, py + dy, pz + dz
+                if (0 <= vx < nx and 0 <= vy < ny and 0 <= vz < nz
+                        and cell_state[vx, vy, vz] not in (_MAP_CLOSE, _MAP_OPEN)
+                        and free[vx, vy, vz]):
+                    queue_m.append((vx, vy, vz))
+                    cell_state[vx, vy, vz] = _MAP_OPEN
+
+            cell_state[px, py, pz] = _MAP_CLOSE
+
+        return clusters
 
     # ── Core planner ──────────────────────────────────────────────────────
 
@@ -334,10 +518,7 @@ class ExplorationPlanner:
         pipeline: SLAMPipeline,
         current_pos,
     ) -> tuple[np.ndarray | None, dict]:
-        """Determine the next exploration waypoint from the live voxel map.
-
-        Frontiers are unoccupied cells adjacent to occupied cells, minus any
-        cells the drone has already visited.
+        """Determine the next waypoint via Wavefront Frontier Detection.
 
         Parameters
         ----------
@@ -349,23 +530,18 @@ class ExplorationPlanner:
         Returns
         -------
         target : ndarray shape (3,) **or** ``None``
-            Next waypoint ``[x, y, z]`` in NED.  ``None`` when no frontiers
-            remain (map edges fully visited).
+            Next waypoint in NED.  ``None`` when no reachable frontiers remain.
         info : dict
-            ``n_frontier_cells``, ``n_frontier_cells_raw`` (before visited
-            filter), ``n_occupied_cells``, ``n_clusters``.
+            ``n_frontier_cells``, ``n_frontier_cells_raw``,
+            ``n_occupied_cells``, ``n_clusters``, ``frontier_world_pts``.
         """
         current_pos = np.asarray(current_pos, dtype=float)
 
-        # 1) Update visited grid from new scan poses ──────────────────────
-        raw_poses = pipeline._scan_T_raw
-        for T in raw_poses[self._n_poses_processed :]:
-            self._stamp_visited(T[:3, 3])
-        self._n_poses_processed = len(raw_poses)
-        self._stamp_visited(current_pos)
+        # 1) Update observed grid via raycasting through real scan data ───
+        self._raycast_update_observed()
 
-        # 2) Build 2-D occupied grid from 3-D voxel map ──────────────────
-        occupied_grid = np.zeros((self.nx, self.ny), dtype=bool)
+        # 2) Build 3-D occupied grid from SLAM map points ────────────────
+        occupied_grid = np.zeros((self.nx, self.ny, self.nz), dtype=bool)
         vis_pts = pipeline.get_map_points()
 
         info: dict = {
@@ -373,6 +549,7 @@ class ExplorationPlanner:
             "n_frontier_cells_raw": 0,
             "n_occupied_cells": 0,
             "n_clusters": 0,
+            "frontier_world_pts": np.empty((0, 3), dtype=np.float64),
         }
 
         if len(vis_pts) == 0:
@@ -386,85 +563,124 @@ class ExplorationPlanner:
             ((vis_pts[:, 1] - self.ymin) / self.resolution).astype(int),
             0, self.ny - 1,
         )
-        occupied_grid[ix, iy] = True
+        iz = np.clip(
+            ((vis_pts[:, 2] - self.zmin) / self.resolution).astype(int),
+            0, self.nz - 1,
+        )
+        occupied_grid[ix, iy, iz] = True
         info["n_occupied_cells"] = int(occupied_grid.sum())
 
-        # 3) Find map-edge frontiers ──────────────────────────────────────
-        #    frontier = unoccupied cells that are 4-connected neighbours of
-        #    at least one occupied cell.
-        struct = ndimage.generate_binary_structure(2, 1)   # 4-connected
-        dilated = ndimage.binary_dilation(occupied_grid, structure=struct)
-        frontier_raw = dilated & ~occupied_grid            # map edges
+        # 3) Derive free / unknown / frontier masks ──────────────────────
+        free = self._observed & ~occupied_grid
+        unknown = ~self._observed
 
-        n_frontier_raw = int(frontier_raw.sum())
-        info["n_frontier_cells_raw"] = n_frontier_raw
+        n_observed = int(self._observed.sum())
+        n_free = int(free.sum())
+        n_unknown = int(unknown.sum())
+        n_total = self.nx * self.ny * self.nz
+        print(f"    [debug] scans raycasted: {self._n_scans_raycasted} | "
+              f"observed: {n_observed}/{n_total} | "
+              f"free: {n_free} | occupied: {info['n_occupied_cells']} | "
+              f"unknown: {n_unknown}")
 
-        # 4) Remove already-visited frontier cells ────────────────────────
-        frontier_mask = frontier_raw & ~self._visited
+        # Frontier = free voxels with ≥ 1 unknown 6-connected neighbour
+        struct = ndimage.generate_binary_structure(3, 1)   # 6-connected
+        unknown_adjacent = ndimage.binary_dilation(unknown, structure=struct)
+        is_frontier = free & unknown_adjacent
 
-        n_frontier = int(frontier_mask.sum())
-        info["n_frontier_cells"] = n_frontier
+        # Ensure drone start voxel is free (it is physically there)
+        start = self._world_to_grid(*current_pos[:3])
+        if not free[start]:
+            self._observed[start] = True
+            occupied_grid[start] = False
+            free[start] = True
 
-        # Build 3-D world coordinates for all frontier cells (for viewer overlay)
-        fc_all = np.argwhere(frontier_mask)
-        if len(fc_all) > 0:
+        # 4) Wavefront Frontier Detection BFS ─────────────────────────────
+        all_clusters = self._wfd_bfs(start, free, is_frontier)
+
+        # Raw count (all clusters, any size)
+        n_raw = sum(len(c) for c in all_clusters)
+        info["n_frontier_cells_raw"] = n_raw
+
+        # Filter by minimum cluster size
+        valid_clusters = [c for c in all_clusters if len(c) >= self.min_frontier_size]
+        n_valid = sum(len(c) for c in valid_clusters)
+        info["n_frontier_cells"] = n_valid
+        info["n_clusters"] = len(valid_clusters)
+
+        # Build world coordinates for viewer overlay
+        if n_valid > 0:
+            all_cells = np.vstack(valid_clusters)
             frontier_world = np.column_stack([
-                self.xmin + (fc_all[:, 0] + 0.5) * self.resolution,
-                self.ymin + (fc_all[:, 1] + 0.5) * self.resolution,
-                np.full(len(fc_all), self.flight_height),
+                self.xmin + (all_cells[:, 0] + 0.5) * self.resolution,
+                self.ymin + (all_cells[:, 1] + 0.5) * self.resolution,
+                self.zmin + (all_cells[:, 2] + 0.5) * self.resolution,
             ])
             info["frontier_world_pts"] = frontier_world
-        else:
-            info["frontier_world_pts"] = np.empty((0, 3), dtype=np.float64)
 
-        if n_frontier == 0:
+        if n_valid == 0:
             return None, info
 
-        # 5) Cluster frontiers and score ──────────────────────────────────
-        labeled, n_clusters = ndimage.label(frontier_mask, structure=struct)
-        info["n_clusters"] = n_clusters
-
-        cur_xy = current_pos[:2]
+        # 5) Score frontier clusters ──────────────────────────────────────
+        cur_xyz = current_pos[:3]
         best_score = -np.inf
         best_target = None
 
-        for cid in range(1, n_clusters + 1):
-            cells = np.argwhere(labeled == cid)
-            if len(cells) < self.min_frontier_size:
-                continue
-
-            # Cluster centroid → world coords
+        for cells in valid_clusters:
             cx_mean = float(cells[:, 0].mean())
             cy_mean = float(cells[:, 1].mean())
-            wx, wy = self._grid_to_world(cx_mean, cy_mean)
+            cz_mean = float(cells[:, 2].mean())
+            wx, wy, wz = self._grid_to_world(cx_mean, cy_mean, cz_mean)
 
             # Keep target inside bounds with a small margin
             wx = float(np.clip(wx, self.xmin + 1, self.xmax - 1))
             wy = float(np.clip(wy, self.ymin + 1, self.ymax - 1))
+            wz = float(np.clip(wz, self.zmin + 1, self.zmax - 1))
 
-            # Reject if the target cell itself is occupied
-            tix, tiy = self._world_to_grid(wx, wy)
-            if occupied_grid[tix, tiy]:
+            # Reject if the target voxel itself is occupied
+            tix, tiy, tiz = self._world_to_grid(wx, wy, wz)
+            if occupied_grid[tix, tiy, tiz]:
                 continue
 
+            # Reject if too close to any previous waypoint
+            candidate = np.array([wx, wy, wz])
+            if self._waypoint_history:
+                prev = np.array(self._waypoint_history)
+                if np.any(np.linalg.norm(prev - candidate, axis=1)
+                          < self.waypoint_exclusion_radius):
+                    continue
+
             gain = float(len(cells))                # information gain
-            dist = max(float(np.linalg.norm(np.array([wx, wy]) - cur_xy)), 0.5)
+            dist = max(float(np.linalg.norm(np.array([wx, wy, wz]) - cur_xyz)), 0.5)
             score = gain / dist                     # benefit / cost
 
             if score > best_score:
                 best_score = score
-                best_target = np.array([wx, wy, self.flight_height])
+                best_target = np.array([wx, wy, wz])
 
-        # Fallback: nearest individual frontier cell if all clusters too small
-        if best_target is None and n_frontier > 0:
-            fc = np.argwhere(frontier_mask)
+        # Fallback: nearest frontier voxel if all cluster centroids rejected
+        if best_target is None and n_valid > 0:
+            all_cells = np.vstack(valid_clusters)
             fw = np.column_stack([
-                self.xmin + (fc[:, 0] + 0.5) * self.resolution,
-                self.ymin + (fc[:, 1] + 0.5) * self.resolution,
+                self.xmin + (all_cells[:, 0] + 0.5) * self.resolution,
+                self.ymin + (all_cells[:, 1] + 0.5) * self.resolution,
+                self.zmin + (all_cells[:, 2] + 0.5) * self.resolution,
             ])
-            dists = np.linalg.norm(fw - cur_xy.reshape(1, 2), axis=1)
-            nearest = fw[np.argmin(dists)]
-            best_target = np.array([nearest[0], nearest[1], self.flight_height])
+            # Filter out frontier voxels too close to previous waypoints
+            if self._waypoint_history:
+                prev = np.array(self._waypoint_history)
+                keep = np.ones(len(fw), dtype=bool)
+                for wp in prev:
+                    keep &= np.linalg.norm(fw - wp, axis=1) >= self.waypoint_exclusion_radius
+                fw = fw[keep]
+            if len(fw) > 0:
+                dists = np.linalg.norm(fw - cur_xyz.reshape(1, 3), axis=1)
+                nearest = fw[np.argmin(dists)]
+                best_target = np.array([nearest[0], nearest[1], nearest[2]])
+
+        # Record chosen waypoint in history
+        if best_target is not None:
+            self._waypoint_history.append(best_target.copy())
 
         return best_target, info
 
@@ -475,145 +691,296 @@ class ExplorationPlanner:
 
 SAVE_DIR = os.path.join(os.path.dirname(__file__), "flight_recordings")
 
-# Area to fully explore (xmin, xmax, ymin, ymax) in NED
-EXPLORE_BOUNDS  = (-15, 30, -30, 5)
-FLIGHT_HEIGHT   = -15.0         # NED z for waypoints
-VELOCITY        = 2             # m/s
-SCAN_HZ         = 1 / 2.5      # scans per second
-PLANNER_RES     = 1.0           # planning grid cell size (m)
-VISITED_RADIUS  = 3.0           # exclude map edges within this range of past poses (m)
+# ── Mode selection ────────────────────────────────────────────────────────
+# Set REPLAY_DIR to a recording directory (or parent) to run offline on
+# saved LiDAR data.  Leave empty ("") for live AirSim flight.
+
+#REPLAY_DIR      = "flight_recordings"            # e.g. "flight_recordings/flight_1771909992"
+REPLAY_DIR      = ""  
+# ── Exploration parameters (shared by both modes) ────────────────────────
+EXPLORE_BOUNDS  = (-20, 20, -50, 10, -20, 0)   # (xmin,xmax,ymin,ymax,zmin,zmax) NED
+TAKEOFF_HEIGHT  = -15.0         # NED z for initial ascent (live mode only)
+VELOCITY        = 3             # m/s (live mode only)
+SCAN_HZ         = 1 / 2.5      # scans per second (live mode only)
+PLANNER_RES     = 1.0           # planning grid voxel size (m)
 MAX_TARGETS     = 50            # safety cap on autonomous waypoints
-SCAN_DELAY      = 3             # register a scan only after this many newer scans arrive
+SCAN_DELAY      = 3             # register a scan only after N newer scans (live mode)
+PLAN_EVERY      = 3             # run planner every N frames (replay mode)
+FRAME_SKIP      = 1             # process every Nth frame (replay mode, 1 = all)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Set up SLAM pipeline
+# Replay mode — offline exploration on saved LiDAR data
 # ══════════════════════════════════════════════════════════════════════════════
 
-cfg = SLAMConfig(
-    registration="vgicp",
-    octo_resolution=0.15,
-    frame_skip=1,
-    live_max_hz=SCAN_HZ,
-    enable_viewer=True,
-)
+def run_replay(recording_dir: str):
+    """Replay saved flight data through the SLAM pipeline + exploration planner.
 
-live = LiveSLAM(cfg)
-live.connect()
+    Loads frame_*.npz files, feeds each through the SLAM pipeline, and runs
+    the WFD planner periodically so you can see frontier detection and target
+    selection in the Open3D viewer without a running simulator.
+    """
+    recording_dir = resolve_recording_dir(recording_dir)
+    all_frames = sorted(glob.glob(os.path.join(recording_dir, "frame_*.npz")))
+    if not all_frames:
+        print(f"No frame_*.npz files found in {recording_dir}")
+        return
 
-out_dir = os.path.join(SAVE_DIR, f"exploration_{int(time.time())}")
-live.enable_recording(out_dir)
-live.pipeline.start_viewer()
+    frames = all_frames[::FRAME_SKIP]
+    print(f"Replaying {len(frames)} frames from {recording_dir}")
+    print(f"  (available: {len(all_frames)}, skip={FRAME_SKIP})")
 
-buf = BufferedSLAM(live, delay_scans=SCAN_DELAY)
-print(f"  Scan buffer delay: {SCAN_DELAY} scans "
-      f"({SCAN_DELAY / SCAN_HZ:.1f}s at {SCAN_HZ:.2f} Hz)")
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Takeoff and rise to exploration altitude
-# ══════════════════════════════════════════════════════════════════════════════
-
-print("Taking off...")
-live.client.takeoffAsync().join()
-time.sleep(1)
-
-print(f"Rising to altitude z={FLIGHT_HEIGHT} ...")
-future = live.client.moveToPositionAsync(0, 0, FLIGHT_HEIGHT, velocity=VELOCITY)
-while not future._set_flag:
-    buf.process_once()
-    time.sleep(0.001)
-# Collect a few scans at the starting position
-for _ in range(5):
-    buf.process_once()
-    time.sleep(0.1)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Autonomous frontier exploration loop
-# ══════════════════════════════════════════════════════════════════════════════
-
-planner = ExplorationPlanner(
-    bounds=EXPLORE_BOUNDS,
-    resolution=PLANNER_RES,
-    flight_height=FLIGHT_HEIGHT,
-    min_frontier_size=3,
-    visited_radius=VISITED_RADIUS,
-)
-
-print(f"\n{'='*60}")
-print(f"Autonomous exploration started")
-print(f"  Bounds: x=[{EXPLORE_BOUNDS[0]}, {EXPLORE_BOUNDS[1]}], "
-      f"y=[{EXPLORE_BOUNDS[2]}, {EXPLORE_BOUNDS[3]}]")
-print(f"  Grid:  {planner.nx} x {planner.ny} cells @ {PLANNER_RES} m")
-print(f"  Visited radius: {VISITED_RADIUS} m  |  Max waypoints: {MAX_TARGETS}")
-print(f"{'='*60}\n")
-
-wp_count = 0
-
-while wp_count < MAX_TARGETS:
-    # Current drone position
-    state = live.client.getMultirotorState()
-    p = state.kinematics_estimated.position
-    current_pos = np.array([p.x_val, p.y_val, p.z_val])
-
-    # Ask the planner
-    target, info = planner.next_target(live.pipeline, current_pos)
-
-    # Send frontier overlay to the 3-D viewer (orange points)
-    live.set_frontier_points(info.get("frontier_world_pts"))
-
-    print(f"  [{wp_count + 1:02d}] Occupied: {info['n_occupied_cells']} | "
-          f"Frontiers: {info['n_frontier_cells']}/{info['n_frontier_cells_raw']} "
-          f"(after visited filter) in {info['n_clusters']} clusters")
-
-    if target is None:
-        print("\n  Exploration complete — no unvisited map-edge frontiers remain")
-        break
-
-    print(f"       -> target ({target[0]:.1f}, {target[1]:.1f}, {target[2]:.1f})")
-
-    # Show markers in viewer
-    live.set_target(target.tolist())
-    wp_count += 1
-
-    # Fly to the target
-    future = live.client.moveToPositionAsync(
-        float(target[0]), float(target[1]), float(target[2]),
-        velocity=VELOCITY,
+    # ── Set up SLAM pipeline + viewer ────────────────────────────────────
+    cfg = SLAMConfig(
+        registration="vgicp",
+        octo_resolution=0.15,
+        frame_skip=1,
+        enable_viewer=True,
     )
+    pipeline = SLAMPipeline(cfg)
+    pipeline.start_viewer()
+
+    # ── Set up planner ───────────────────────────────────────────────────
+    planner = ExplorationPlanner(
+        bounds=EXPLORE_BOUNDS,
+        resolution=PLANNER_RES,
+        min_frontier_size=3,
+    )
+
+    print(f"\n{'='*60}")
+    print(f"Exploration planner replay")
+    print(f"  Bounds: x=[{EXPLORE_BOUNDS[0]}, {EXPLORE_BOUNDS[1]}], "
+          f"y=[{EXPLORE_BOUNDS[2]}, {EXPLORE_BOUNDS[3]}], "
+          f"z=[{EXPLORE_BOUNDS[4]}, {EXPLORE_BOUNDS[5]}]")
+    print(f"  Grid:  {planner.nx} x {planner.ny} x {planner.nz} voxels @ {PLANNER_RES} m")
+    print(f"  Observation: raycasted from LiDAR  |  Plan every {PLAN_EVERY} frames")
+    print(f"{'='*60}\n")
+
+    wp_count = 0
+    targets_chosen: list[np.ndarray] = []
+
+    for i, path in enumerate(frames):
+        t_load = time.perf_counter()
+        data = np.load(path)
+        pts = data["points"]
+        pos = data["position"] if "position" in data.files else np.zeros(3)
+        ori = (data["orientation"] if "orientation" in data.files
+               else np.array([1, 0, 0, 0], dtype=float))
+        lp = data["lidar_position"] if "lidar_position" in data.files else None
+        lo = data["lidar_orientation"] if "lidar_orientation" in data.files else None
+        gps = data["gps"] if "gps" in data.files else None
+
+        # ── Feed frame to SLAM pipeline ──────────────────────────────────
+        pipeline.set_drone_pos(pos)
+        result = pipeline.process_frame(
+            pts, pos, ori,
+            gps=gps,
+            lidar_position=lp,
+            lidar_orientation=lo,
+            frame_label=i,
+        )
+
+        # ── Feed scan to planner for raycasting ─────────────────────────
+        valid_pts = filter_valid(pts)
+        if len(valid_pts) > 0:
+            lp_arr = lp if lp is not None else np.zeros(3)
+            lo_arr = lo if lo is not None else np.array([1, 0, 0, 0], dtype=float)
+            R_l = Rotation.from_quat(
+                [lo_arr[1], lo_arr[2], lo_arr[3], lo_arr[0]]).as_matrix()
+            body = (R_l @ valid_pts.T).T + lp_arr
+
+            ori_arr = np.asarray(ori, dtype=float)
+            R_b = Rotation.from_quat(
+                [ori_arr[1], ori_arr[2], ori_arr[3], ori_arr[0]]).as_matrix()
+            world_pts = (R_b @ body.T).T + np.asarray(pos, dtype=float)
+            planner.feed_scan(pos.copy(), world_pts.astype(np.float32))
+
+        # ── Run planner periodically ─────────────────────────────────────
+        if (i + 1) % PLAN_EVERY == 0 or i == len(frames) - 1:
+            current_pos = np.asarray(pos, dtype=float)
+            t_plan = time.perf_counter()
+            target, info = planner.next_target(pipeline, current_pos)
+            dt_plan = time.perf_counter() - t_plan
+
+            # Update viewer overlays
+            pipeline.set_frontier_points(info.get("frontier_world_pts"))
+
+            print(f"  [frame {i+1:03d}/{len(frames)}] "
+                  f"Occupied: {info['n_occupied_cells']} | "
+                  f"Frontiers: {info['n_frontier_cells']}/{info['n_frontier_cells_raw']} "
+                  f"in {info['n_clusters']} clusters | "
+                  f"plan: {dt_plan*1e3:.0f}ms")
+
+            if target is not None:
+                wp_count += 1
+                targets_chosen.append(target.copy())
+                pipeline.set_target_pos(target.tolist())
+                print(f"       -> target #{wp_count}: "
+                      f"({target[0]:.1f}, {target[1]:.1f}, {target[2]:.1f})")
+            else:
+                print(f"       -> no frontiers remain")
+
+    # ── Summary ──────────────────────────────────────────────────────────
+    print(f"\n{'='*60}")
+    print(f"Replay complete — {len(frames)} frames processed, "
+          f"{wp_count} targets selected")
+    if targets_chosen:
+        print(f"  Target waypoints:")
+        for j, t in enumerate(targets_chosen):
+            print(f"    #{j+1}: ({t[0]:.1f}, {t[1]:.1f}, {t[2]:.1f})")
+    print(f"{'='*60}")
+
+    pipeline.get_corrected_map_points()
+    pipeline.print_summary()
+
+    print("\n  Viewer is still open — close the Open3D window or press Enter to exit.")
+    try:
+        input()
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+    pipeline.stop_viewer()
+    print("Done.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Live mode — autonomous flight with AirSim
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_live():
+    """Connect to AirSim, fly autonomously using frontier exploration."""
+    import cosysairsim as airsim
+
+    cfg = SLAMConfig(
+        registration="vgicp",
+        octo_resolution=0.15,
+        frame_skip=1,
+        live_max_hz=SCAN_HZ,
+        enable_viewer=True,
+    )
+
+    live = LiveSLAM(cfg)
+    live.connect()
+
+    out_dir = os.path.join(SAVE_DIR, f"exploration_{int(time.time())}")
+    live.enable_recording(out_dir)
+    live.pipeline.start_viewer()
+
+    buf = BufferedSLAM(live, delay_scans=SCAN_DELAY)
+    print(f"  Scan buffer delay: {SCAN_DELAY} scans "
+          f"({SCAN_DELAY / SCAN_HZ:.1f}s at {SCAN_HZ:.2f} Hz)")
+
+    # ── Planner (must be created before takeoff so scans are forwarded) ──
+    planner = ExplorationPlanner(
+        bounds=EXPLORE_BOUNDS,
+        resolution=PLANNER_RES,
+        min_frontier_size=3,
+    )
+    buf.set_planner(planner)
+
+    # ── Takeoff ──────────────────────────────────────────────────────────
+    print("Taking off...")
+    live.client.takeoffAsync().join()
+    time.sleep(1)
+
+    print(f"Rising to altitude z={TAKEOFF_HEIGHT} ...")
+    future = live.client.moveToPositionAsync(0, 0, TAKEOFF_HEIGHT, velocity=VELOCITY)
     while not future._set_flag:
         buf.process_once()
         time.sleep(0.001)
-
-    # Hover and scan at the waypoint to fill in detail
     for _ in range(5):
         buf.process_once()
         time.sleep(0.1)
 
-print(f"\nExploration finished after {wp_count} waypoints.")
+    # Flush all buffered scans so the planner has raycasting data
+    # from every scan collected during ascent (not just the N-delay ones)
+    buf.flush()
+    print(f"  Initial scans forwarded to planner: {planner._n_scans_raycasted} raycasted, "
+          f"{len(planner._scan_data)} total")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Finalise — save outputs but keep the viewer open for inspection
-# ══════════════════════════════════════════════════════════════════════════════
+    print(f"\n{'='*60}")
+    print(f"Autonomous 3-D exploration started")
+    print(f"  Bounds: x=[{EXPLORE_BOUNDS[0]}, {EXPLORE_BOUNDS[1]}], "
+          f"y=[{EXPLORE_BOUNDS[2]}, {EXPLORE_BOUNDS[3]}], "
+          f"z=[{EXPLORE_BOUNDS[4]}, {EXPLORE_BOUNDS[5]}]")
+    print(f"  Grid:  {planner.nx} x {planner.ny} x {planner.nz} voxels @ {PLANNER_RES} m")
+    print(f"  Observation: raycasted from LiDAR  |  Max waypoints: {MAX_TARGETS}")
+    print(f"{'='*60}\n")
 
-# Flush any remaining buffered scans into the pipeline
-buf.flush()
-print(f"  Buffer stats: {buf._n_collected} total scans collected")
+    wp_count = 0
 
-# Correct the map and save, but do NOT stop the viewer
-live.pipeline.get_corrected_map_points()
-if out_dir:
-    bt_path = os.path.join(out_dir, "map.bt")
+    while wp_count < MAX_TARGETS:
+        state = live.client.getMultirotorState()
+        p = state.kinematics_estimated.position
+        current_pos = np.array([p.x_val, p.y_val, p.z_val])
+
+        target, info = planner.next_target(live.pipeline, current_pos)
+
+        live.set_frontier_points(info.get("frontier_world_pts"))
+
+        print(f"  [{wp_count + 1:02d}] Occupied: {info['n_occupied_cells']} | "
+              f"Frontiers: {info['n_frontier_cells']}/{info['n_frontier_cells_raw']} "
+              f"(after visited filter) in {info['n_clusters']} clusters")
+
+        if target is None:
+            print("\n  Exploration complete — no unvisited map-edge frontiers remain")
+            break
+
+        print(f"       -> target ({target[0]:.1f}, {target[1]:.1f}, {target[2]:.1f})")
+
+        live.set_target(target.tolist())
+        wp_count += 1
+
+        future = live.client.moveToPositionAsync(
+            float(target[0]), float(target[1]), float(target[2]),
+            velocity=VELOCITY,
+        )
+        while not future._set_flag:
+            buf.process_once()
+            time.sleep(0.001)
+
+        for _ in range(5):
+            buf.process_once()
+            time.sleep(0.1)
+
+    print(f"\nExploration finished after {wp_count} waypoints.")
+
+    # ── Finalise ─────────────────────────────────────────────────────────
+    buf.flush()
+    print(f"  Buffer stats: {buf._n_collected} total scans collected")
+
+    live.pipeline.get_corrected_map_points()
+    if out_dir:
+        bt_path = os.path.join(out_dir, "map.bt")
+        try:
+            live.pipeline.save_octomap(bt_path)
+        except Exception as e:
+            print(f"  (could not save OctoMap: {e})")
+    live.pipeline.print_summary()
+    print(f"\nOutputs saved to {out_dir}/")
+
+    print("\n  Viewer is still open — close the Open3D window or press Enter here to exit.")
     try:
-        live.pipeline.save_octomap(bt_path)
-    except Exception as e:
-        print(f"  (could not save OctoMap: {e})")
-live.pipeline.print_summary()
-print(f"\nOutputs saved to {out_dir}/")
+        input()
+    except (EOFError, KeyboardInterrupt):
+        pass
 
-print("\n  Viewer is still open — close the Open3D window or press Enter here to exit.")
-try:
-    input()
-except (EOFError, KeyboardInterrupt):
-    pass
+    live.pipeline.stop_viewer()
+    print("Done.")
 
-live.pipeline.stop_viewer()
-print("Done.")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Entry point
+# ══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    import sys
+    # Command line override: pass a recording directory as argument
+    replay = sys.argv[1] if len(sys.argv) > 1 else REPLAY_DIR
+
+    if replay:
+        # Resolve relative paths from this script's directory
+        if not os.path.isabs(replay):
+            replay = os.path.join(os.path.dirname(__file__), replay)
+        run_replay(replay)
+    else:
+        run_live()
