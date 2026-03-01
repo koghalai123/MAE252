@@ -90,6 +90,7 @@ class PathPlanner:
         ground_z: float = 0.0,
         simplify_time: float = 0.5,
         range_m: float = 5.0,
+        above_grid_margin: float = 0.0,
     ):
         self.inflation_radius = inflation_radius
         self.planner_type = planner_type
@@ -98,6 +99,7 @@ class PathPlanner:
         self.ground_z = ground_z
         self.simplify_time = simplify_time
         self.range_m = range_m
+        self.above_grid_margin = above_grid_margin
 
         # Map state (set by update_map)
         self._traversable: np.ndarray | None = None   # observed & ~inflated
@@ -264,12 +266,20 @@ class PathPlanner:
     def _is_valid_point(self, pt: np.ndarray) -> bool:
         """True if the point would be accepted as an OMPL start/goal."""
         x, y, z = float(pt[0]), float(pt[1]), float(pt[2])
+        if self._is_above_grid(x, y, z):
+            return True
         if not self.is_in_grid(x, y, z):
             return False
         return self.is_traversable(x, y, z)
 
     def is_traversable(self, x: float, y: float, z: float) -> bool:
-        """True if the point is in known-free (observed & not inflated) space."""
+        """True if the point is in known-free (observed & not inflated) space.
+
+        Points above the grid (within ``above_grid_margin``) are considered
+        free — open airspace above the scanned volume.
+        """
+        if self._is_above_grid(x, y, z):
+            return True
         if self._traversable is None:
             return False
         ix, iy, iz = self._world_to_grid_unchecked(x, y, z)
@@ -304,6 +314,25 @@ class PathPlanner:
         return (o[0] <= x < o[0] + self._nx * r
                 and o[1] <= y < o[1] + self._ny * r
                 and o[2] <= z < o[2] + self._nz * r)
+
+    def _is_above_grid(self, x: float, y: float, z: float) -> bool:
+        """True if the point is above the grid ceiling within the allowed margin.
+
+        In NED, "above" means *more negative* Z.  The grid's Z-min is its
+        ceiling.  Returns True when the point's X/Y are inside the grid and
+        its Z is above (less than) ``origin[2]`` but within
+        ``above_grid_margin`` metres.
+        """
+        if self.above_grid_margin <= 0:
+            return False
+        o, r = self._origin, self._resolution
+        z_ceil = float(o[2])                      # grid ceiling (most-negative Z in grid)
+        z_limit = z_ceil - self.above_grid_margin  # how far above we allow
+        if not (z_limit <= z < z_ceil):
+            return False
+        # X/Y must still be within the grid footprint
+        return (o[0] <= x < o[0] + self._nx * r
+                and o[1] <= y < o[1] + self._ny * r)
 
     def world_to_grid(
         self, x: float, y: float, z: float,
@@ -439,8 +468,14 @@ class PathPlanner:
 
         bounds = ob.RealVectorBounds(3)
         pad = max(self._resolution * 4, 2.0)  # generous padding for edge overshoot
-        for i in range(3):
-            bounds.setLow(i, float(self._origin[i]) - pad)
+        bounds.setLow(
+            0, float(self._origin[0]) - pad)
+        bounds.setLow(
+            1, float(self._origin[1]) - pad)
+        # Extend Z lower bound to include above-grid airspace
+        z_ceil = float(self._origin[2])
+        bounds.setLow(
+            2, z_ceil - self.above_grid_margin - pad)
         bounds.setHigh(
             0, float(self._origin[0]) + self._nx * self._resolution + pad)
         bounds.setHigh(
@@ -459,12 +494,21 @@ class PathPlanner:
         self._si.setup()
 
     def _is_valid(self, state) -> bool:
-        """OMPL validity checker — True only for known-free space."""
+        """OMPL validity checker — True only for known-free space.
+
+        Points above the grid (within ``above_grid_margin``) are treated as
+        free airspace so the planner can route through altitudes above the
+        scanned volume.
+        """
         x, y, z = state[0], state[1], state[2]
 
         # Ground plane constraint
         if z > self.ground_z:
             return False
+
+        # Above-grid airspace is always free
+        if self._is_above_grid(x, y, z):
+            return True
 
         # Grid index (no clamp)
         res = self._resolution

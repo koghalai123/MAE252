@@ -15,6 +15,7 @@ from scipy.spatial.transform import Rotation, Slerp
 _MARKER_FLOATS = 8
 _MARKER_RADIUS = 0.5
 _FRONTIER_MAX_PTS = 200_000  # max frontier overlay points
+_PATH_MAX_PTS = 2_000         # max planned-path waypoints
 
 
 def _make_sphere(color, radius=_MARKER_RADIUS):
@@ -28,7 +29,8 @@ def _make_sphere(color, radius=_MARKER_RADIUS):
 
 def _vis_process(shm_name, shape, dtype_str, lock, update_event, stop_event,
                  marker_shm_name=None, frontier_shm_name=None,
-                 frontier_shape=None):
+                 frontier_shape=None, path_shm_name=None,
+                 path_shape=None):
     """Visualizer loop running in a separate process."""
     import numpy as _np
     import open3d as _o3d
@@ -50,6 +52,13 @@ def _vis_process(shm_name, shape, dtype_str, lock, update_event, stop_event,
         frontier_shm = multiprocessing.shared_memory.SharedMemory(name=frontier_shm_name)
         frontier_buf = _np.ndarray(frontier_shape, dtype=dtype_str, buffer=frontier_shm.buf)
 
+    # Optional planned-path overlay shared memory
+    path_shm = None
+    path_buf = None
+    if path_shm_name is not None and path_shape is not None:
+        path_shm = multiprocessing.shared_memory.SharedMemory(name=path_shm_name)
+        path_buf = _np.ndarray(path_shape, dtype=dtype_str, buffer=path_shm.buf)
+
     pcd = _o3d.geometry.PointCloud()
     # Filter zero-padded slots for initial display
     init_pts = buf.copy()
@@ -65,6 +74,10 @@ def _vis_process(shm_name, shape, dtype_str, lock, update_event, stop_event,
     # Frontier overlay point cloud (orange)
     frontier_pcd = _o3d.geometry.PointCloud()
 
+    # Planned-path overlay (cyan line set)
+    path_lineset = _o3d.geometry.LineSet()
+    path_visible = False
+
     vis = _o3d.visualization.Visualizer()
     vis.create_window(window_name="3D Map Viewer", width=1280, height=720)
     vis.add_geometry(pcd)
@@ -76,6 +89,7 @@ def _vis_process(shm_name, shape, dtype_str, lock, update_event, stop_event,
                 pts = buf.copy()
                 mdata = marker_buf.copy() if marker_buf is not None else None
                 fdata = frontier_buf.copy() if frontier_buf is not None else None
+                pdata = path_buf.copy() if path_buf is not None else None
             update_event.clear()
             # Only render actual points, not zero-padded buffer slots
             mask = _np.any(pts != 0, axis=1)
@@ -91,6 +105,27 @@ def _vis_process(shm_name, shape, dtype_str, lock, update_event, stop_event,
                 if len(fpts) > 0:
                     frontier_pcd.paint_uniform_color([1.0, 0.6, 0.0])
                 vis.update_geometry(frontier_pcd)
+
+            # ── Update planned-path line (cyan) ──────────────────────
+            if pdata is not None:
+                pmask = _np.any(pdata != 0, axis=1)
+                ppts = pdata[pmask]
+                if len(ppts) >= 2:
+                    lines = [[j, j + 1] for j in range(len(ppts) - 1)]
+                    colors = [[0.0, 0.9, 1.0]] * len(lines)
+                    new_ls = _o3d.geometry.LineSet(
+                        points=_o3d.utility.Vector3dVector(ppts),
+                        lines=_o3d.utility.Vector2iVector(lines),
+                    )
+                    new_ls.colors = _o3d.utility.Vector3dVector(colors)
+                    if path_visible:
+                        vis.remove_geometry(path_lineset, reset_bounding_box=False)
+                    path_lineset = new_ls
+                    vis.add_geometry(path_lineset, reset_bounding_box=False)
+                    path_visible = True
+                elif path_visible:
+                    vis.remove_geometry(path_lineset, reset_bounding_box=False)
+                    path_visible = False
 
             # ── Update drone sphere ───────────────────────────────────
             if mdata is not None and mdata[3] == 1.0:
@@ -129,6 +164,8 @@ def _vis_process(shm_name, shape, dtype_str, lock, update_event, stop_event,
         marker_shm.close()
     if frontier_shm is not None:
         frontier_shm.close()
+    if path_shm is not None:
+        path_shm.close()
 
 
 class Viewer3D:
@@ -143,6 +180,8 @@ class Viewer3D:
         self._marker_buf = None
         self._frontier_shm = None
         self._frontier_buf = None
+        self._path_shm = None
+        self._path_buf = None
         self._proc = None
         self._lock = multiprocessing.Lock()
         self._update_event = multiprocessing.Event()
@@ -176,6 +215,15 @@ class Viewer3D:
                                          buffer=self._frontier_shm.buf)
         self._frontier_buf[:] = 0.0
 
+        # Planned-path overlay shared memory
+        self._path_shape = (_PATH_MAX_PTS, 3)
+        path_nbytes = int(np.prod(self._path_shape) * self._dtype.itemsize)
+        self._path_shm = multiprocessing.shared_memory.SharedMemory(
+            create=True, size=path_nbytes)
+        self._path_buf = np.ndarray(self._path_shape, dtype=self._dtype,
+                                     buffer=self._path_shm.buf)
+        self._path_buf[:] = 0.0
+
         self._update_event.set()
         self._proc = multiprocessing.Process(
             target=_vis_process,
@@ -183,12 +231,15 @@ class Viewer3D:
                   self._lock, self._update_event, self._stop_event),
             kwargs=dict(marker_shm_name=self._marker_shm.name,
                         frontier_shm_name=self._frontier_shm.name,
-                        frontier_shape=self._frontier_shape),
+                        frontier_shape=self._frontier_shape,
+                        path_shm_name=self._path_shm.name,
+                        path_shape=self._path_shape),
             daemon=True,
         )
         self._proc.start()
 
-    def update(self, points, *, drone_pos=None, target_pos=None, frontier_points=None):
+    def update(self, points, *, drone_pos=None, target_pos=None,
+               frontier_points=None, path_points=None):
         n = min(len(points), self.MAX_POINTS)
         with self._lock:
             self._buf[:] = 0.0
@@ -209,6 +260,34 @@ class Viewer3D:
                 if frontier_points is not None and len(frontier_points) > 0:
                     nf = min(len(frontier_points), _FRONTIER_MAX_PTS)
                     self._frontier_buf[:nf] = frontier_points[:nf].astype(self._dtype)
+            if self._path_buf is not None:
+                self._path_buf[:] = 0.0
+                if path_points is not None and len(path_points) > 0:
+                    np_ = min(len(path_points), _PATH_MAX_PTS)
+                    self._path_buf[:np_] = path_points[:np_].astype(self._dtype)
+        self._update_event.set()
+
+    def update_overlays(self, *, drone_pos=None, target_pos=None,
+                        path_points=None):
+        """Lightweight overlay-only update (no point-cloud copy).
+
+        Updates only the marker and/or path shared-memory buffers and
+        signals the viewer process.  The main point-cloud and frontier
+        buffers are left untouched from the last ``update()`` call.
+        """
+        with self._lock:
+            if self._marker_buf is not None:
+                if drone_pos is not None:
+                    self._marker_buf[0:3] = np.asarray(drone_pos, dtype=np.float64)
+                    self._marker_buf[3] = 1.0
+                if target_pos is not None:
+                    self._marker_buf[4:7] = np.asarray(target_pos, dtype=np.float64)
+                    self._marker_buf[7] = 1.0
+            if path_points is not None and self._path_buf is not None:
+                self._path_buf[:] = 0.0
+                if len(path_points) > 0:
+                    np_ = min(len(path_points), _PATH_MAX_PTS)
+                    self._path_buf[:np_] = path_points[:np_].astype(self._dtype)
         self._update_event.set()
 
     def stop(self):
@@ -221,6 +300,9 @@ class Viewer3D:
         if self._frontier_shm is not None:
             self._frontier_shm.close()
             self._frontier_shm.unlink()
+        if self._path_shm is not None:
+            self._path_shm.close()
+            self._path_shm.unlink()
         if self._shm is not None:
             self._shm.close()
             self._shm.unlink()

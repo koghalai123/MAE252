@@ -32,6 +32,10 @@ from scipy.spatial.transform import Rotation
 
 from finalMappingPipeline import LiveSLAM, SLAMConfig, SLAMPipeline
 from RegistrationComparison import resolve_recording_dir, filter_valid, xform_pts
+from obstacleAvoidance import (
+    PathPlanner, PathFollower, FollowerState, FlightResult,
+    get_drone_position,
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -316,13 +320,23 @@ class ExplorationPlanner:
         resolution: float = 1.0,
         min_frontier_size: int = 3,
         ray_subsample: float | None = None,
-        waypoint_exclusion_radius: float = 1.0,
+        waypoint_exclusion_radius: float = 3.0,
+        unknown_gain_radius: int = 3,
+        distance_exponent: float = 0.5,
+        lidar_altitude_offset: float = 0.0,
+        min_target_distance: float = 3.0,
+        inflation_margin: float = 2.0,
     ):
         self.xmin, self.xmax, self.ymin, self.ymax, self.zmin, self.zmax = bounds
         self.resolution = resolution
         self.min_frontier_size = min_frontier_size
         self.ray_subsample = ray_subsample if ray_subsample is not None else resolution
         self.waypoint_exclusion_radius = waypoint_exclusion_radius
+        self.unknown_gain_radius = unknown_gain_radius
+        self.distance_exponent = distance_exponent
+        self.lidar_altitude_offset = lidar_altitude_offset
+        self.min_target_distance = min_target_distance
+        self.inflation_margin = inflation_margin
 
         self.nx = int(np.ceil((self.xmax - self.xmin) / resolution))
         self.ny = int(np.ceil((self.ymax - self.ymin) / resolution))
@@ -330,6 +344,9 @@ class ExplorationPlanner:
 
         # Persistent observed grid — once observed, always observed
         self._observed = np.zeros((self.nx, self.ny, self.nz), dtype=bool)
+
+        # Last occupied grid (updated each next_target call)
+        self._last_occupied_grid = np.zeros((self.nx, self.ny, self.nz), dtype=bool)
 
         # Raw scan data fed from BufferedSLAM: (sensor_origin(3,), world_pts(N,3))
         self._scan_data: list[tuple[np.ndarray, np.ndarray]] = []
@@ -568,6 +585,7 @@ class ExplorationPlanner:
             0, self.nz - 1,
         )
         occupied_grid[ix, iy, iz] = True
+        self._last_occupied_grid = occupied_grid
         info["n_occupied_cells"] = int(occupied_grid.sum())
 
         # 3) Derive free / unknown / frontier masks ──────────────────────
@@ -588,12 +606,26 @@ class ExplorationPlanner:
         unknown_adjacent = ndimage.binary_dilation(unknown, structure=struct)
         is_frontier = free & unknown_adjacent
 
-        # Ensure drone start voxel is free (it is physically there)
+        # Ensure a small neighbourhood around the drone is observed+free
+        # so the BFS can always connect outward to the scanned region.
+        # The drone is physically present, so a few-voxel radius is safe.
         start = self._world_to_grid(*current_pos[:3])
-        if not free[start]:
-            self._observed[start] = True
-            occupied_grid[start] = False
-            free[start] = True
+        sx, sy, sz = start
+        _SEED_R = 2  # voxel radius around drone to force free
+        for dx in range(-_SEED_R, _SEED_R + 1):
+            for dy in range(-_SEED_R, _SEED_R + 1):
+                for dz in range(-_SEED_R, _SEED_R + 1):
+                    nx_, ny_, nz_ = sx + dx, sy + dy, sz + dz
+                    if (0 <= nx_ < self.nx and 0 <= ny_ < self.ny
+                            and 0 <= nz_ < self.nz):
+                        self._observed[nx_, ny_, nz_] = True
+                        occupied_grid[nx_, ny_, nz_] = False
+                        free[nx_, ny_, nz_] = True
+        # Recompute frontier mask after seeding (new free cells may be
+        # adjacent to unknown voxels)
+        unknown = ~self._observed
+        unknown_adjacent = ndimage.binary_dilation(unknown, structure=struct)
+        is_frontier = free & unknown_adjacent
 
         # 4) Wavefront Frontier Detection BFS ─────────────────────────────
         all_clusters = self._wfd_bfs(start, free, is_frontier)
@@ -622,20 +654,35 @@ class ExplorationPlanner:
             return None, info
 
         # 5) Score frontier clusters ──────────────────────────────────────
+        #    gain  = unknown voxels in a box around the frontier centroid
+        #            (estimates how much NEW space will be revealed, not
+        #            how much boundary we already know about)
+        #    cost  = distance^exponent  (exponent < 1 softens the bias
+        #            toward nearby frontiers so the drone pushes outward)
+        #    The waypoint is offset upward (more negative Z in NED) so the
+        #    downward-facing LiDAR can scan the frontier region from above.
         cur_xyz = current_pos[:3]
         best_score = -np.inf
         best_target = None
+        r = self.unknown_gain_radius
+        # Safe Z clamp: keep waypoints well inside bounds so OMPL doesn't
+        # reject them due to the inflated obstacle boundary.
+        z_lo = self.zmin + self.inflation_margin
+        z_hi = self.zmax - self.inflation_margin
 
         for cells in valid_clusters:
             cx_mean = float(cells[:, 0].mean())
             cy_mean = float(cells[:, 1].mean())
             cz_mean = float(cells[:, 2].mean())
-            wx, wy, wz = self._grid_to_world(cx_mean, cy_mean, cz_mean)
+            wx, wy, wz_frontier = self._grid_to_world(cx_mean, cy_mean, cz_mean)
 
-            # Keep target inside bounds with a small margin
-            wx = float(np.clip(wx, self.xmin + 1, self.xmax - 1))
-            wy = float(np.clip(wy, self.ymin + 1, self.ymax - 1))
-            wz = float(np.clip(wz, self.zmin + 1, self.zmax - 1))
+            # Offset waypoint above the frontier for downward LiDAR coverage
+            wz = wz_frontier - self.lidar_altitude_offset
+
+            # Keep target inside safe bounds
+            wx = float(np.clip(wx, self.xmin + self.inflation_margin, self.xmax - self.inflation_margin))
+            wy = float(np.clip(wy, self.ymin + self.inflation_margin, self.ymax - self.inflation_margin))
+            wz = float(np.clip(wz, z_lo, z_hi))
 
             # Reject if the target voxel itself is occupied
             tix, tiy, tiz = self._world_to_grid(wx, wy, wz)
@@ -650,13 +697,27 @@ class ExplorationPlanner:
                           < self.waypoint_exclusion_radius):
                     continue
 
-            gain = float(len(cells))                # information gain
-            dist = max(float(np.linalg.norm(np.array([wx, wy, wz]) - cur_xyz)), 0.5)
-            score = gain / dist                     # benefit / cost
+            # Reject if target is too close to the drone's current position
+            # (prevents picking "already here" waypoints)
+            dist = max(float(np.linalg.norm(candidate - cur_xyz)), 0.01)
+            if dist < self.min_target_distance:
+                continue
+
+            # Count unknown voxels near the frontier centroid — this
+            # measures exploration potential (how much new space is behind
+            # this frontier) rather than the raw frontier size.
+            gx, gy, gz = self._world_to_grid(wx, wy, wz_frontier)
+            x0, x1 = max(0, gx - r), min(self.nx, gx + r + 1)
+            y0, y1 = max(0, gy - r), min(self.ny, gy + r + 1)
+            z0, z1 = max(0, gz - r), min(self.nz, gz + r + 1)
+            unknown_nearby = int(unknown[x0:x1, y0:y1, z0:z1].sum())
+
+            gain = float(unknown_nearby)
+            score = gain / (dist ** self.distance_exponent)
 
             if score > best_score:
                 best_score = score
-                best_target = np.array([wx, wy, wz])
+                best_target = candidate
 
         # Fallback: nearest frontier voxel if all cluster centroids rejected
         if best_target is None and n_valid > 0:
@@ -666,6 +727,11 @@ class ExplorationPlanner:
                 self.ymin + (all_cells[:, 1] + 0.5) * self.resolution,
                 self.zmin + (all_cells[:, 2] + 0.5) * self.resolution,
             ])
+            # Offset Z for LiDAR coverage (fly above the frontier)
+            fw[:, 2] -= self.lidar_altitude_offset
+            fw[:, 0] = np.clip(fw[:, 0], self.xmin + self.inflation_margin, self.xmax - self.inflation_margin)
+            fw[:, 1] = np.clip(fw[:, 1], self.ymin + self.inflation_margin, self.ymax - self.inflation_margin)
+            fw[:, 2] = np.clip(fw[:, 2], self.zmin + self.inflation_margin, self.zmax - self.inflation_margin)
             # Filter out frontier voxels too close to previous waypoints
             if self._waypoint_history:
                 prev = np.array(self._waypoint_history)
@@ -673,6 +739,10 @@ class ExplorationPlanner:
                 for wp in prev:
                     keep &= np.linalg.norm(fw - wp, axis=1) >= self.waypoint_exclusion_radius
                 fw = fw[keep]
+            # Filter out points too close to the drone
+            if len(fw) > 0:
+                fb_dists = np.linalg.norm(fw - cur_xyz.reshape(1, 3), axis=1)
+                fw = fw[fb_dists >= self.min_target_distance]
             if len(fw) > 0:
                 dists = np.linalg.norm(fw - cur_xyz.reshape(1, 3), axis=1)
                 nearest = fw[np.argmin(dists)]
@@ -699,7 +769,7 @@ SAVE_DIR = os.path.join(os.path.dirname(__file__), "flight_recordings")
 REPLAY_DIR      = ""  
 # ── Exploration parameters (shared by both modes) ────────────────────────
 EXPLORE_BOUNDS  = (-20, 20, -50, 10, -20, 0)   # (xmin,xmax,ymin,ymax,zmin,zmax) NED
-TAKEOFF_HEIGHT  = -15.0         # NED z for initial ascent (live mode only)
+TAKEOFF_HEIGHT  = EXPLORE_BOUNDS[4] - 5         # NED z, 5 m above grid ceiling (LiDAR points down)
 VELOCITY        = 3             # m/s (live mode only)
 SCAN_HZ         = 1 / 2.5      # scans per second (live mode only)
 PLANNER_RES     = 1.0           # planning grid voxel size (m)
@@ -707,6 +777,22 @@ MAX_TARGETS     = 50            # safety cap on autonomous waypoints
 SCAN_DELAY      = 3             # register a scan only after N newer scans (live mode)
 PLAN_EVERY      = 3             # run planner every N frames (replay mode)
 FRAME_SKIP      = 1             # process every Nth frame (replay mode, 1 = all)
+
+# ── Path-planning parameters (live mode) ─────────────────────────────────
+INFLATION_RADIUS    = 1.5       # safety margin (m) inflated around obstacles
+ABOVE_GRID_MARGIN   = 10.0      # metres of free airspace above the grid ceiling
+PATH_PLANNER_TYPE   = "ABITstar"
+PATH_SOLVE_TIMEOUT  = 2.0       # seconds per OMPL solve
+FLIGHT_MODE         = "velocity" # "path" (moveOnPathAsync) or "velocity" (pure-pursuit)
+POLL_HZ             = 20.0
+MIN_WP_SPACING      = 1.0
+
+# ── Exploration scoring (live mode) ──────────────────────────────────────
+UNKNOWN_GAIN_RADIUS = 3         # voxels: box radius for counting unknown neighbours
+DISTANCE_EXPONENT   = 0.5       # softer distance penalty (1.0 = original linear)
+LIDAR_ALT_OFFSET    = 2.0       # fly this many metres above frontier centroid (NED)
+MIN_TARGET_DIST     = 3.0       # skip targets closer than this (m) to avoid re-visiting
+WP_EXCLUSION_RADIUS = 3.0       # avoid re-selecting waypoints within this radius (m)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Replay mode — offline exploration on saved LiDAR data
@@ -869,13 +955,28 @@ def run_live():
     print(f"  Scan buffer delay: {SCAN_DELAY} scans "
           f"({SCAN_DELAY / SCAN_HZ:.1f}s at {SCAN_HZ:.2f} Hz)")
 
-    # ── Planner (must be created before takeoff so scans are forwarded) ──
-    planner = ExplorationPlanner(
+    # ── Exploration planner (must be created before takeoff so scans are forwarded)
+    exploration = ExplorationPlanner(
         bounds=EXPLORE_BOUNDS,
         resolution=PLANNER_RES,
         min_frontier_size=3,
+        unknown_gain_radius=UNKNOWN_GAIN_RADIUS,
+        distance_exponent=DISTANCE_EXPONENT,
+        lidar_altitude_offset=LIDAR_ALT_OFFSET,
+        min_target_distance=MIN_TARGET_DIST,
+        waypoint_exclusion_radius=WP_EXCLUSION_RADIUS,
+        inflation_margin=INFLATION_RADIUS + 0.5,
     )
-    buf.set_planner(planner)
+    buf.set_planner(exploration)
+
+    # ── OMPL path planner (obstacle avoidance) ───────────────────────────
+    path_planner = PathPlanner(
+        inflation_radius=INFLATION_RADIUS,
+        planner_type=PATH_PLANNER_TYPE,
+        solve_timeout=PATH_SOLVE_TIMEOUT,
+        ground_z=0.0,
+        above_grid_margin=ABOVE_GRID_MARGIN,
+    )
 
     # ── Takeoff ──────────────────────────────────────────────────────────
     print("Taking off...")
@@ -886,24 +987,57 @@ def run_live():
     future = live.client.moveToPositionAsync(0, 0, TAKEOFF_HEIGHT, velocity=VELOCITY)
     while not future._set_flag:
         buf.process_once()
+        p = live.client.getMultirotorState().kinematics_estimated.position
+        live.pipeline.set_drone_pos(np.array([p.x_val, p.y_val, p.z_val]))
+        live.pipeline.refresh_overlays()
         time.sleep(0.001)
-    for _ in range(5):
+    live.client.hoverAsync().join()
+
+    # Hover at cruise altitude and collect several scans so the planner
+    # has a proper observed region centred at the operating height.
+    MIN_INITIAL_SCANS = 5
+    INITIAL_TIMEOUT   = 30.0   # seconds — safety cap
+    print(f"  Collecting initial scans at cruise altitude (need {MIN_INITIAL_SCANS})...")
+    t0 = time.time()
+    while buf._n_collected < MIN_INITIAL_SCANS and (time.time() - t0) < INITIAL_TIMEOUT:
         buf.process_once()
-        time.sleep(0.1)
+        p = live.client.getMultirotorState().kinematics_estimated.position
+        live.pipeline.set_drone_pos(np.array([p.x_val, p.y_val, p.z_val]))
+        live.pipeline.refresh_overlays()
+        time.sleep(0.05)
+    print(f"  Collected {buf._n_collected} scans in {time.time() - t0:.1f}s")
 
     # Flush all buffered scans so the planner has raycasting data
     # from every scan collected during ascent (not just the N-delay ones)
     buf.flush()
-    print(f"  Initial scans forwarded to planner: {planner._n_scans_raycasted} raycasted, "
-          f"{len(planner._scan_data)} total")
+    print(f"  Initial scans forwarded to planner: {exploration._n_scans_raycasted} raycasted, "
+          f"{len(exploration._scan_data)} total")
+
+    # ── Path follower (threaded flight executor) ─────────────────────────
+    def _viewer_tick(pos, _follower):
+        """Called at POLL_HZ on the follower thread — update drone marker."""
+        live.pipeline.set_drone_pos(pos)
+        live.pipeline.refresh_overlays()
+
+    follower = PathFollower(
+        live.client, planner=path_planner,
+        mode=FLIGHT_MODE, velocity=VELOCITY,
+        poll_hz=POLL_HZ, min_spacing=MIN_WP_SPACING,
+        on_tick=_viewer_tick,
+    )
+    follower.start()
+
+    mode_label = ("moveOnPathAsync" if FLIGHT_MODE == "path"
+                  else "pure-pursuit velocity")
 
     print(f"\n{'='*60}")
     print(f"Autonomous 3-D exploration started")
     print(f"  Bounds: x=[{EXPLORE_BOUNDS[0]}, {EXPLORE_BOUNDS[1]}], "
           f"y=[{EXPLORE_BOUNDS[2]}, {EXPLORE_BOUNDS[3]}], "
           f"z=[{EXPLORE_BOUNDS[4]}, {EXPLORE_BOUNDS[5]}]")
-    print(f"  Grid:  {planner.nx} x {planner.ny} x {planner.nz} voxels @ {PLANNER_RES} m")
-    print(f"  Observation: raycasted from LiDAR  |  Max waypoints: {MAX_TARGETS}")
+    print(f"  Grid:  {exploration.nx} x {exploration.ny} x {exploration.nz} voxels @ {PLANNER_RES} m")
+    print(f"  Path planner: {PATH_PLANNER_TYPE}  |  Inflation: {INFLATION_RADIUS} m")
+    print(f"  Flight mode: {mode_label}  |  Max waypoints: {MAX_TARGETS}")
     print(f"{'='*60}\n")
 
     wp_count = 0
@@ -913,7 +1047,7 @@ def run_live():
         p = state.kinematics_estimated.position
         current_pos = np.array([p.x_val, p.y_val, p.z_val])
 
-        target, info = planner.next_target(live.pipeline, current_pos)
+        target, info = exploration.next_target(live.pipeline, current_pos)
 
         live.set_frontier_points(info.get("frontier_world_pts"))
 
@@ -930,14 +1064,67 @@ def run_live():
         live.set_target(target.tolist())
         wp_count += 1
 
-        future = live.client.moveToPositionAsync(
-            float(target[0]), float(target[1]), float(target[2]),
-            velocity=VELOCITY,
+        # ── Update PathPlanner's map from exploration grids ──────────
+        origin = np.array([exploration.xmin, exploration.ymin, exploration.zmin])
+        path_planner.update_map(
+            exploration._observed.copy(),
+            exploration._last_occupied_grid.copy(),
+            origin, exploration.resolution,
         )
-        while not future._set_flag:
-            buf.process_once()
-            time.sleep(0.001)
+        # Store occupied world-frame points for viewer / clearance tracking
+        vis_pts = live.pipeline.get_map_points()
+        if len(vis_pts) > 0:
+            path_planner.points = vis_pts.astype(np.float32)
 
+        # ── Plan a collision-free path to the frontier target ────────
+        t_plan = time.time()
+        path = path_planner.plan(current_pos, target)
+        dt_plan = time.time() - t_plan
+
+        if path is not None:
+            print(f"       Path: {len(path)} waypoints, {dt_plan:.2f}s")
+
+            # Show the planned path in the 3D viewer (cyan line)
+            live.set_path_points(np.asarray(path, dtype=np.float64))
+
+            # Fly the planned path with the threaded PathFollower
+            follower.follow(path, goal=target)
+
+            # Collect scans while the follower flies
+            while follower.is_busy:
+                buf.process_once()
+                time.sleep(0.001)
+
+            # Log the flight result
+            result = follower.last_result
+            if result is not None:
+                status = ("ARRIVED" if result.success
+                          else ("COLLISION" if result.collided else "MISSED"))
+                clearance_str = (
+                    f"{result.min_obstacle_clearance:.2f} m"
+                    if result.min_obstacle_clearance < float('inf') else "n/a")
+                print(f"       {status} — flight: {result.flight_time:.1f}s, "
+                      f"error: {result.arrival_error:.2f} m, "
+                      f"clearance: {clearance_str}")
+        else:
+            print(f"       No path found ({dt_plan:.2f}s) — flying direct")
+            live.set_path_points(None)  # clear path line from viewer
+            # Fall back to straight-line flight if OMPL cannot find a route
+            future = live.client.moveToPositionAsync(
+                float(target[0]), float(target[1]), float(target[2]),
+                velocity=VELOCITY,
+            )
+            while not future._set_flag:
+                buf.process_once()
+                p = live.client.getMultirotorState().kinematics_estimated.position
+                live.pipeline.set_drone_pos(np.array([p.x_val, p.y_val, p.z_val]))
+                live.pipeline.refresh_overlays()
+                time.sleep(0.001)
+
+        # Hover to hold position while the next planning step runs
+        live.client.hoverAsync().join()
+
+        # Extra scans after arrival — let the map settle
         for _ in range(5):
             buf.process_once()
             time.sleep(0.1)
@@ -945,6 +1132,7 @@ def run_live():
     print(f"\nExploration finished after {wp_count} waypoints.")
 
     # ── Finalise ─────────────────────────────────────────────────────────
+    follower.stop()
     buf.flush()
     print(f"  Buffer stats: {buf._n_collected} total scans collected")
 

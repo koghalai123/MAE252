@@ -324,6 +324,7 @@ class SLAMPipeline:
         self._drone_pos: np.ndarray | None = None
         self._target_pos: np.ndarray | None = None
         self._frontier_points: np.ndarray | None = None
+        self._path_points: np.ndarray | None = None
 
         # Outlier detector
         self._outlier_det = RegistrationOutlierDetector(
@@ -408,6 +409,27 @@ class SLAMPipeline:
             self._frontier_points = np.asarray(pts, dtype=np.float64)
         else:
             self._frontier_points = None
+
+    def set_path_points(self, pts):
+        """Set planned-path overlay points (Nx3) shown as cyan line in the viewer."""
+        if pts is not None and len(pts) > 0:
+            self._path_points = np.asarray(pts, dtype=np.float64)
+        else:
+            self._path_points = None
+
+    def refresh_overlays(self):
+        """Push current drone/target/path overlays to the viewer without a new scan.
+
+        This is much cheaper than a full ``update()`` because it skips the
+        point-cloud copy.  Call at high frequency (e.g. 20 Hz) for smooth
+        marker tracking.
+        """
+        if self._viewer is not None and self._viewer._proc:
+            self._viewer.update_overlays(
+                drone_pos=self._drone_pos,
+                target_pos=self._target_pos,
+                path_points=self._path_points,
+            )
 
     # ── Callback registration ─────────────────────────────────────────────
 
@@ -610,7 +632,8 @@ class SLAMPipeline:
                 self._viewer.update(vp,
                                     drone_pos=self._drone_pos,
                                     target_pos=self._target_pos,
-                                    frontier_points=self._frontier_points)
+                                    frontier_points=self._frontier_points,
+                                    path_points=self._path_points)
         self.timings["vis"].append(time.perf_counter() - t0)
 
         self.timings["total"].append(time.perf_counter() - t_frame)
@@ -972,6 +995,14 @@ class LiveSLAM:
     def set_frontier_points(self, pts):
         """Set frontier overlay points (Nx3) shown as orange in the viewer."""
         self.pipeline.set_frontier_points(pts)
+
+    def set_path_points(self, pts):
+        """Set planned-path overlay (Nx3) shown as cyan line in the viewer."""
+        self.pipeline.set_path_points(pts)
+
+    def refresh_overlays(self):
+        """Push current overlays to the viewer without a new scan."""
+        self.pipeline.refresh_overlays()
 
     def connect(self):
         """Connect to AirSim and arm the drone."""
