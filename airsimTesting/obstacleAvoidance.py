@@ -1,306 +1,172 @@
 #!/usr/bin/env python3
-"""OMPL-based obstacle-avoidance path planning for a drone in AirSim.
+"""PathPlanner — OMPL-based 3-D path planning through three-state voxel maps.
 
-Loads a voxel map (ground-truth or incrementally built) from an .npz file,
-builds an occupancy grid with an inflation layer for safety, then uses
-OMPL's RRT* planner to find collision-free paths to random near-obstacle
-goal locations.
+Provides a :class:`PathPlanner` that accepts a map with three voxel states
+(**free**, **occupied**, **unknown**) and plans collision-free paths through
+known-free space using OMPL's sampling-based planners.
 
-The map is stored as a ``VoxelMap`` that can be **hot-reloaded** or
-**updated in-place** so the same planner pipeline works for both:
-  - static ground-truth maps, and
-  - incrementally expanding maps during live exploration.
+**Key design**: Unknown voxels are treated as **obstacles** (conservative
+planning).  The planner will only route paths through voxels that have been
+observed and found to be empty.  This is the correct behaviour for autonomous
+exploration where the drone must not fly into unscanned regions.
 
-Unknown space is treated as traversable (optimistic), since the drone must
-be able to fly into unexplored regions.  The inflation (safety margin)
-only applies to *known* occupied voxels.
+Quick usage from ``exploration.py``::
+
+    from obstacleAvoidance import PathPlanner
+
+    planner = PathPlanner(inflation_radius=1.5, ground_z=0.0)
+    planner.update_map(observed, occupied,
+                       origin=np.array([xmin, ymin, zmin]),
+                       resolution=1.0)
+    path = planner.plan(current_pos, target_pos)
+    if path is not None:
+        print(f"Found path with {len(path)} waypoints")
+
+The module also includes AirSim flight-executor utilities and a standalone
+test that loads a ground-truth voxel map and flies random obstacle-avoidance
+missions in the simulator (``python obstacleAvoidance.py``).
 """
 
 from __future__ import annotations
 
-import cosysairsim as airsim
 import math
 import numpy as np
 import os
-import sys
 import time
-from collections import deque
+from typing import TYPE_CHECKING
 
 from ompl import base as ob
 from ompl import geometric as og
 
-from sensorFeed import Viewer3D
+if TYPE_CHECKING:
+    import cosysairsim as airsim
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GPS-based drone localisation
+# PathPlanner
 # ══════════════════════════════════════════════════════════════════════════════
 
-def gps_to_ned(
-    gps_lat: float, gps_lon: float, gps_alt: float,
-    home_lat: float, home_lon: float, home_alt: float,
-) -> np.ndarray:
-    """Convert GPS geodetic coordinates to local NED relative to *home*.
+class PathPlanner:
+    """OMPL-based 3-D path planner for three-state voxel maps.
 
-    Uses a flat-earth approximation with the WGS-84 semi-major axis.
-    Accurate to < 1 m for distances up to several kilometres.
+    Accepts a map with three voxel states:
 
-    Returns
-    -------
-    ndarray, shape (3,)
-        Position in NED (North-East-Down) metres, where
-        X = North, Y = East, Z = Down.
-    """
-    R_EARTH = 6_378_137.0  # WGS-84 semi-major axis (m)
+    - **Free**: observed and unoccupied — the drone may fly here.
+    - **Occupied**: contains an obstacle.
+    - **Unknown**: not yet observed by any sensor — treated as impassable.
 
-    d_lat = math.radians(gps_lat - home_lat)
-    d_lon = math.radians(gps_lon - home_lon)
-
-    north = d_lat * R_EARTH
-    east  = d_lon * R_EARTH * math.cos(math.radians(home_lat))
-    down  = -(gps_alt - home_alt)
-
-    return np.array([north, east, down])
-
-
-def get_drone_position(client: airsim.MultirotorClient) -> np.ndarray:
-    """Return the drone's NED position derived from its simulated GPS.
-
-    AirSim's state-estimator (``kinematics_estimated``) reports position
-    relative to the player-start origin, but this can be incorrect if
-    the drone spawns at an unexpected location.  The simulated GPS, on
-    the other hand, reflects the drone's *true* physics state.  By
-    converting the GPS reading back to NED via the home geo-point we
-    get the correct position in the map's coordinate frame.
-    """
-    home = client.getHomeGeoPoint()
-    gps  = client.getGpsData().gnss.geo_point
-    return gps_to_ned(
-        gps.latitude, gps.longitude, gps.altitude,
-        home.latitude, home.longitude, home.altitude,
-    )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# VoxelMap — occupancy representation with safety inflation
-# ══════════════════════════════════════════════════════════════════════════════
-
-class VoxelMap:
-    """3-D occupancy grid built from a voxel point cloud.
+    An inflation (safety margin) is applied around occupied voxels so
+    planned paths maintain a safe clearance distance.
 
     Parameters
     ----------
-    resolution : float
-        Voxel edge length in metres used for the planning grid.
-        May differ from the source map resolution (points are re-binned).
     inflation_radius : float
-        Safety margin (metres) added around every occupied voxel.
-    """
-
-    def __init__(self, resolution: float = 0.5, inflation_radius: float = 1.0):
-        self.resolution = resolution
-        self.inflation_radius = inflation_radius
-
-        # Grid arrays (allocated on first load / update)
-        self.occupied: np.ndarray | None = None   # bool (nx, ny, nz)
-        self.inflated: np.ndarray | None = None   # bool (nx, ny, nz) — collision grid
-
-        # World-frame origin (minimum corner)
-        self.origin = np.zeros(3)
-        self.nx = self.ny = self.nz = 0
-
-        # The raw occupied points (world frame) — kept for viewer display
-        self.points: np.ndarray = np.empty((0, 3), dtype=np.float32)
-
-    # ── Load from .npz (displayGroundTruth format) ────────────────────────
-
-    def load_npz(self, path: str) -> None:
-        """Load a voxel map from a ``.npz`` file saved by displayGroundTruth.py.
-
-        Expected keys: ``points`` (N, 3) float32 occupied voxel centres,
-        plus optional metadata (``center``, ``grid_size``, ``resolution``).
-        """
-        data = np.load(path)
-        pts = data["points"].astype(np.float32)
-        self._build_from_points(pts)
-        print(f"  [VoxelMap] Loaded {len(pts):,} occupied points from {path}")
-        print(f"  [VoxelMap] Grid: {self.nx}×{self.ny}×{self.nz} @ {self.resolution} m")
-        print(f"  [VoxelMap] Bounds: ({self.origin[0]:.1f}..{self.origin[0]+self.nx*self.resolution:.1f}, "
-              f"{self.origin[1]:.1f}..{self.origin[1]+self.ny*self.resolution:.1f}, "
-              f"{self.origin[2]:.1f}..{self.origin[2]+self.nz*self.resolution:.1f})")
-
-    def update_points(self, pts: np.ndarray) -> None:
-        """Replace the map with a new set of occupied world-frame points.
-
-        Use this for live / incrementally expanding maps.
-        """
-        pts = np.asarray(pts, dtype=np.float32)
-        self._build_from_points(pts)
-
-    # ── Internal grid construction ────────────────────────────────────────
-
-    def _build_from_points(self, pts: np.ndarray) -> None:
-        self.points = pts
-        if len(pts) == 0:
-            self.occupied = np.zeros((1, 1, 1), dtype=bool)
-            self.inflated = np.zeros((1, 1, 1), dtype=bool)
-            self.origin = np.zeros(3)
-            self.nx = self.ny = self.nz = 1
-            return
-
-        res = self.resolution
-        # Pad the bounding box by the inflation radius + one extra voxel
-        pad = self.inflation_radius + res
-        mins = pts.min(axis=0) - pad
-        maxs = pts.max(axis=0) + pad
-        self.origin = mins.copy()
-
-        self.nx = int(np.ceil((maxs[0] - mins[0]) / res))
-        self.ny = int(np.ceil((maxs[1] - mins[1]) / res))
-        self.nz = int(np.ceil((maxs[2] - mins[2]) / res))
-
-        # Build occupied grid
-        self.occupied = np.zeros((self.nx, self.ny, self.nz), dtype=bool)
-        ix = np.clip(((pts[:, 0] - self.origin[0]) / res).astype(int), 0, self.nx - 1)
-        iy = np.clip(((pts[:, 1] - self.origin[1]) / res).astype(int), 0, self.ny - 1)
-        iz = np.clip(((pts[:, 2] - self.origin[2]) / res).astype(int), 0, self.nz - 1)
-        self.occupied[ix, iy, iz] = True
-
-        # Inflate: dilate occupied voxels by a spherical structuring element
-        self._inflate()
-
-    def _inflate(self) -> None:
-        from scipy import ndimage
-
-        r_vox = max(1, int(np.ceil(self.inflation_radius / self.resolution)))
-        # Build spherical structuring element
-        diam = 2 * r_vox + 1
-        struct = np.zeros((diam, diam, diam), dtype=bool)
-        c = r_vox
-        for dx in range(-r_vox, r_vox + 1):
-            for dy in range(-r_vox, r_vox + 1):
-                for dz in range(-r_vox, r_vox + 1):
-                    if dx * dx + dy * dy + dz * dz <= r_vox * r_vox:
-                        struct[c + dx, c + dy, c + dz] = True
-
-        self.inflated = ndimage.binary_dilation(self.occupied, structure=struct)
-        n_occ = int(self.occupied.sum())
-        n_inf = int(self.inflated.sum())
-        print(f"  [VoxelMap] Occupied voxels: {n_occ:,}  |  Inflated: {n_inf:,}  "
-              f"(r={self.inflation_radius} m, {r_vox} vox)")
-
-    # ── Query helpers ─────────────────────────────────────────────────────
-
-    def world_to_grid(self, x: float, y: float, z: float) -> tuple[int, int, int]:
-        res = self.resolution
-        ix = int(np.clip(int((x - self.origin[0]) / res), 0, self.nx - 1))
-        iy = int(np.clip(int((y - self.origin[1]) / res), 0, self.ny - 1))
-        iz = int(np.clip(int((z - self.origin[2]) / res), 0, self.nz - 1))
-        return ix, iy, iz
-
-    def grid_to_world(self, ix: int, iy: int, iz: int) -> np.ndarray:
-        return self.origin + np.array([ix + 0.5, iy + 0.5, iz + 0.5]) * self.resolution
-
-    def is_occupied(self, x: float, y: float, z: float) -> bool:
-        """Check the *raw* occupied grid (no inflation)."""
-        ix, iy, iz = self.world_to_grid(x, y, z)
-        return bool(self.occupied[ix, iy, iz])
-
-    def is_collision(self, x: float, y: float, z: float) -> bool:
-        """Check the *inflated* collision grid."""
-        ix, iy, iz = self.world_to_grid(x, y, z)
-        return bool(self.inflated[ix, iy, iz])
-
-    def in_bounds(self, x: float, y: float, z: float) -> bool:
-        """True if the point falls inside the grid's bounding box."""
-        return (self.origin[0] <= x <= self.origin[0] + self.nx * self.resolution
-                and self.origin[1] <= y <= self.origin[1] + self.ny * self.resolution
-                and self.origin[2] <= z <= self.origin[2] + self.nz * self.resolution)
-
-    @property
-    def bounds_min(self) -> np.ndarray:
-        return self.origin.copy()
-
-    @property
-    def bounds_max(self) -> np.ndarray:
-        return self.origin + np.array([self.nx, self.ny, self.nz]) * self.resolution
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# OMPL Planner
-# ══════════════════════════════════════════════════════════════════════════════
-
-class OMPLPlanner:
-    """OMPL-based 3-D path planner using RRT* with a VoxelMap for collision.
-
-    Unknown space (outside the map or not yet mapped) is treated as
-    **free**, so the planner can operate with partial / expanding maps.
-
-    Parameters
-    ----------
-    voxel_map : VoxelMap
-        The occupancy grid to collision-check against.
+        Safety margin (metres) inflated around occupied voxels.
     planner_type : str
-        OMPL planner name: ``"RRTstar"``, ``"RRTConnect"``, ``"BITstar"``, etc.
+        OMPL planner algorithm.  ``"ABITstar"`` (near-optimal, fast) is
+        the default.  Other options: ``"RRTstar"``, ``"RRTConnect"``
+        (fastest but non-optimal), ``"BITstar"``, ``"InformedRRTstar"``.
     solve_timeout : float
-        Maximum seconds for the planner to search per query.
-    path_resolution : float
-        Interpolation resolution (metres) for collision checking along edges.
+        Maximum time (seconds) for a single planning query.  Anytime
+        planners stop early once a first feasible solution is found, then
+        refine for up to ``refine_time`` additional seconds.
+    refine_time : float
+        Time (seconds) for optional post-solve path refinement.
+    ground_z : float
+        Maximum allowed NED Z (more positive = deeper underground).
+        States below this are always invalid.  Set to ``np.inf`` to disable.
+    simplify_time : float
+        Time limit (seconds) for OMPL path simplification.
+    range_m : float
+        Maximum edge length for tree-based planners (metres).
     """
 
     def __init__(
         self,
-        voxel_map: VoxelMap,
-        planner_type: str = "RRTstar",
-        solve_timeout: float = 5.0,
-        path_resolution: float = 0.25,
-        bounds_padding: float = 20.0,
+        inflation_radius: float = 1.5,
+        planner_type: str = "ABITstar",
+        solve_timeout: float = 2.0,
+        refine_time: float = 0.5,
+        ground_z: float = 0.0,
+        simplify_time: float = 0.5,
+        range_m: float = 5.0,
     ):
-        self.vmap = voxel_map
+        self.inflation_radius = inflation_radius
         self.planner_type = planner_type
         self.solve_timeout = solve_timeout
-        self.path_resolution = path_resolution
-        self.bounds_padding = bounds_padding
+        self.refine_time = refine_time
+        self.ground_z = ground_z
+        self.simplify_time = simplify_time
+        self.range_m = range_m
 
-        # Build OMPL state space — padded well beyond the map so the
-        # drone's actual position is always inside the valid state space.
-        # The validity checker already treats out-of-map space as free.
-        self._space = ob.RealVectorStateSpace(3)
-        self._apply_bounds()
+        # Map state (set by update_map)
+        self._traversable: np.ndarray | None = None   # observed & ~inflated
+        self._occupied_grid: np.ndarray | None = None  # raw occupied
+        self._observed_grid: np.ndarray | None = None  # raw observed
+        self._inflated_grid: np.ndarray | None = None  # inflated occupied
+        self._origin = np.zeros(3, dtype=np.float64)
+        self._resolution: float = 1.0
+        self._nx = self._ny = self._nz = 0
 
-        # Space information + validity checker
-        self._si = ob.SpaceInformation(self._space)
-        self._si.setStateValidityChecker(ob.StateValidityCheckerFn(self._is_valid))
-        self._si.setStateValidityCheckingResolution(
-            path_resolution / self._space.getMaximumExtent()
-        )
-        self._si.setup()
+        # Raw occupied points (world frame) — kept for viewer display
+        self._points: np.ndarray = np.empty((0, 3), dtype=np.float32)
 
-    def _apply_bounds(self) -> None:
-        """Set OMPL state-space bounds = map bounds + generous padding."""
-        bounds = ob.RealVectorBounds(3)
-        bmin = self.vmap.bounds_min
-        bmax = self.vmap.bounds_max
-        pad = self.bounds_padding
-        for i in range(3):
-            bounds.setLow(i, float(bmin[i]) - pad)
-            bounds.setHigh(i, float(bmax[i]) + pad)
-        self._space.setBounds(bounds)
-        lo = [float(bmin[i]) - pad for i in range(3)]
-        hi = [float(bmax[i]) + pad for i in range(3)]
-        print(f"  [OMPL] State space bounds: "
-              f"({lo[0]:.1f}..{hi[0]:.1f}, {lo[1]:.1f}..{hi[1]:.1f}, {lo[2]:.1f}..{hi[2]:.1f})")
+        # OMPL internals (built on first update_map)
+        self._space: ob.RealVectorStateSpace | None = None
+        self._si: ob.SpaceInformation | None = None
 
-    def _is_valid(self, state) -> bool:
-        """OMPL state validity checker — free if NOT in the inflated grid.
+    # ── Map update ────────────────────────────────────────────────────────
 
-        Points outside the known map are treated as free (optimistic for
-        exploration into unknown space).
+    def update_map(
+        self,
+        observed: np.ndarray,
+        occupied: np.ndarray,
+        origin: np.ndarray | tuple | list,
+        resolution: float,
+    ) -> None:
+        """Update the planner's map from three-state voxel grids.
+
+        Call this whenever the SLAM map changes (new scans registered).
+        The method re-inflates occupied voxels and rebuilds the OMPL
+        state space.
+
+        Parameters
+        ----------
+        observed : bool ndarray, shape (nx, ny, nz)
+            True for voxels that have been observed by the sensor.
+        occupied : bool ndarray, shape (nx, ny, nz)
+            True for voxels that contain obstacles.  Should generally be
+            a subset of *observed*, though this is not enforced.
+        origin : array-like, shape (3,)
+            World-frame NED position of the grid's minimum corner
+            ``(x_min, y_min, z_min)``.
+        resolution : float
+            Voxel edge length in metres.
         """
-        x, y, z = state[0], state[1], state[2]
-        if not self.vmap.in_bounds(x, y, z):
-            return True  # unknown / out-of-map → optimistically free
-        return not self.vmap.is_collision(x, y, z)
+        self._observed_grid = np.asarray(observed, dtype=bool)
+        self._occupied_grid = np.asarray(occupied, dtype=bool)
+        self._origin = np.asarray(origin, dtype=np.float64).ravel()[:3]
+        self._resolution = float(resolution)
+        self._nx, self._ny, self._nz = self._observed_grid.shape
+
+        # Inflate occupied voxels with a spherical safety margin
+        self._inflate()
+
+        # Traversable = observed AND not in inflated obstacle zone
+        self._traversable = self._observed_grid & ~self._inflated_grid
+
+        # Rebuild OMPL state space and validity checker
+        self._build_ompl()
+
+        n_free = int(self._traversable.sum())
+        n_obs = int(self._observed_grid.sum())
+        n_occ = int(self._occupied_grid.sum())
+        n_total = self._nx * self._ny * self._nz
+        print(f"  [PathPlanner] Grid {self._nx}x{self._ny}x{self._nz} "
+              f"@ {resolution} m  |  observed {n_obs}/{n_total}  "
+              f"occ {n_occ}  free {n_free}")
+
+    # ── Path planning ─────────────────────────────────────────────────────
 
     def plan(
         self,
@@ -308,23 +174,25 @@ class OMPLPlanner:
         goal: np.ndarray,
         simplify: bool = True,
     ) -> np.ndarray | None:
-        """Plan a collision-free path from *start* to *goal*.
+        """Plan a collision-free path through known-free space.
 
         Parameters
         ----------
-        start, goal : ndarray, shape (3,)
-            World-frame positions (NED).
+        start, goal : array-like, shape (3,)
+            Start and goal positions in NED world frame.
         simplify : bool
-            If True, run OMPL's path simplifier to smooth/shorten the result.
+            Run OMPL's path simplifier to smooth/shorten the result.
 
         Returns
         -------
         ndarray, shape (N, 3) or None
-            Waypoints along the collision-free path, or ``None`` if planning fails.
+            Waypoints (NED) along the path, or ``None`` if no path is found.
         """
-        # Dynamically expand bounds if start or goal is outside
-        self._ensure_in_bounds(start)
-        self._ensure_in_bounds(goal)
+        if self._si is None:
+            raise RuntimeError("Call update_map() before plan()")
+
+        start = np.asarray(start, dtype=float).ravel()[:3]
+        goal = np.asarray(goal, dtype=float).ravel()[:3]
 
         pdef = ob.ProblemDefinition(self._si)
 
@@ -334,13 +202,32 @@ class OMPLPlanner:
         g[0], g[1], g[2] = float(goal[0]), float(goal[1]), float(goal[2])
 
         pdef.setStartAndGoalStates(s, g)
-        pdef.setOptimizationObjective(ob.PathLengthOptimizationObjective(self._si))
+        pdef.setOptimizationObjective(
+            ob.PathLengthOptimizationObjective(self._si))
 
         planner = self._make_planner()
         planner.setProblemDefinition(pdef)
         planner.setup()
 
-        solved = planner.solve(self.solve_timeout)
+        # ── Solve with early termination for anytime planners ────────
+        FEASIBILITY_PLANNERS = {"RRT", "RRTConnect", "PRM"}
+        try:
+            if self.planner_type in FEASIBILITY_PLANNERS:
+                solved = planner.solve(self.solve_timeout)
+            else:
+                # Phase 1: find ANY feasible solution (or timeout)
+                ptc_exact = ob.exactSolnPlannerTerminationCondition(pdef)
+                ptc_time = ob.timedPlannerTerminationCondition(
+                    self.solve_timeout)
+                ptc = ob.plannerOrTerminationCondition(ptc_exact, ptc_time)
+                solved = planner.solve(ptc)
+                # Phase 2: brief refinement
+                if solved:
+                    planner.solve(ob.timedPlannerTerminationCondition(
+                        min(self.refine_time, self.solve_timeout * 0.25)))
+        except (AttributeError, TypeError):
+            # Fallback if termination helpers are unavailable
+            solved = planner.solve(self.solve_timeout)
 
         if not solved:
             return None
@@ -349,176 +236,240 @@ class OMPLPlanner:
 
         if simplify:
             simplifier = og.PathSimplifier(self._si)
-            simplifier.simplifyMax(path)
+            simplifier.simplify(path, self.simplify_time)
 
         path.interpolate()   # densify for smooth flight
 
-        # Extract waypoints
         states = path.getStates()
-        waypoints = np.array([[st[0], st[1], st[2]] for st in states], dtype=np.float64)
-        return waypoints
+        return np.array([[st[0], st[1], st[2]] for st in states],
+                        dtype=np.float64)
+
+    # ── Query helpers ─────────────────────────────────────────────────────
+
+    def is_traversable(self, x: float, y: float, z: float) -> bool:
+        """True if the point is in known-free (observed & not inflated) space."""
+        if self._traversable is None:
+            return False
+        ix, iy, iz = self._world_to_grid_unchecked(x, y, z)
+        if not (0 <= ix < self._nx and 0 <= iy < self._ny
+                and 0 <= iz < self._nz):
+            return False
+        return bool(self._traversable[ix, iy, iz])
+
+    def is_collision(self, x: float, y: float, z: float) -> bool:
+        """True if the point is in the inflated-occupied zone."""
+        if self._inflated_grid is None:
+            return False
+        ix, iy, iz = self._world_to_grid_unchecked(x, y, z)
+        if not (0 <= ix < self._nx and 0 <= iy < self._ny
+                and 0 <= iz < self._nz):
+            return False
+        return bool(self._inflated_grid[ix, iy, iz])
+
+    def is_occupied(self, x: float, y: float, z: float) -> bool:
+        """True if the point is in a raw-occupied voxel (no inflation)."""
+        if self._occupied_grid is None:
+            return False
+        ix, iy, iz = self._world_to_grid_unchecked(x, y, z)
+        if not (0 <= ix < self._nx and 0 <= iy < self._ny
+                and 0 <= iz < self._nz):
+            return False
+        return bool(self._occupied_grid[ix, iy, iz])
+
+    def is_in_grid(self, x: float, y: float, z: float) -> bool:
+        """True if the point falls inside the grid's bounding box."""
+        o, r = self._origin, self._resolution
+        return (o[0] <= x < o[0] + self._nx * r
+                and o[1] <= y < o[1] + self._ny * r
+                and o[2] <= z < o[2] + self._nz * r)
+
+    def world_to_grid(
+        self, x: float, y: float, z: float,
+    ) -> tuple[int, int, int]:
+        """Convert world NED to grid indices (clipped to bounds)."""
+        res = self._resolution
+        ix = int(np.clip(int((x - self._origin[0]) / res), 0, self._nx - 1))
+        iy = int(np.clip(int((y - self._origin[1]) / res), 0, self._ny - 1))
+        iz = int(np.clip(int((z - self._origin[2]) / res), 0, self._nz - 1))
+        return ix, iy, iz
+
+    def grid_to_world(self, ix: int, iy: int, iz: int) -> np.ndarray:
+        """Convert grid indices to world NED (voxel centre)."""
+        return (self._origin
+                + np.array([ix + 0.5, iy + 0.5, iz + 0.5]) * self._resolution)
+
+    def find_nearest_free(
+        self, pos: np.ndarray, max_radius: float = 10.0,
+    ) -> np.ndarray | None:
+        """Find the nearest traversable point via expanding search.
+
+        Tries ascending first (most common escape in NED), then expands
+        in all directions.  Returns ``None`` if nothing found within
+        *max_radius*.
+        """
+        pos = np.asarray(pos, dtype=float).ravel()[:3]
+        step = self._resolution
+
+        for dz in np.arange(-step, -max_radius, -step):
+            cand = pos + np.array([0.0, 0.0, dz])
+            if self.is_traversable(*cand):
+                return cand
+
+        for r in np.arange(step, max_radius + step, step):
+            for dx in [-r, 0.0, r]:
+                for dy in [-r, 0.0, r]:
+                    for dz in [-r, 0.0, r]:
+                        if dx == 0 and dy == 0 and dz == 0:
+                            continue
+                        cand = pos + np.array([dx, dy, dz])
+                        if self.is_traversable(*cand):
+                            return cand
+        return None
+
+    # ── Properties ────────────────────────────────────────────────────────
+
+    @property
+    def origin(self) -> np.ndarray:
+        """Grid origin (minimum corner in world frame)."""
+        return self._origin.copy()
+
+    @property
+    def resolution(self) -> float:
+        """Grid voxel size in metres."""
+        return self._resolution
+
+    @property
+    def grid_shape(self) -> tuple[int, int, int]:
+        """Grid dimensions ``(nx, ny, nz)``."""
+        return (self._nx, self._ny, self._nz)
+
+    @property
+    def occupied(self) -> np.ndarray | None:
+        """Raw occupied grid ``(nx, ny, nz)`` — no inflation."""
+        return self._occupied_grid
+
+    @property
+    def observed(self) -> np.ndarray | None:
+        """Observed (sensor-covered) grid ``(nx, ny, nz)``."""
+        return self._observed_grid
+
+    @property
+    def traversable(self) -> np.ndarray | None:
+        """Traversable grid ``(nx, ny, nz)`` — observed & not inflated."""
+        return self._traversable
+
+    @property
+    def points(self) -> np.ndarray:
+        """Raw occupied points in world frame (for viewer display)."""
+        return self._points
+
+    @points.setter
+    def points(self, value: np.ndarray) -> None:
+        self._points = np.asarray(value, dtype=np.float32)
+
+    # ── Internal ──────────────────────────────────────────────────────────
+
+    def _world_to_grid_unchecked(
+        self, x: float, y: float, z: float,
+    ) -> tuple[int, int, int]:
+        """Convert world coords to grid indices without boundary clamping."""
+        res = self._resolution
+        return (int((x - self._origin[0]) / res),
+                int((y - self._origin[1]) / res),
+                int((z - self._origin[2]) / res))
+
+    def _inflate(self) -> None:
+        """Inflate occupied voxels by a spherical structuring element."""
+        from scipy import ndimage
+
+        r_vox = max(1, int(np.ceil(self.inflation_radius / self._resolution)))
+        diam = 2 * r_vox + 1
+        struct = np.zeros((diam, diam, diam), dtype=bool)
+        c = r_vox
+        for dx in range(-r_vox, r_vox + 1):
+            for dy in range(-r_vox, r_vox + 1):
+                for dz in range(-r_vox, r_vox + 1):
+                    if dx * dx + dy * dy + dz * dz <= r_vox * r_vox:
+                        struct[c + dx, c + dy, c + dz] = True
+
+        self._inflated_grid = ndimage.binary_dilation(
+            self._occupied_grid, structure=struct)
+
+    def _build_ompl(self) -> None:
+        """Build OMPL state space, bounds, and validity checker."""
+        self._space = ob.RealVectorStateSpace(3)
+
+        bounds = ob.RealVectorBounds(3)
+        pad = max(self._resolution * 4, 2.0)  # generous padding for edge overshoot
+        for i in range(3):
+            bounds.setLow(i, float(self._origin[i]) - pad)
+        bounds.setHigh(
+            0, float(self._origin[0]) + self._nx * self._resolution + pad)
+        bounds.setHigh(
+            1, float(self._origin[1]) + self._ny * self._resolution + pad)
+        z_max = (float(self._origin[2])
+                 + self._nz * self._resolution + pad)
+        bounds.setHigh(2, min(z_max, self.ground_z))
+
+        self._space.setBounds(bounds)
+
+        self._si = ob.SpaceInformation(self._space)
+        self._si.setStateValidityChecker(
+            ob.StateValidityCheckerFn(self._is_valid))
+        self._si.setStateValidityCheckingResolution(
+            self._resolution / self._space.getMaximumExtent())
+        self._si.setup()
+
+    def _is_valid(self, state) -> bool:
+        """OMPL validity checker — True only for known-free space."""
+        x, y, z = state[0], state[1], state[2]
+
+        # Ground plane constraint
+        if z > self.ground_z:
+            return False
+
+        # Grid index (no clamp)
+        res = self._resolution
+        ix = int((x - self._origin[0]) / res)
+        iy = int((y - self._origin[1]) / res)
+        iz = int((z - self._origin[2]) / res)
+
+        # Out of grid -> unknown -> invalid
+        if not (0 <= ix < self._nx and 0 <= iy < self._ny
+                and 0 <= iz < self._nz):
+            return False
+
+        return bool(self._traversable[ix, iy, iz])
 
     def _make_planner(self):
+        """Instantiate the configured OMPL planner."""
         planners = {
             "RRTstar": og.RRTstar,
             "RRTConnect": og.RRTConnect,
             "RRT": og.RRT,
             "PRM": og.PRM,
             "BITstar": og.BITstar,
+            "ABITstar": og.ABITstar,
+            "AITstar": og.AITstar,
             "InformedRRTstar": og.InformedRRTstar,
         }
         cls = planners.get(self.planner_type, og.RRTstar)
-        return cls(self._si)
-
-    def _ensure_in_bounds(self, point: np.ndarray) -> None:
-        """Expand OMPL bounds if *point* is outside the current state space."""
-        bounds = self._space.getBounds()
-        expanded = False
-        for i in range(3):
-            v = float(point[i])
-            if v < bounds.low[i]:
-                print(f"  [OMPL] Expanding axis {i} low: {bounds.low[i]:.2f} → {v - 5:.2f}")
-                bounds.setLow(i, v - 5.0)
-                expanded = True
-            if v > bounds.high[i]:
-                print(f"  [OMPL] Expanding axis {i} high: {bounds.high[i]:.2f} → {v + 5:.2f}")
-                bounds.setHigh(i, v + 5.0)
-                expanded = True
-        if expanded:
-            self._space.setBounds(bounds)
-            self._si.setup()
-
-    def rebuild(self) -> None:
-        """Rebuild OMPL internals after the VoxelMap has been updated.
-
-        Call this when the underlying map changes (e.g. new exploration data)
-        so the planner bounds and validity checker reflect the new geometry.
-        """
-        self._apply_bounds()
-        self._si.setup()
+        p = cls(self._si)
+        if hasattr(p, 'setRange'):
+            p.setRange(self.range_m)
+        return p
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Nearest free-space finder (for escaping from inside obstacles)
+# Path utilities
 # ══════════════════════════════════════════════════════════════════════════════
 
-def find_nearest_free(
-    vmap: VoxelMap,
-    pos: np.ndarray,
-    max_radius: float = 10.0,
-    step: float = 0.5,
-) -> np.ndarray | None:
-    """BFS-style search outward from *pos* to find the nearest collision-free point.
+def subsample_path(
+    waypoints: np.ndarray, min_spacing: float = 1.0,
+) -> np.ndarray:
+    """Sub-sample a dense path so consecutive waypoints are >= *min_spacing* apart.
 
-    Searches in a grid of ``step``-spaced candidates expanding in shells
-    of increasing radius.  Returns the nearest point that is inside the
-    map bounds and NOT in the inflated collision grid, or ``None`` if no
-    free point is found within ``max_radius``.
-    """
-    # Try going straight up first (most common escape)
-    for dz in np.arange(-step, -max_radius, -step):
-        cand = pos + np.array([0.0, 0.0, dz])
-        if not vmap.in_bounds(*cand) or not vmap.is_collision(*cand):
-            return cand
-
-    # Expand in axis-aligned directions
-    for r in np.arange(step, max_radius + step, step):
-        for dx in [-r, 0, r]:
-            for dy in [-r, 0, r]:
-                for dz in [-r, 0, r]:
-                    if dx == 0 and dy == 0 and dz == 0:
-                        continue
-                    cand = pos + np.array([dx, dy, dz])
-                    if not vmap.in_bounds(*cand):
-                        return cand  # out-of-map = free
-                    if not vmap.is_collision(*cand):
-                        return cand
-    return None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Goal sampler — random positions near obstacles
-# ══════════════════════════════════════════════════════════════════════════════
-
-def sample_near_obstacle_goal(
-    vmap: VoxelMap,
-    current_pos: np.ndarray,
-    min_dist_from_obstacle: float = 2.0,
-    max_dist_from_obstacle: float = 5.0,
-    min_dist_from_drone: float = 5.0,
-    max_attempts: int = 500,
-    rng: np.random.Generator | None = None,
-) -> np.ndarray | None:
-    """Sample a random collision-free goal near occupied voxels.
-
-    Strategy:
-    1. Pick a random occupied voxel.
-    2. Offset it by a random direction at a distance in
-       [min_dist_from_obstacle, max_dist_from_obstacle].
-    3. Verify the candidate is collision-free (inflated grid) and
-       at least ``min_dist_from_drone`` from the current position.
-
-    Returns None if no valid goal is found after ``max_attempts`` tries.
-    """
-    if rng is None:
-        rng = np.random.default_rng()
-
-    # Get indices of occupied voxels
-    occ_indices = np.argwhere(vmap.occupied)
-    if len(occ_indices) == 0:
-        return None
-
-    for _ in range(max_attempts):
-        # 1. Pick a random occupied voxel
-        idx = rng.integers(0, len(occ_indices))
-        occ_ijk = occ_indices[idx]
-        occ_world = vmap.grid_to_world(*occ_ijk)
-
-        # 2. Random offset direction
-        direction = rng.standard_normal(3)
-        direction /= np.linalg.norm(direction) + 1e-8
-        dist = rng.uniform(min_dist_from_obstacle, max_dist_from_obstacle)
-        candidate = occ_world + direction * dist
-
-        # 3. Must be inside the map bounds
-        if not vmap.in_bounds(*candidate):
-            continue
-
-        # 4. Must NOT be in the inflated collision zone
-        if vmap.is_collision(*candidate):
-            continue
-
-        # 5. Must be far enough from the drone
-        if np.linalg.norm(candidate - current_pos) < min_dist_from_drone:
-            continue
-
-        return candidate
-
-    return None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Flight executor — dynamics-based path following in Unreal Engine
-# ══════════════════════════════════════════════════════════════════════════════
-
-class FlightResult:
-    """Result of a single path-following flight."""
-    def __init__(self):
-        self.success: bool = False
-        self.collided: bool = False
-        self.collision_info: object | None = None
-        self.flight_time: float = 0.0
-        self.path_length: float = 0.0
-        self.arrival_error: float = 0.0
-        self.min_obstacle_clearance: float = float('inf')
-        self.trajectory: list[np.ndarray] = []  # actual positions over time
-
-
-def _subsample_path(waypoints: np.ndarray, min_spacing: float = 1.0) -> np.ndarray:
-    """Sub-sample a dense OMPL path so consecutive waypoints are ≥ min_spacing apart.
-
-    Always keeps the first and last waypoint. This avoids feeding hundreds
-    of closely-spaced points to moveOnPathAsync which can cause jittery flight.
+    Always keeps the first and last waypoint.
     """
     if len(waypoints) <= 2:
         return waypoints
@@ -531,292 +482,681 @@ def _subsample_path(waypoints: np.ndarray, min_spacing: float = 1.0) -> np.ndarr
     return np.array(kept)
 
 
-def fly_path_on_path(
-    client: airsim.MultirotorClient,
-    waypoints: np.ndarray,
-    velocity: float = 3.0,
-    lookahead: float = -1,
-    adaptive_lookahead: int = 1,
-    min_spacing: float = 1.0,
-    viewer: Viewer3D | None = None,
-    vmap: VoxelMap | None = None,
-    map_points: np.ndarray | None = None,
-    goal: np.ndarray | None = None,
-    poll_hz: float = 20.0,
-) -> FlightResult:
-    """Fly the drone through waypoints using AirSim's moveOnPathAsync.
+def straight_line_free(
+    planner: PathPlanner,
+    start: np.ndarray,
+    end: np.ndarray,
+    step: float = 0.3,
+) -> bool:
+    """True if the straight line from *start* to *end* is fully traversable.
 
-    This uses AirSim's built-in path-following controller which runs the
-    full multirotor dynamics simulation inside Unreal Engine — the drone
-    physically accelerates, banks, and decelerates through the waypoints.
+    Marches along the segment and checks each sample against the planner's
+    traversability grid.  Fails if any point is unknown, occupied, or in
+    the inflated zone.
+    """
+    diff = end - start
+    dist = np.linalg.norm(diff)
+    if dist < 1e-6:
+        return True
+    direction = diff / dist
+    n_samples = int(np.ceil(dist / step)) + 1
+    for i in range(n_samples):
+        t = min(i * step, dist)
+        pt = start + direction * t
+        if not planner.is_traversable(*pt):
+            return False
+    return True
 
-    During flight the function polls the drone's actual position at
-    ``poll_hz`` to:
-    - Update the 3-D viewer with the real trajectory
-    - Monitor for collisions via ``simGetCollisionInfo``
-    - Track minimum clearance to known obstacles
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GPS-based drone localisation (no cosysairsim import needed)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def gps_to_ned(
+    gps_lat: float, gps_lon: float, gps_alt: float,
+    home_lat: float, home_lon: float, home_alt: float,
+) -> np.ndarray:
+    """Convert GPS geodetic coordinates to local NED relative to *home*.
+
+    Uses a flat-earth approximation with the WGS-84 semi-major axis.
+    """
+    R_EARTH = 6_378_137.0
+    d_lat = math.radians(gps_lat - home_lat)
+    d_lon = math.radians(gps_lon - home_lon)
+    north = d_lat * R_EARTH
+    east = d_lon * R_EARTH * math.cos(math.radians(home_lat))
+    down = -(gps_alt - home_alt)
+    return np.array([north, east, down])
+
+
+def get_drone_position(client: airsim.MultirotorClient) -> np.ndarray:
+    """Return the drone's NED position derived from its simulated GPS."""
+    home = client.getHomeGeoPoint()
+    gps = client.getGpsData().gnss.geo_point
+    return gps_to_ned(
+        gps.latitude, gps.longitude, gps.altitude,
+        home.latitude, home.longitude, home.altitude,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Flight executors (require cosysairsim at call time)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class FlightResult:
+    """Result of a single path-following flight."""
+    def __init__(self):
+        self.success: bool = False
+        self.collided: bool = False
+        self.collision_info: object | None = None
+        self.flight_time: float = 0.0
+        self.path_length: float = 0.0
+        self.arrival_error: float = 0.0
+        self.min_obstacle_clearance: float = float('inf')
+        self.trajectory: list[np.ndarray] = []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PathFollower — threaded path executor
+# ══════════════════════════════════════════════════════════════════════════════
+
+import threading
+from enum import Enum, auto
+from typing import Callable
+
+
+class FollowerState(Enum):
+    """Current state of the PathFollower."""
+    IDLE = auto()       # No path; hovering or waiting
+    FOLLOWING = auto()  # Actively flying a path
+    ARRIVED = auto()    # Reached the last waypoint
+    PREEMPTED = auto()  # Path was replaced before completion
+    STOPPED = auto()    # Follower thread shut down
+
+
+class PathFollower:
+    """Threaded path-following executor for AirSim drones.
+
+    Runs its own background thread that autonomously follows waypoint
+    paths using either ``moveOnPathAsync`` or pure-pursuit velocity
+    control.  New paths can be submitted at any time, preempting the
+    current one.
+
+    Quick usage::
+
+        follower = PathFollower(client, planner, mode="velocity")
+        follower.start()
+
+        # Submit a path (non-blocking — returns immediately)
+        follower.follow(waypoints, goal=goal_pos)
+
+        # Meanwhile the main thread can do SLAM, replan, etc.
+        while follower.state == FollowerState.FOLLOWING:
+            buf.process_once()
+            time.sleep(0.01)
+
+        result = follower.last_result
+
+        # Submit a new path (preempts if still flying)
+        follower.follow(new_waypoints, goal=new_goal)
+
+        # When done:
+        follower.stop()
 
     Parameters
     ----------
-    client : MultirotorClient
-        Connected and armed AirSim client.
-    waypoints : ndarray (N, 3)
-        Path waypoints in NED world frame (from OMPL planner).
+    client : airsim.MultirotorClient
+        Connected AirSim client (must already have API control).
+    planner : PathPlanner | None
+        If provided, used for collision/clearance monitoring.
+    mode : str
+        ``"path"`` for ``moveOnPathAsync``, ``"velocity"`` for
+        pure-pursuit velocity control.
     velocity : float
-        Desired cruise speed in m/s.
-    lookahead / adaptive_lookahead
-        AirSim path-following parameters.  -1 = auto lookahead.
-    min_spacing : float
-        Minimum distance (m) between consecutive waypoints sent to AirSim.
-    viewer : Viewer3D or None
-        If provided, the drone position is updated in real-time.
-    vmap : VoxelMap or None
-        If provided, obstacle clearance is tracked during flight.
-    map_points : ndarray or None
-        The voxel map points for viewer updates.
-    goal : ndarray or None
-        Current goal for viewer target marker.
+        Target flight speed (m/s).
+    arrival_threshold : float
+        Distance (m) to final waypoint to count as arrived.
     poll_hz : float
-        How often (Hz) to poll position/collision during flight.
-
-    Returns
-    -------
-    FlightResult
-        Detailed result including collision info and actual trajectory.
+        Control loop frequency (Hz).
+    min_spacing : float
+        Minimum spacing between waypoints after sub-sampling.
+    viewer : object | None
+        Optional ``Viewer3D`` for real-time display updates.
+    on_tick : callable | None
+        Called once per control tick with signature
+        ``on_tick(pos: np.ndarray, follower: PathFollower)``.
+        Use this for SLAM scan collection or any per-tick work.
     """
-    result = FlightResult()
-    result.path_length = float(np.sum(np.linalg.norm(np.diff(waypoints, axis=0), axis=1)))
 
-    # Sub-sample for smooth dynamics
-    wps = _subsample_path(waypoints, min_spacing=min_spacing)
+    def __init__(
+        self,
+        client,
+        planner: PathPlanner | None = None,
+        mode: str = "velocity",
+        velocity: float = 3.0,
+        arrival_threshold: float = 1.5,
+        poll_hz: float = 20.0,
+        min_spacing: float = 1.0,
+        viewer=None,
+        on_tick: Callable[[np.ndarray, 'PathFollower'], None] | None = None,
+    ):
+        self.client = client
+        self.planner = planner
+        self.mode = mode
+        self.velocity = velocity
+        self.arrival_threshold = arrival_threshold
+        self.poll_hz = poll_hz
+        self.min_spacing = min_spacing
+        self.viewer = viewer
+        self.on_tick = on_tick
 
-    # Build AirSim Vector3r path
-    path_vec = [airsim.Vector3r(float(wp[0]), float(wp[1]), float(wp[2])) for wp in wps]
+        # ── Thread state ──────────────────────────────────────────────
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._new_path_event = threading.Event()
+        self._stop_event = threading.Event()
+        self._done_event = threading.Event()
+        self._done_event.set()  # initially "done" (no flight pending)
 
-    # Configure yaw to face direction of travel
-    yaw_mode = airsim.YawMode(is_rate=False, yaw_or_rate=0)
+        # Current mission (protected by _lock)
+        self._waypoints: np.ndarray | None = None
+        self._goal: np.ndarray | None = None
+        self._map_points: np.ndarray | None = None
+        self._preempt = False
 
-    # Compute a generous timeout from path length + margin
-    timeout_sec = max(result.path_length / max(velocity, 0.5) * 3.0, 30.0)
+        # Public readable state
+        self._state = FollowerState.IDLE
+        self._last_result: FlightResult | None = None
+        self._position: np.ndarray = np.zeros(3)
 
-    t0 = time.time()
-    poll_interval = 1.0 / poll_hz
+    # ── Properties ────────────────────────────────────────────────────
 
-    # Reset collision state
-    client.simGetCollisionInfo()
+    @property
+    def state(self) -> FollowerState:
+        """Current follower state (thread-safe read)."""
+        return self._state
 
-    # Launch the path-following task (non-blocking)
-    future = client.moveOnPathAsync(
-        path_vec,
-        velocity=velocity,
-        timeout_sec=timeout_sec,
-        drivetrain=airsim.DrivetrainType.ForwardOnly,
-        yaw_mode=yaw_mode,
-        lookahead=lookahead,
-        adaptive_lookahead=adaptive_lookahead,
-    )
+    @property
+    def last_result(self) -> FlightResult | None:
+        """Result from the most recently completed (or preempted) path."""
+        return self._last_result
 
-    # ── Real-time monitoring loop ────────────────────────────────────
-    while not future._set_flag:
-        pos = get_drone_position(client)
-        result.trajectory.append(pos.copy())
+    @property
+    def position(self) -> np.ndarray:
+        """Most recent drone position (NED), updated each tick."""
+        return self._position.copy()
 
-        # Collision check
-        cinfo = client.simGetCollisionInfo()
-        if cinfo.has_collided:
-            result.collided = True
-            result.collision_info = cinfo
-            print(f"    !! COLLISION with '{cinfo.object_name}' "
-                  f"at ({cinfo.position.x_val:.1f}, {cinfo.position.y_val:.1f}, "
-                  f"{cinfo.position.z_val:.1f})")
+    @property
+    def is_busy(self) -> bool:
+        """True if actively following a path."""
+        return self._state == FollowerState.FOLLOWING
 
-        # Obstacle clearance (check against raw occupied grid)
-        if vmap is not None and vmap.in_bounds(*pos):
-            ix, iy, iz = vmap.world_to_grid(*pos)
-            if vmap.is_collision(*pos):
-                result.min_obstacle_clearance = 0.0
-            else:
-                # Approximate clearance: distance to nearest occupied voxel
-                # in a small neighbourhood (fast local check)
-                r = 5  # check 5-voxel radius
-                xlo = max(0, ix - r); xhi = min(vmap.nx, ix + r + 1)
-                ylo = max(0, iy - r); yhi = min(vmap.ny, iy + r + 1)
-                zlo = max(0, iz - r); zhi = min(vmap.nz, iz + r + 1)
-                local_occ = vmap.occupied[xlo:xhi, ylo:yhi, zlo:zhi]
-                if local_occ.any():
-                    occ_local = np.argwhere(local_occ)
-                    occ_local[:, 0] += xlo
-                    occ_local[:, 1] += ylo
-                    occ_local[:, 2] += zlo
-                    occ_world = np.column_stack([
-                        vmap.origin[0] + (occ_local[:, 0] + 0.5) * vmap.resolution,
-                        vmap.origin[1] + (occ_local[:, 1] + 0.5) * vmap.resolution,
-                        vmap.origin[2] + (occ_local[:, 2] + 0.5) * vmap.resolution,
-                    ])
-                    dists = np.linalg.norm(occ_world - pos, axis=1)
-                    clearance = float(dists.min())
-                    result.min_obstacle_clearance = min(result.min_obstacle_clearance, clearance)
+    # ── Lifecycle ─────────────────────────────────────────────────────
 
-        # Update viewer
-        if viewer is not None and map_points is not None:
-            viewer.update(
-                map_points,
-                drone_pos=pos,
-                target_pos=goal,
-                frontier_points=waypoints,  # show planned path as overlay
-            )
+    def start(self) -> None:
+        """Start the background follower thread."""
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._state = FollowerState.IDLE
+        self._thread = threading.Thread(
+            target=self._run_loop, name="PathFollower", daemon=True)
+        self._thread.start()
 
-        time.sleep(poll_interval)
+    def stop(self, timeout: float = 5.0) -> None:
+        """Signal the follower to stop and wait for the thread to exit."""
+        self._stop_event.set()
+        self._new_path_event.set()  # wake the thread if it's waiting
+        self._done_event.set()     # unblock any pending wait()
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+        self._state = FollowerState.STOPPED
 
-    result.flight_time = time.time() - t0
+    def follow(
+        self,
+        waypoints: np.ndarray,
+        goal: np.ndarray | None = None,
+        map_points: np.ndarray | None = None,
+    ) -> None:
+        """Submit a new path to follow (non-blocking, preempts current).
 
-    # Final position
-    final_pos = get_drone_position(client)
-    result.trajectory.append(final_pos.copy())
-    result.arrival_error = float(np.linalg.norm(final_pos - waypoints[-1]))
-    result.success = (result.arrival_error < 3.0 and not result.collided)
+        Parameters
+        ----------
+        waypoints : ndarray (N, 3)
+            Waypoints in NED world frame.
+        goal : ndarray (3,) | None
+            Final goal position (for viewer display; defaults to last wp).
+        map_points : ndarray (M, 3) | None
+            Occupied points for viewer display.  If ``None`` and a planner
+            is set, uses ``planner.points``.
+        """
+        waypoints = np.asarray(waypoints, dtype=np.float64)
+        if goal is None:
+            goal = waypoints[-1].copy()
+        if map_points is None and self.planner is not None:
+            map_points = self.planner.points
 
-    return result
+        self._done_event.clear()
+        with self._lock:
+            self._waypoints = waypoints
+            self._goal = goal
+            self._map_points = map_points
+            self._preempt = True
+        self._state = FollowerState.FOLLOWING
+        self._new_path_event.set()
 
+    def wait(self, timeout: float | None = None) -> FlightResult | None:
+        """Block until the current path completes or is preempted.
 
-def fly_path_velocity(
-    client: airsim.MultirotorClient,
-    waypoints: np.ndarray,
-    velocity: float = 3.0,
-    arrival_threshold: float = 1.5,
-    min_spacing: float = 1.0,
-    viewer: Viewer3D | None = None,
-    vmap: VoxelMap | None = None,
-    map_points: np.ndarray | None = None,
-    goal: np.ndarray | None = None,
-    poll_hz: float = 20.0,
-) -> FlightResult:
-    """Pure-pursuit velocity controller — fly the path using moveByVelocityAsync.
+        Returns the ``FlightResult``, or ``None`` on timeout.
+        """
+        if not self._done_event.wait(timeout=timeout):
+            return None  # timed out
+        return self._last_result
 
-    This is a fallback/alternative to moveOnPathAsync that gives more explicit
-    control over the drone's velocity vector.  At each step the controller
-    computes a velocity toward the next waypoint, advancing to the following
-    waypoint when within ``arrival_threshold``.
+    # ── Main thread loop ─────────────────────────────────────────────
 
-    The drone physically simulates all dynamics in Unreal Engine.
-    """
-    result = FlightResult()
-    result.path_length = float(np.sum(np.linalg.norm(np.diff(waypoints, axis=0), axis=1)))
+    def _run_loop(self) -> None:
+        """Background thread: wait for paths, fly them, repeat."""
+        # AirSim's msgpack-rpc client binds its asyncio transport to
+        # the event loop of the thread that created it.  A background
+        # thread therefore needs its OWN client connection.
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
-    wps = _subsample_path(waypoints, min_spacing=min_spacing)
-    poll_interval = 1.0 / poll_hz
-    cmd_duration = poll_interval * 3  # velocity command duration
+        import cosysairsim as airsim
+        self._thread_client = airsim.MultirotorClient()
+        self._thread_client.confirmConnection()
+        self._thread_client.enableApiControl(True)
+        self._thread_client.armDisarm(True)
+        print("  [PathFollower] Thread-local AirSim client connected")
 
-    t0 = time.time()
-    wp_idx = 0
+        while not self._stop_event.is_set():
+            # Wait for a path or stop signal
+            self._new_path_event.wait(timeout=0.5)
+            self._new_path_event.clear()
 
-    client.simGetCollisionInfo()  # reset
+            if self._stop_event.is_set():
+                break
 
-    while wp_idx < len(wps):
-        pos = get_drone_position(client)
-        result.trajectory.append(pos.copy())
+            # Grab the pending path
+            with self._lock:
+                if self._waypoints is None:
+                    continue
+                waypoints = self._waypoints.copy()
+                goal = self._goal.copy() if self._goal is not None else None
+                map_points = (self._map_points.copy()
+                              if self._map_points is not None else None)
+                self._waypoints = None
+                self._preempt = False
 
-        target_wp = wps[wp_idx]
-        to_target = target_wp - pos
-        dist = np.linalg.norm(to_target)
+            self._state = FollowerState.FOLLOWING
 
-        # Advance to next waypoint if close enough
-        if dist < arrival_threshold and wp_idx < len(wps) - 1:
-            wp_idx += 1
+            try:
+                if self.mode == "path":
+                    result = self._fly_on_path(waypoints, goal, map_points)
+                else:
+                    result = self._fly_velocity(waypoints, goal, map_points)
+            except Exception as e:
+                print(f"  [PathFollower] Flight error: {e}")
+                result = FlightResult()
+
+            self._last_result = result
+
+            # Was this preempted? (a new path arrived mid-flight)
+            with self._lock:
+                if self._preempt or self._waypoints is not None:
+                    self._state = FollowerState.PREEMPTED
+                    self._done_event.set()
+                    continue
+
+            self._state = (FollowerState.ARRIVED if result.success
+                           else FollowerState.IDLE)
+            self._done_event.set()
+
+    # ── Flight implementations ───────────────────────────────────────
+
+    def _fly_on_path(
+        self, waypoints: np.ndarray, goal: np.ndarray | None,
+        map_points: np.ndarray | None,
+    ) -> FlightResult:
+        """Follow waypoints using ``moveOnPathAsync``."""
+        import cosysairsim as airsim
+
+        result = FlightResult()
+        result.path_length = float(np.sum(np.linalg.norm(
+            np.diff(waypoints, axis=0), axis=1)))
+
+        wps = subsample_path(waypoints, min_spacing=self.min_spacing)
+        path_vec = [airsim.Vector3r(float(wp[0]), float(wp[1]), float(wp[2]))
+                    for wp in wps]
+        yaw_mode = airsim.YawMode(is_rate=False, yaw_or_rate=0)
+        timeout_sec = max(
+            result.path_length / max(self.velocity, 0.5) * 3.0, 30.0)
+
+        poll_interval = 1.0 / self.poll_hz
+        t0 = time.time()
+
+        self._thread_client.simGetCollisionInfo()  # reset
+
+        future = self._thread_client.moveOnPathAsync(
+            path_vec, velocity=self.velocity, timeout_sec=timeout_sec,
+            drivetrain=airsim.DrivetrainType.ForwardOnly,
+            yaw_mode=yaw_mode, lookahead=-1, adaptive_lookahead=1,
+        )
+
+        while not future._set_flag:
+            if self._stop_event.is_set() or self._preempt_check():
+                try:
+                    self._thread_client.cancelLastTask()
+                except Exception:
+                    self._thread_client.moveByVelocityAsync(0, 0, 0, 1).join()
+                break
+
+            pos = get_drone_position(self._thread_client)
+            self._position = pos
+            result.trajectory.append(pos.copy())
+
+            self._check_collision(result)
+            self._track_clearance(result, pos)
+            self._update_viewer(pos, goal, map_points, waypoints)
+
+            if self.on_tick is not None:
+                try:
+                    self.on_tick(pos, self)
+                except Exception:
+                    pass
+
+            time.sleep(poll_interval)
+
+        result.flight_time = time.time() - t0
+        final_pos = get_drone_position(self._thread_client)
+        self._position = final_pos
+        result.trajectory.append(final_pos.copy())
+        result.arrival_error = float(np.linalg.norm(final_pos - wps[-1]))
+        result.success = (result.arrival_error < self.arrival_threshold * 2
+                          and not result.collided)
+        return result
+
+    def _fly_velocity(
+        self, waypoints: np.ndarray, goal: np.ndarray | None,
+        map_points: np.ndarray | None,
+    ) -> FlightResult:
+        """Follow waypoints using pure-pursuit velocity commands."""
+        import cosysairsim as airsim
+
+        result = FlightResult()
+        result.path_length = float(np.sum(np.linalg.norm(
+            np.diff(waypoints, axis=0), axis=1)))
+
+        wps = subsample_path(waypoints, min_spacing=self.min_spacing)
+        poll_interval = 1.0 / self.poll_hz
+        cmd_duration = poll_interval * 3
+
+        t0 = time.time()
+        wp_idx = 0
+        self._thread_client.simGetCollisionInfo()
+
+        while wp_idx < len(wps):
+            if self._stop_event.is_set() or self._preempt_check():
+                break
+
+            pos = get_drone_position(self._thread_client)
+            self._position = pos
+            result.trajectory.append(pos.copy())
+
             target_wp = wps[wp_idx]
             to_target = target_wp - pos
             dist = np.linalg.norm(to_target)
 
-        # Final waypoint — tighter threshold
-        if wp_idx == len(wps) - 1 and dist < arrival_threshold * 0.5:
-            break
+            if dist < self.arrival_threshold and wp_idx < len(wps) - 1:
+                wp_idx += 1
+                target_wp = wps[wp_idx]
+                to_target = target_wp - pos
+                dist = np.linalg.norm(to_target)
 
-        # Velocity toward target (scale speed by distance for smooth decel)
-        speed = min(velocity, max(dist * 0.8, 0.5))
-        direction = to_target / max(dist, 1e-6)
-        vx, vy, vz = direction * speed
+            if (wp_idx == len(wps) - 1
+                    and dist < self.arrival_threshold * 0.5):
+                break
 
-        # Yaw toward direction of travel
-        yaw_deg = float(np.degrees(np.arctan2(vy, vx)))
-        yaw_mode = airsim.YawMode(is_rate=False, yaw_or_rate=yaw_deg)
+            speed = min(self.velocity, max(dist * 0.8, 0.5))
+            direction = to_target / max(dist, 1e-6)
+            vx, vy, vz = direction * speed
 
-        client.moveByVelocityAsync(
-            float(vx), float(vy), float(vz),
-            duration=cmd_duration,
-            drivetrain=airsim.DrivetrainType.MaxDegreeOfFreedom,
-            yaw_mode=yaw_mode,
-        )
+            yaw_deg = float(np.degrees(np.arctan2(vy, vx)))
+            yaw_mode = airsim.YawMode(is_rate=False, yaw_or_rate=yaw_deg)
 
-        # Collision check
-        cinfo = client.simGetCollisionInfo()
+            self._thread_client.moveByVelocityAsync(
+                float(vx), float(vy), float(vz),
+                duration=cmd_duration,
+                drivetrain=airsim.DrivetrainType.MaxDegreeOfFreedom,
+                yaw_mode=yaw_mode,
+            )
+
+            self._check_collision(result)
+            self._track_clearance(result, pos)
+            self._update_viewer(pos, goal, map_points, waypoints)
+
+            if self.on_tick is not None:
+                try:
+                    self.on_tick(pos, self)
+                except Exception:
+                    pass
+
+            if (time.time() - t0
+                    > result.path_length / max(self.velocity, 0.5) * 5 + 60):
+                print("    !! Flight timeout")
+                break
+
+            time.sleep(poll_interval)
+
+        self._thread_client.moveByVelocityAsync(0, 0, 0, duration=1.0).join()
+
+        result.flight_time = time.time() - t0
+        final_pos = get_drone_position(self._thread_client)
+        self._position = final_pos
+        result.trajectory.append(final_pos.copy())
+        result.arrival_error = float(np.linalg.norm(final_pos - wps[-1]))
+        result.success = (result.arrival_error < self.arrival_threshold * 2
+                          and not result.collided)
+        return result
+
+    # ── Helpers ───────────────────────────────────────────────────────
+
+    def _preempt_check(self) -> bool:
+        """True if a new path has been submitted (should preempt)."""
+        with self._lock:
+            return self._preempt or self._waypoints is not None
+
+    def _check_collision(self, result: FlightResult) -> None:
+        cinfo = self._thread_client.simGetCollisionInfo()
         if cinfo.has_collided:
             result.collided = True
             result.collision_info = cinfo
             print(f"    !! COLLISION with '{cinfo.object_name}' "
-                  f"at ({cinfo.position.x_val:.1f}, {cinfo.position.y_val:.1f}, "
+                  f"at ({cinfo.position.x_val:.1f}, "
+                  f"{cinfo.position.y_val:.1f}, "
                   f"{cinfo.position.z_val:.1f})")
 
-        # Obstacle clearance
-        if vmap is not None and vmap.in_bounds(*pos):
-            if vmap.is_collision(*pos):
-                result.min_obstacle_clearance = 0.0
+    def _track_clearance(
+        self, result: FlightResult, pos: np.ndarray,
+    ) -> None:
+        planner = self.planner
+        if planner is None or not planner.is_in_grid(*pos):
+            return
+        if planner.is_collision(*pos):
+            result.min_obstacle_clearance = 0.0
+            return
+        ix, iy, iz = planner.world_to_grid(*pos)
+        nx, ny, nz = planner.grid_shape
+        occ = planner.occupied
+        if occ is None:
+            return
+        r = 5
+        xlo, xhi = max(0, ix - r), min(nx, ix + r + 1)
+        ylo, yhi = max(0, iy - r), min(ny, iy + r + 1)
+        zlo, zhi = max(0, iz - r), min(nz, iz + r + 1)
+        local_occ = occ[xlo:xhi, ylo:yhi, zlo:zhi]
+        if not local_occ.any():
+            return
+        occ_local = np.argwhere(local_occ)
+        occ_local[:, 0] += xlo
+        occ_local[:, 1] += ylo
+        occ_local[:, 2] += zlo
+        orig = planner.origin
+        res = planner.resolution
+        occ_world = np.column_stack([
+            orig[0] + (occ_local[:, 0] + 0.5) * res,
+            orig[1] + (occ_local[:, 1] + 0.5) * res,
+            orig[2] + (occ_local[:, 2] + 0.5) * res,
+        ])
+        clearance = float(np.linalg.norm(occ_world - pos, axis=1).min())
+        result.min_obstacle_clearance = min(
+            result.min_obstacle_clearance, clearance)
 
-        # Update viewer
-        if viewer is not None and map_points is not None:
-            viewer.update(
-                map_points,
-                drone_pos=pos,
-                target_pos=goal,
-                frontier_points=waypoints,
-            )
-
-        # Timeout safety
-        if time.time() - t0 > result.path_length / max(velocity, 0.5) * 5.0 + 60:
-            print("    !! Flight timeout")
-            break
-
-        time.sleep(poll_interval)
-
-    # Stop the drone
-    client.moveByVelocityAsync(0, 0, 0, duration=1.0).join()
-
-    result.flight_time = time.time() - t0
-    final_pos = get_drone_position(client)
-    result.trajectory.append(final_pos.copy())
-    result.arrival_error = float(np.linalg.norm(final_pos - wps[-1]))
-    result.success = (result.arrival_error < 3.0 and not result.collided)
-
-    return result
+    def _update_viewer(
+        self, pos: np.ndarray, goal: np.ndarray | None,
+        map_points: np.ndarray | None, waypoints: np.ndarray,
+    ) -> None:
+        if self.viewer is not None and map_points is not None:
+            self.viewer.update(
+                map_points, drone_pos=pos, target_pos=goal,
+                frontier_points=waypoints)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Main pipeline
+# Goal sampler (for standalone testing)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── Configuration ─────────────────────────────────────────────────────────
+def sample_near_obstacle_goal(
+    planner: PathPlanner,
+    current_pos: np.ndarray,
+    min_dist_from_obstacle: float = 2.0,
+    max_dist_from_obstacle: float = 5.0,
+    min_dist_from_drone: float = 5.0,
+    max_attempts: int = 500,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray | None:
+    """Sample a random collision-free goal near occupied voxels.
+
+    The goal must NOT be reachable via a straight line from the drone,
+    forcing the planner to navigate around obstacles.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    occ = planner.occupied
+    if occ is None:
+        return None
+    occ_indices = np.argwhere(occ)
+    if len(occ_indices) == 0:
+        return None
+
+    for _ in range(max_attempts):
+        idx = rng.integers(0, len(occ_indices))
+        occ_ijk = occ_indices[idx]
+        occ_world = planner.grid_to_world(*occ_ijk)
+
+        direction = rng.standard_normal(3)
+        direction /= np.linalg.norm(direction) + 1e-8
+        dist = rng.uniform(min_dist_from_obstacle, max_dist_from_obstacle)
+        candidate = occ_world + direction * dist
+
+        # Must be traversable (observed, not occupied, not inflated)
+        if not planner.is_traversable(*candidate):
+            continue
+
+        # Must be above the ground plane
+        if candidate[2] > planner.ground_z:
+            continue
+
+        # Must be far enough from the drone
+        if np.linalg.norm(candidate - current_pos) < min_dist_from_drone:
+            continue
+
+        # Straight line must be BLOCKED -- forces non-trivial planning
+        if straight_line_free(planner, current_pos, candidate, step=0.3):
+            continue
+
+        return candidate
+
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Ground-truth map loader (for standalone testing)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_ground_truth_map(
+    npz_path: str,
+    resolution: float = 0.5,
+    inflation_radius: float = 1.5,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Load a ground-truth .npz and build observed/occupied grids.
+
+    For ground truth, every voxel in the bounding box is treated as
+    *observed* (the entire volume was scanned).
+
+    Returns
+    -------
+    observed, occupied : bool ndarray (nx, ny, nz)
+    origin : ndarray (3,)
+    resolution : float
+    """
+    data = np.load(npz_path)
+    pts = data["points"].astype(np.float32)
+
+    res = resolution
+    pad = inflation_radius + res
+    mins = pts.min(axis=0) - pad
+    maxs = pts.max(axis=0) + pad
+    origin = mins.copy()
+
+    nx = int(np.ceil((maxs[0] - mins[0]) / res))
+    ny = int(np.ceil((maxs[1] - mins[1]) / res))
+    nz = int(np.ceil((maxs[2] - mins[2]) / res))
+
+    occupied = np.zeros((nx, ny, nz), dtype=bool)
+    ix = np.clip(((pts[:, 0] - origin[0]) / res).astype(int), 0, nx - 1)
+    iy = np.clip(((pts[:, 1] - origin[1]) / res).astype(int), 0, ny - 1)
+    iz = np.clip(((pts[:, 2] - origin[2]) / res).astype(int), 0, nz - 1)
+    occupied[ix, iy, iz] = True
+
+    # Ground truth: the full volume has been scanned
+    observed = np.ones((nx, ny, nz), dtype=bool)
+
+    print(f"  [load_ground_truth_map] {len(pts):,} points -> "
+          f"{nx}x{ny}x{nz} grid @ {res} m")
+
+    return observed, occupied, origin, res
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Standalone test -- obstacle avoidance missions in AirSim
+# ══════════════════════════════════════════════════════════════════════════════
+
+# -- Configuration ---------------------------------------------------------
 RECORDINGS_DIR = os.path.join(os.path.dirname(__file__), "flight_recordings")
+MAP_NPZ = ""  # leave empty to auto-detect latest ground_truth_*
 
-# The most recent ground-truth recording (or set to a specific path)
-MAP_NPZ = ""  # leave empty to auto-detect latest ground_truth_* recording
+PLANNING_RESOLUTION = 0.5
+INFLATION_RADIUS    = 1.5
+PLANNER_TYPE        = "ABITstar"
+SOLVE_TIMEOUT       = 2.0
+GROUND_Z            = 0.0
 
-PLANNING_RESOLUTION = 0.5   # voxel size (m) for the planning grid
-INFLATION_RADIUS    = 1.5   # safety margin (m) around obstacles
-PLANNER_TYPE        = "RRTstar"
-SOLVE_TIMEOUT       = 5.0   # seconds per planning query
-PATH_RESOLUTION     = 0.25  # collision-check resolution along edges
+VELOCITY            = 3.0
+TAKEOFF_HEIGHT      = -10.0
+NUM_GOALS           = 10
 
-VELOCITY            = 3.0   # flight speed (m/s)
-TAKEOFF_HEIGHT      = -10.0 # NED z for initial ascent (must be within map Z range)
-NUM_GOALS           = 10    # number of random near-obstacle goals to visit
-BOUNDS_PADDING      = 20.0  # extra metres around map for OMPL state space
+NEAR_OBS_MIN        = 2.0
+NEAR_OBS_MAX        = 5.0
+MIN_GOAL_DIST       = 5.0
 
-NEAR_OBS_MIN        = 2.0   # min distance from obstacle for goal sampling
-NEAR_OBS_MAX        = 5.0   # max distance from obstacle for goal sampling
-MIN_GOAL_DIST       = 5.0   # min distance from drone to sampled goal
-
-FLIGHT_MODE         = "path"  # "path" = moveOnPathAsync, "velocity" = pure-pursuit
-POLL_HZ             = 20.0   # real-time monitoring rate during flight
-MIN_WP_SPACING      = 1.0    # min metres between sub-sampled waypoints
+FLIGHT_MODE         = "path"   # "path" or "velocity"
+POLL_HZ             = 20.0
+MIN_WP_SPACING      = 1.0
 
 
 def find_latest_ground_truth() -> str:
@@ -827,31 +1167,39 @@ def find_latest_ground_truth() -> str:
     if not matches:
         raise FileNotFoundError(
             f"No ground truth recordings found matching {pattern}\n"
-            f"Run displayGroundTruth.py first to create one."
-        )
+            f"Run displayGroundTruth.py first to create one.")
     return matches[-1]
 
 
 def main():
+    import cosysairsim as airsim
+    from sensorFeed import Viewer3D
+
     t_start = time.time()
 
-    # ── 1) Load voxel map ────────────────────────────────────────────────
+    # -- 1) Load voxel map -------------------------------------------------
     map_path = MAP_NPZ if MAP_NPZ else find_latest_ground_truth()
     print(f"[1/7] Loading voxel map: {map_path}")
-    vmap = VoxelMap(resolution=PLANNING_RESOLUTION, inflation_radius=INFLATION_RADIUS)
-    vmap.load_npz(map_path)
+    observed, occupied, origin, res = load_ground_truth_map(
+        map_path, resolution=PLANNING_RESOLUTION,
+        inflation_radius=INFLATION_RADIUS)
 
-    # ── 2) Set up OMPL planner ───────────────────────────────────────────
-    print(f"[2/7] Setting up OMPL planner ({PLANNER_TYPE}, timeout={SOLVE_TIMEOUT}s)")
-    planner = OMPLPlanner(
-        vmap,
+    # -- 2) Set up planner -------------------------------------------------
+    print(f"[2/7] Setting up PathPlanner ({PLANNER_TYPE}, "
+          f"timeout={SOLVE_TIMEOUT}s)")
+    planner = PathPlanner(
+        inflation_radius=INFLATION_RADIUS,
         planner_type=PLANNER_TYPE,
         solve_timeout=SOLVE_TIMEOUT,
-        path_resolution=PATH_RESOLUTION,
-        bounds_padding=BOUNDS_PADDING,
+        ground_z=GROUND_Z,
     )
+    planner.update_map(observed, occupied, origin, res)
 
-    # ── 3) Connect to AirSim ────────────────────────────────────────────
+    # Store occupied points for viewer display
+    data = np.load(map_path)
+    planner.points = data["points"].astype(np.float32)
+
+    # -- 3) Connect to AirSim ----------------------------------------------
     print("[3/7] Connecting to AirSim ...")
     client = airsim.MultirotorClient()
     client.confirmConnection()
@@ -859,90 +1207,99 @@ def main():
     client.armDisarm(True)
     time.sleep(0.5)
 
-    # ── 4) GPS localisation sanity check ──────────────────────────────
+    # -- 4) GPS localisation sanity check ----------------------------------
     print("[4/7] Checking GPS localisation ...")
-    gps_pos   = get_drone_position(client)
+    gps_pos = get_drone_position(client)
     state_est = client.getMultirotorState()
-    p_est     = state_est.kinematics_estimated.position
-    kin_pos   = np.array([p_est.x_val, p_est.y_val, p_est.z_val])
-    offset    = gps_pos - kin_pos
+    p_est = state_est.kinematics_estimated.position
+    kin_pos = np.array([p_est.x_val, p_est.y_val, p_est.z_val])
+    offset = gps_pos - kin_pos
 
     home = client.getHomeGeoPoint()
-    gps  = client.getGpsData().gnss.geo_point
-    print(f"  Home GPS : lat={home.latitude:.7f}  lon={home.longitude:.7f}  alt={home.altitude:.2f}")
-    print(f"  Drone GPS: lat={gps.latitude:.7f}  lon={gps.longitude:.7f}  alt={gps.altitude:.2f}")
-    print(f"  Kinematics NED : ({kin_pos[0]:.2f}, {kin_pos[1]:.2f}, {kin_pos[2]:.2f})")
-    print(f"  GPS-derived NED: ({gps_pos[0]:.2f}, {gps_pos[1]:.2f}, {gps_pos[2]:.2f})")
-    print(f"  Offset (GPS-Kin): ({offset[0]:.2f}, {offset[1]:.2f}, {offset[2]:.2f})")
+    gps = client.getGpsData().gnss.geo_point
+    print(f"  Home GPS : lat={home.latitude:.7f}  lon={home.longitude:.7f}  "
+          f"alt={home.altitude:.2f}")
+    print(f"  Drone GPS: lat={gps.latitude:.7f}  lon={gps.longitude:.7f}  "
+          f"alt={gps.altitude:.2f}")
+    print(f"  Kinematics NED : ({kin_pos[0]:.2f}, {kin_pos[1]:.2f}, "
+          f"{kin_pos[2]:.2f})")
+    print(f"  GPS-derived NED: ({gps_pos[0]:.2f}, {gps_pos[1]:.2f}, "
+          f"{gps_pos[2]:.2f})")
+    print(f"  Offset (GPS-Kin): ({offset[0]:.2f}, {offset[1]:.2f}, "
+          f"{offset[2]:.2f})")
     if np.linalg.norm(offset) > 1.0:
-        print(f"  ⚠  Significant offset detected ({np.linalg.norm(offset):.2f} m) — "
-              f"using GPS position for planning")
+        print(f"  Warning: significant offset ({np.linalg.norm(offset):.2f} m)")
 
-    # ── 5) Launch viewer ─────────────────────────────────────────────────
-    print(f"[5/7] Launching viewer with {len(vmap.points):,} occupied voxels")
+    # -- 5) Launch viewer --------------------------------------------------
+    print(f"[5/7] Launching viewer with {len(planner.points):,} "
+          f"occupied voxels")
     viewer = Viewer3D()
-    viewer.start(initial_points=vmap.points)
+    viewer.start(initial_points=planner.points)
 
-    # ── 6) Takeoff + escape to collision-free position ─────────────────
+    # -- 6) Takeoff + escape -----------------------------------------------
     print(f"[6/7] Taking off to z={TAKEOFF_HEIGHT} ...")
     client.takeoffAsync().join()
     time.sleep(1)
-    client.moveToPositionAsync(0, 0, TAKEOFF_HEIGHT, velocity=VELOCITY).join()
+    client.moveToPositionAsync(
+        0, 0, TAKEOFF_HEIGHT, velocity=VELOCITY).join()
     time.sleep(1)
 
-    # After takeoff, check if the drone is inside an obstacle (e.g. tree
-    # at spawn).  If so, ascend further until clear, then move laterally.
     esc_pos = get_drone_position(client)
-    if vmap.in_bounds(*esc_pos) and vmap.is_collision(*esc_pos):
-        print(f"  ⚠  Drone is inside inflated obstacle at ({esc_pos[0]:.1f}, "
-              f"{esc_pos[1]:.1f}, {esc_pos[2]:.1f}) — escaping ...")
-        # Try ascending in 2 m steps
+    if planner.is_in_grid(*esc_pos) and planner.is_collision(*esc_pos):
+        print(f"  Warning: drone inside inflated obstacle at "
+              f"({esc_pos[0]:.1f}, {esc_pos[1]:.1f}, {esc_pos[2]:.1f}) "
+              f"-- escaping ...")
         escape_z = esc_pos[2]
         for _ in range(10):
-            escape_z -= 2.0  # go UP in NED (more negative)
-            if not vmap.in_bounds(esc_pos[0], esc_pos[1], escape_z):
+            escape_z -= 2.0
+            if not planner.is_in_grid(esc_pos[0], esc_pos[1], escape_z):
                 break
-            if not vmap.is_collision(esc_pos[0], esc_pos[1], escape_z):
+            if not planner.is_collision(esc_pos[0], esc_pos[1], escape_z):
                 break
         client.moveToPositionAsync(
             float(esc_pos[0]), float(esc_pos[1]), float(escape_z),
-            velocity=VELOCITY,
-        ).join()
+            velocity=VELOCITY).join()
         time.sleep(0.5)
         esc_pos = get_drone_position(client)
-        print(f"  Escaped to ({esc_pos[0]:.1f}, {esc_pos[1]:.1f}, {esc_pos[2]:.1f})  "
-              f"collision={vmap.is_collision(*esc_pos) if vmap.in_bounds(*esc_pos) else 'out-of-bounds'}")
+        in_coll = (planner.is_collision(*esc_pos)
+                   if planner.is_in_grid(*esc_pos) else "out-of-bounds")
+        print(f"  Escaped to ({esc_pos[0]:.1f}, {esc_pos[1]:.1f}, "
+              f"{esc_pos[2]:.1f})  collision={in_coll}")
 
-    # Select flight executor based on mode
-    fly_fn = fly_path_on_path if FLIGHT_MODE == "path" else fly_path_velocity
-    mode_label = "moveOnPathAsync" if FLIGHT_MODE == "path" else "pure-pursuit velocity"
+    mode_label = ("moveOnPathAsync" if FLIGHT_MODE == "path"
+                  else "pure-pursuit velocity")
 
-    # ── Main loop: sample goals near obstacles and fly to them ───────────
+    # -- 7) Set up PathFollower --------------------------------------------
+    follower = PathFollower(
+        client, planner=planner, mode=FLIGHT_MODE,
+        velocity=VELOCITY, poll_hz=POLL_HZ,
+        min_spacing=MIN_WP_SPACING, viewer=viewer,
+    )
+    follower.start()
+
+    # -- 8) Main loop: sample goals and fly --------------------------------
     rng = np.random.default_rng(42)
     goals_reached = 0
     goals_failed = 0
     total_collisions = 0
     all_results: list[FlightResult] = []
 
+    nx, ny, nz = planner.grid_shape
     print(f"\n{'='*60}")
-    print(f"Obstacle-avoidance path planning — {NUM_GOALS} random goals")
-    print(f"  Grid: {vmap.nx}×{vmap.ny}×{vmap.nz} @ {PLANNING_RESOLUTION} m")
+    print(f"Obstacle-avoidance path planning -- {NUM_GOALS} random goals")
+    print(f"  Grid: {nx}x{ny}x{nz} @ {PLANNING_RESOLUTION} m")
     print(f"  Inflation: {INFLATION_RADIUS} m  |  Planner: {PLANNER_TYPE}")
     print(f"  Goal sampling: {NEAR_OBS_MIN}-{NEAR_OBS_MAX} m from obstacles")
     print(f"  Flight mode: {mode_label}  |  Poll: {POLL_HZ} Hz")
     print(f"{'='*60}\n")
 
     for goal_i in range(NUM_GOALS):
-        # Current drone position (from GPS)
         current_pos = get_drone_position(client)
+        viewer.update(planner.points, drone_pos=current_pos)
 
-        # Update viewer with drone position
-        viewer.update(vmap.points, drone_pos=current_pos)
-
-        # Sample a goal near obstacles
         print(f"[Goal {goal_i+1}/{NUM_GOALS}] Sampling near-obstacle goal ...")
         goal = sample_near_obstacle_goal(
-            vmap, current_pos,
+            planner, current_pos,
             min_dist_from_obstacle=NEAR_OBS_MIN,
             max_dist_from_obstacle=NEAR_OBS_MAX,
             min_dist_from_drone=MIN_GOAL_DIST,
@@ -950,7 +1307,7 @@ def main():
         )
 
         if goal is None:
-            print(f"  SKIP — could not sample a valid goal after max attempts")
+            print(f"  SKIP -- could not sample a valid goal")
             goals_failed += 1
             continue
 
@@ -958,27 +1315,37 @@ def main():
         print(f"  Goal: ({goal[0]:.1f}, {goal[1]:.1f}, {goal[2]:.1f})  |  "
               f"Distance: {dist:.1f} m")
 
-        # Show goal + drone in viewer
-        viewer.update(vmap.points, drone_pos=current_pos, target_pos=goal)
+        viewer.update(planner.points, drone_pos=current_pos, target_pos=goal)
 
-        # ── Plan path with OMPL ──────────────────────────────────────
-        # If the drone is currently inside an obstacle (e.g. after a
-        # collision or spawning in a tree), find the nearest free-space
-        # point and use that as the planner start instead.
+        # If drone is outside grid, fly back to nearest valid position
         plan_start = current_pos.copy()
-        if vmap.in_bounds(*plan_start) and vmap.is_collision(*plan_start):
-            free_pt = find_nearest_free(vmap, plan_start)
+        if not planner.is_in_grid(*plan_start):
+            free_pt = planner.find_nearest_free(plan_start)
             if free_pt is None:
-                print(f"  SKIP — drone stuck inside obstacle, no free point found")
+                print(f"  SKIP -- outside grid bounds, no free voxel nearby")
                 goals_failed += 1
                 continue
-            print(f"  ⚠  Start in collision — offsetting to free point "
+            print(f"  Warning: start outside grid -- flying to "
                   f"({free_pt[0]:.1f}, {free_pt[1]:.1f}, {free_pt[2]:.1f})")
-            # Physically move the drone to the free point first
             client.moveToPositionAsync(
                 float(free_pt[0]), float(free_pt[1]), float(free_pt[2]),
-                velocity=VELOCITY,
-            ).join()
+                velocity=VELOCITY).join()
+            time.sleep(0.5)
+            plan_start = get_drone_position(client)
+
+        # If drone is in collision, escape first
+        if (planner.is_in_grid(*plan_start)
+                and planner.is_collision(*plan_start)):
+            free_pt = planner.find_nearest_free(plan_start)
+            if free_pt is None:
+                print(f"  SKIP -- stuck inside obstacle")
+                goals_failed += 1
+                continue
+            print(f"  Warning: start in collision -- offsetting to "
+                  f"({free_pt[0]:.1f}, {free_pt[1]:.1f}, {free_pt[2]:.1f})")
+            client.moveToPositionAsync(
+                float(free_pt[0]), float(free_pt[1]), float(free_pt[2]),
+                velocity=VELOCITY).join()
             time.sleep(0.5)
             plan_start = get_drone_position(client)
 
@@ -987,33 +1354,29 @@ def main():
         dt_plan = time.time() - t_plan
 
         if path is None:
-            print(f"  FAIL — planner could not find a path ({dt_plan:.2f}s)")
+            print(f"  FAIL -- no path found ({dt_plan:.2f}s)")
             goals_failed += 1
             continue
 
         print(f"  Path found: {len(path)} waypoints, {dt_plan:.2f}s")
 
-        # Show planned path in viewer (orange frontier overlay)
-        viewer.update(vmap.points, drone_pos=current_pos,
+        viewer.update(planner.points, drone_pos=current_pos,
                       target_pos=goal, frontier_points=path)
-        time.sleep(0.3)  # brief pause to see the planned path before flight
+        time.sleep(0.3)
 
-        # ── Execute path with full dynamics ───────────────────────────
         print(f"  Flying ({mode_label}) ...")
-        flight = fly_fn(
-            client, path,
-            velocity=VELOCITY,
-            min_spacing=MIN_WP_SPACING,
-            viewer=viewer,
-            vmap=vmap,
-            map_points=vmap.points,
-            goal=goal,
-            poll_hz=POLL_HZ,
-        )
+        follower.follow(path, goal=goal, map_points=planner.points)
+        flight = follower.wait()
+
+        if flight is None:
+            print(f"  FAIL -- flight returned no result")
+            goals_failed += 1
+            continue
+
         all_results.append(flight)
 
-        # ── Report ───────────────────────────────────────────────────
-        status = "ARRIVED" if flight.success else ("COLLISION" if flight.collided else "MISSED")
+        status = ("ARRIVED" if flight.success
+                  else ("COLLISION" if flight.collided else "MISSED"))
         if flight.collided:
             total_collisions += 1
         if flight.success or not flight.collided:
@@ -1021,28 +1384,25 @@ def main():
         else:
             goals_failed += 1
 
-        clearance_str = (f"{flight.min_obstacle_clearance:.2f} m"
-                         if flight.min_obstacle_clearance < float('inf')
-                         else "n/a")
-        traj_len = len(flight.trajectory)
-        print(f"  {status} — flight: {flight.flight_time:.1f}s, "
+        clearance_str = (
+            f"{flight.min_obstacle_clearance:.2f} m"
+            if flight.min_obstacle_clearance < float('inf') else "n/a")
+        print(f"  {status} -- flight: {flight.flight_time:.1f}s, "
               f"error: {flight.arrival_error:.2f} m, "
               f"clearance: {clearance_str}, "
-              f"trajectory: {traj_len} samples")
+              f"trajectory: {len(flight.trajectory)} samples")
 
         if flight.collided:
             ci = flight.collision_info
             print(f"    Collided with: '{ci.object_name}' "
                   f"(penetration: {ci.penetration_depth:.3f})")
-
         print()
 
-        # Brief pause between goals
         final_pos = get_drone_position(client)
-        viewer.update(vmap.points, drone_pos=final_pos, target_pos=goal)
+        viewer.update(planner.points, drone_pos=final_pos, target_pos=goal)
         time.sleep(0.5)
 
-    # ── Summary ──────────────────────────────────────────────────────────
+    # -- Summary -----------------------------------------------------------
     total_time = time.time() - t_start
     print(f"\n{'='*60}")
     print(f"Obstacle avoidance complete")
@@ -1061,13 +1421,14 @@ def main():
         print(f"  Min clearance:   {min_clear:.2f} m")
     print(f"{'='*60}")
 
-    print("\nViewer is still open — press Enter to land and exit.")
+    follower.stop()
+
+    print("\nViewer is still open -- press Enter to land and exit.")
     try:
         input()
     except (EOFError, KeyboardInterrupt):
         pass
 
-    # Land
     print("Landing ...")
     client.landAsync().join()
     client.armDisarm(False)
