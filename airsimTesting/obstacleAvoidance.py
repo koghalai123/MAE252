@@ -194,6 +194,21 @@ class PathPlanner:
         start = np.asarray(start, dtype=float).ravel()[:3]
         goal = np.asarray(goal, dtype=float).ravel()[:3]
 
+        # Auto-fix invalid start: if outside grid or not traversable,
+        # snap to the nearest valid position.
+        if not self._is_valid_point(start):
+            fixed = self.find_nearest_free(start, margin=3.0)
+            if fixed is None:
+                fixed = self.find_nearest_free(start)  # try without margin
+            if fixed is None:
+                print(f"  [plan] Cannot fix invalid start "
+                      f"({start[0]:.1f}, {start[1]:.1f}, {start[2]:.1f})")
+                return None
+            print(f"  [plan] Auto-adjusted start from "
+                  f"({start[0]:.1f}, {start[1]:.1f}, {start[2]:.1f}) to "
+                  f"({fixed[0]:.1f}, {fixed[1]:.1f}, {fixed[2]:.1f})")
+            start = fixed
+
         pdef = ob.ProblemDefinition(self._si)
 
         s = ob.State(self._space)
@@ -245,6 +260,13 @@ class PathPlanner:
                         dtype=np.float64)
 
     # ── Query helpers ─────────────────────────────────────────────────────
+
+    def _is_valid_point(self, pt: np.ndarray) -> bool:
+        """True if the point would be accepted as an OMPL start/goal."""
+        x, y, z = float(pt[0]), float(pt[1]), float(pt[2])
+        if not self.is_in_grid(x, y, z):
+            return False
+        return self.is_traversable(x, y, z)
 
     def is_traversable(self, x: float, y: float, z: float) -> bool:
         """True if the point is in known-free (observed & not inflated) space."""
@@ -300,19 +322,35 @@ class PathPlanner:
 
     def find_nearest_free(
         self, pos: np.ndarray, max_radius: float = 10.0,
+        margin: float = 0.0,
     ) -> np.ndarray | None:
         """Find the nearest traversable point via expanding search.
 
         Tries ascending first (most common escape in NED), then expands
         in all directions.  Returns ``None`` if nothing found within
         *max_radius*.
+
+        Parameters
+        ----------
+        margin : float
+            Minimum distance (m) from the grid boundary that the returned
+            point must satisfy.  Use this to avoid picking edge voxels
+            that the drone may overshoot.
         """
         pos = np.asarray(pos, dtype=float).ravel()[:3]
         step = self._resolution
 
+        def _inside_margin(pt: np.ndarray) -> bool:
+            if margin <= 0:
+                return True
+            o, r = self._origin, self._resolution
+            return (o[0] + margin <= pt[0] <= o[0] + self._nx * r - margin
+                    and o[1] + margin <= pt[1] <= o[1] + self._ny * r - margin
+                    and o[2] + margin <= pt[2] <= o[2] + self._nz * r - margin)
+
         for dz in np.arange(-step, -max_radius, -step):
             cand = pos + np.array([0.0, 0.0, dz])
-            if self.is_traversable(*cand):
+            if self.is_traversable(*cand) and _inside_margin(cand):
                 return cand
 
         for r in np.arange(step, max_radius + step, step):
@@ -322,7 +360,7 @@ class PathPlanner:
                         if dx == 0 and dy == 0 and dz == 0:
                             continue
                         cand = pos + np.array([dx, dy, dz])
-                        if self.is_traversable(*cand):
+                        if self.is_traversable(*cand) and _inside_margin(cand):
                             return cand
         return None
 
@@ -1317,37 +1355,42 @@ def main():
 
         viewer.update(planner.points, drone_pos=current_pos, target_pos=goal)
 
-        # If drone is outside grid, fly back to nearest valid position
+        # If drone is outside grid or in collision, recover
         plan_start = current_pos.copy()
-        if not planner.is_in_grid(*plan_start):
-            free_pt = planner.find_nearest_free(plan_start)
-            if free_pt is None:
-                print(f"  SKIP -- outside grid bounds, no free voxel nearby")
-                goals_failed += 1
-                continue
-            print(f"  Warning: start outside grid -- flying to "
-                  f"({free_pt[0]:.1f}, {free_pt[1]:.1f}, {free_pt[2]:.1f})")
-            client.moveToPositionAsync(
-                float(free_pt[0]), float(free_pt[1]), float(free_pt[2]),
-                velocity=VELOCITY).join()
-            time.sleep(0.5)
-            plan_start = get_drone_position(client)
+        RECOVERY_MARGIN = 5.0  # metres inside grid edge to avoid overshoot
+        for _recovery in range(3):  # up to 3 attempts
+            need_recovery = False
+            reason = ""
+            if not planner.is_in_grid(*plan_start):
+                need_recovery = True
+                reason = "outside grid"
+            elif planner.is_collision(*plan_start):
+                need_recovery = True
+                reason = "in collision"
+            if not need_recovery:
+                break
 
-        # If drone is in collision, escape first
-        if (planner.is_in_grid(*plan_start)
-                and planner.is_collision(*plan_start)):
-            free_pt = planner.find_nearest_free(plan_start)
+            free_pt = planner.find_nearest_free(
+                plan_start, margin=RECOVERY_MARGIN)
             if free_pt is None:
-                print(f"  SKIP -- stuck inside obstacle")
-                goals_failed += 1
-                continue
-            print(f"  Warning: start in collision -- offsetting to "
+                # Fall back without margin
+                free_pt = planner.find_nearest_free(plan_start)
+            if free_pt is None:
+                break  # give up
+
+            print(f"  Warning: start {reason} -- flying to "
                   f"({free_pt[0]:.1f}, {free_pt[1]:.1f}, {free_pt[2]:.1f})")
             client.moveToPositionAsync(
                 float(free_pt[0]), float(free_pt[1]), float(free_pt[2]),
                 velocity=VELOCITY).join()
-            time.sleep(0.5)
+            time.sleep(1.0)  # extra settle time for inertia
             plan_start = get_drone_position(client)
+        else:
+            # All 3 attempts exhausted
+            if not planner.is_in_grid(*plan_start):
+                print(f"  SKIP -- could not recover into grid")
+                goals_failed += 1
+                continue
 
         t_plan = time.time()
         path = planner.plan(plan_start, goal)
