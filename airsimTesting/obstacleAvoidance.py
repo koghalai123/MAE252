@@ -1471,15 +1471,46 @@ def main():
     viewer = Viewer3D()
     viewer.start(initial_points=planner.points)
 
-    # -- 6) Takeoff + escape -----------------------------------------------
-    print(f"[6/7] Taking off to z={TAKEOFF_HEIGHT} ...")
+    # -- 6) Set up ThreadedPathPlanner early (plans during takeoff) -------
+    threaded_planner = ThreadedPathPlanner(planner)
+    threaded_planner.start()
+
+    rng = np.random.default_rng(42)
+
+    # Sample the first goal using the *expected* post-takeoff position
+    # and submit it to the background planner BEFORE takeoff, so the
+    # planning runs concurrently with the takeoff manoeuvre.
+    expected_takeoff_pos = np.array([0.0, 0.0, TAKEOFF_HEIGHT])
+    print("[6/8] Sampling first goal and planning during takeoff ...")
+    first_goal = None
+    for _ in range(20):
+        first_goal = sample_near_obstacle_goal(
+            planner, expected_takeoff_pos,
+            min_dist_from_obstacle=NEAR_OBS_MIN,
+            max_dist_from_obstacle=NEAR_OBS_MAX,
+            min_dist_from_drone=MIN_GOAL_DIST,
+            rng=rng,
+        )
+        if first_goal is not None:
+            break
+    if first_goal is not None:
+        dist = np.linalg.norm(first_goal - expected_takeoff_pos)
+        print(f"  First goal: ({first_goal[0]:.1f}, {first_goal[1]:.1f}, "
+              f"{first_goal[2]:.1f})  |  Distance: {dist:.1f} m")
+        threaded_planner.request_plan(expected_takeoff_pos, first_goal)
+    else:
+        print("  Warning: could not sample first goal pre-takeoff")
+
+    # -- 7) Takeoff + escape (planning runs concurrently) ------------------
+    print(f"[7/8] Taking off to z={TAKEOFF_HEIGHT} ...")
     client.takeoffAsync().join()
     time.sleep(1)
     client.moveToPositionAsync(
         0, 0, TAKEOFF_HEIGHT, velocity=VELOCITY).join()
-    time.sleep(1)
+    client.hoverAsync().join()
 
     esc_pos = get_drone_position(client)
+    escaped = False
     if planner.is_in_grid(*esc_pos) and planner.is_collision(*esc_pos):
         print(f"  Warning: drone inside inflated obstacle at "
               f"({esc_pos[0]:.1f}, {esc_pos[1]:.1f}, {esc_pos[2]:.1f}) "
@@ -1494,17 +1525,19 @@ def main():
         client.moveToPositionAsync(
             float(esc_pos[0]), float(esc_pos[1]), float(escape_z),
             velocity=VELOCITY).join()
+        client.hoverAsync().join()
         time.sleep(0.5)
         esc_pos = get_drone_position(client)
         in_coll = (planner.is_collision(*esc_pos)
                    if planner.is_in_grid(*esc_pos) else "out-of-bounds")
         print(f"  Escaped to ({esc_pos[0]:.1f}, {esc_pos[1]:.1f}, "
               f"{esc_pos[2]:.1f})  collision={in_coll}")
+        escaped = True
 
     mode_label = ("moveOnPathAsync" if FLIGHT_MODE == "path"
                   else "pure-pursuit velocity")
 
-    # -- 7) Set up PathFollower + ThreadedPathPlanner ----------------------
+    # -- 8) Set up PathFollower --------------------------------------------
     follower = PathFollower(
         client, planner=planner, mode=FLIGHT_MODE,
         velocity=VELOCITY, poll_hz=POLL_HZ,
@@ -1512,10 +1545,7 @@ def main():
     )
     follower.start()
 
-    threaded_planner = ThreadedPathPlanner(planner)
-    threaded_planner.start()
-
-    # -- 8) Main loop: pipelined plan-while-fly ----------------------------
+    # -- 9) Main loop: pipelined plan-while-fly ----------------------------
     #
     # Strategy: while the drone flies path N, the planner thread is
     # already computing path N+1.  When the flight finishes the next
@@ -1527,7 +1557,6 @@ def main():
     #
     REPLAN_THRESHOLD = 3.0  # m — replan if arrival drifts more than this
 
-    rng = np.random.default_rng(42)
     goals_reached = 0
     goals_failed = 0
     total_collisions = 0
@@ -1617,41 +1646,75 @@ def main():
         print()
         return flight.success or not flight.collided
 
-    # ── First goal: plan synchronously (nothing to overlap with) ─────
+    # ── Collect the pre-planned first path ────────────────────────────
+    # The background planner was started before takeoff.  Collect it now.
     current_pos = get_drone_position(client)
     viewer.update(planner.points, drone_pos=current_pos)
 
     first_path = None
-    first_goal = None
-    for _attempt in range(NUM_GOALS):
-        print(f"[Goal 1/{NUM_GOALS}] Sampling near-obstacle goal ...")
-        first_goal = sample_near_obstacle_goal(
-            planner, current_pos,
-            min_dist_from_obstacle=NEAR_OBS_MIN,
-            max_dist_from_obstacle=NEAR_OBS_MAX,
-            min_dist_from_drone=MIN_GOAL_DIST,
-            rng=rng,
-        )
-        if first_goal is None:
-            print(f"  SKIP -- could not sample a valid goal")
-            goals_failed += 1
-            continue
-
-        plan_start = recover_start(current_pos)
-        if plan_start is None:
-            print(f"  SKIP -- could not recover into grid")
-            goals_failed += 1
-            continue
-
-        pr = threaded_planner.plan_sync(plan_start, first_goal)
-        print(f"  Path {'found' if pr.success else 'FAILED'}: "
-              f"{len(pr.path) if pr.path is not None else 0} wps, "
-              f"{pr.plan_time:.2f}s")
-        if pr.success:
-            first_path = pr.path
-            break
+    if first_goal is not None:
+        pr = threaded_planner.get_result(timeout=30.0)
+        if pr is not None and pr.success:
+            # Check if escape moved us far from the planned start
+            drift = np.linalg.norm(current_pos - pr.start)
+            if drift <= REPLAN_THRESHOLD and not escaped:
+                first_path = pr.path
+                print(f"  Pre-planned first path ready: "
+                      f"{len(first_path)} wps, {pr.plan_time:.2f}s "
+                      f"(drift {drift:.2f} m)")
+            else:
+                # Escape moved us — replan from actual position
+                print(f"  Drift {drift:.2f} m from planned start "
+                      f"— replanning from actual position ...")
+                plan_start = recover_start(current_pos)
+                if plan_start is not None:
+                    pr2 = threaded_planner.plan_sync(plan_start, first_goal)
+                    if pr2.success:
+                        first_path = pr2.path
+                        print(f"  Replan OK: {len(first_path)} wps, "
+                              f"{pr2.plan_time:.2f}s")
         else:
-            goals_failed += 1
+            print(f"  Pre-plan failed — trying synchronous plan ...")
+            plan_start = recover_start(current_pos)
+            if plan_start is not None:
+                pr2 = threaded_planner.plan_sync(plan_start, first_goal)
+                if pr2.success:
+                    first_path = pr2.path
+
+    # If pre-plan didn't work, try sampling fresh goals
+    if first_path is None:
+        for _attempt in range(NUM_GOALS):
+            if first_goal is None:
+                print(f"[Goal 1/{NUM_GOALS}] Sampling near-obstacle goal ...")
+                first_goal = sample_near_obstacle_goal(
+                    planner, current_pos,
+                    min_dist_from_obstacle=NEAR_OBS_MIN,
+                    max_dist_from_obstacle=NEAR_OBS_MAX,
+                    min_dist_from_drone=MIN_GOAL_DIST,
+                    rng=rng,
+                )
+            if first_goal is None:
+                print(f"  SKIP -- could not sample a valid goal")
+                goals_failed += 1
+                continue
+
+            plan_start = recover_start(current_pos)
+            if plan_start is None:
+                print(f"  SKIP -- could not recover into grid")
+                goals_failed += 1
+                first_goal = None
+                continue
+
+            pr = threaded_planner.plan_sync(plan_start, first_goal)
+            print(f"  Path {'found' if pr.success else 'FAILED'}: "
+                  f"{len(pr.path) if pr.path is not None else 0} wps, "
+                  f"{pr.plan_time:.2f}s")
+            if pr.success:
+                first_path = pr.path
+                break
+            else:
+                goals_failed += 1
+                first_goal = None
 
     if first_path is None or first_goal is None:
         print("  Could not plan any initial path — aborting.")
