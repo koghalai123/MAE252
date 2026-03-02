@@ -1284,7 +1284,7 @@ SAVE_DIR = os.path.join(os.path.dirname(__file__), "flight_recordings")
 #REPLAY_DIR      = "flight_recordings"            # e.g. "flight_recordings/flight_1771909992"
 REPLAY_DIR      = ""  
 # ── Exploration parameters (shared by both modes) ────────────────────────
-EXPLORE_BOUNDS  = (-20, 20, -50, 10, -20, 0)   # (xmin,xmax,ymin,ymax,zmin,zmax) NED
+EXPLORE_BOUNDS  = (-15, 15, -35, 5, -15, 0)   # (xmin,xmax,ymin,ymax,zmin,zmax) NED
 TAKEOFF_HEIGHT  = EXPLORE_BOUNDS[4] - 5         # NED z, 5 m above grid ceiling (LiDAR points down)
 VELOCITY        = 3             # m/s (live mode only)
 SCAN_HZ         = 1 / 1.5      # scans per second (live mode only)
@@ -1474,7 +1474,7 @@ def run_live():
     cfg = SLAMConfig(
         registration="vgicp",
         octo_resolution=0.15,
-        frame_skip=1,
+        frame_skip=0,
         live_max_hz=SCAN_HZ,
         enable_viewer=True,
     )

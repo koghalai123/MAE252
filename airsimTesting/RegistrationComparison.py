@@ -207,7 +207,7 @@ def register_state_only(src, tgt, init_T=np.eye(4)):
 #   let ICP progressively lock on.
 # ══════════════════════════════════════════════════════════════════════════════
 
-ICP_MULTI_CORR = [5.0, 2, 0.5]   # coarse → fine correspondence distances
+ICP_MULTI_CORR = [1.0, 0.5, 0.25]   # coarse → fine correspondence distances
 ICP_MULTI_ITER = [25, 15,  7 ]   # iterations per pass
 
 
