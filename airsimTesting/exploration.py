@@ -36,7 +36,7 @@ from finalMappingPipeline import LiveSLAM, SLAMConfig, SLAMPipeline, _QualityPlo
 from RegistrationComparison import resolve_recording_dir, filter_valid, xform_pts
 from obstacleAvoidance import (
     PathPlanner, PathFollower, FollowerState, FlightResult,
-    get_drone_position,
+    get_drone_position, sample_near_obstacle_goal, straight_line_free,
 )
 
 
@@ -98,6 +98,62 @@ class BufferedSLAM:
         self._stop_event = threading.Event()
         self._thread_client = None   # collection thread AirSim client
         self._gps_client = None      # GPS thread AirSim client
+
+        # ── Deferred overlay queue ─────────────────────────────────────
+        # Path / target overlays are queued and released after the same
+        # wall-clock delay as the scan buffer so the viewer stays in sync
+        # with the (delayed) SLAM map.
+        self._overlay_queue: list[tuple[float, dict]] = []
+        self._overlay_lock = threading.Lock()
+
+    @property
+    def overlay_delay(self) -> float:
+        """Wall-clock seconds that overlays should be delayed.
+
+        Matches the scan buffer latency: ``delay_scans / scan_rate``.
+        """
+        hz = self.live._min_interval  # seconds between scans
+        return self.delay_scans * hz
+
+    # ── Overlay queueing ──────────────────────────────────────────────
+
+    def queue_overlay(self, **kwargs) -> None:
+        """Schedule an overlay update to appear after the buffer delay.
+
+        Accepted keyword arguments (all optional):
+          target_pos, path_points, frontier_points
+
+        The update is timestamped with ``time.time()`` and will be pushed
+        to the viewer by ``drain_overlays()`` once ``overlay_delay``
+        seconds have elapsed.
+        """
+        with self._overlay_lock:
+            self._overlay_queue.append((time.time(), dict(kwargs)))
+
+    def drain_overlays(self) -> None:
+        """Push any overlay updates whose delay has elapsed to the viewer.
+
+        Call this frequently (e.g. in every wait-loop iteration) so that
+        queued overlays are released in sync with the delayed SLAM map.
+        """
+        now = time.time()
+        delay = self.overlay_delay
+        ready: list[dict] = []
+        with self._overlay_lock:
+            while self._overlay_queue and (now - self._overlay_queue[0][0]) >= delay:
+                _, data = self._overlay_queue.pop(0)
+                ready.append(data)
+
+        # Apply each update in order; later updates overwrite earlier ones
+        for data in ready:
+            if "target_pos" in data:
+                self.live.set_target(data["target_pos"])
+            if "path_points" in data:
+                self.live.set_path_points(data["path_points"])
+            if "frontier_points" in data:
+                self.live.set_frontier_points(data["frontier_points"])
+        if ready:
+            self.live.refresh_overlays()
 
     def set_planner(self, planner: "ExplorationPlanner") -> None:
         """Attach an ExplorationPlanner to receive per-scan world-frame data."""
@@ -501,6 +557,9 @@ class ExplorationPlanner:
         lidar_altitude_offset: float = 0.0,
         min_target_distance: float = 3.0,
         inflation_margin: float = 2.0,
+        # ── Random waypoint parameters ────────────────────────────
+        use_random: bool = False,
+        random_max_attempts: int = 50,
         # ── NBV parameters ────────────────────────────────────────
         use_nbv: bool = False,
         nbv_sensor_half_angle: float = 45.0,
@@ -510,6 +569,12 @@ class ExplorationPlanner:
         nbv_local_radius: float = 10.0,
         above_grid_margin: float = 0.0,
         nbv_lidar_max_range: float = 40.0,
+        nbv_unknown_block_size: int = 4,
+        nbv_n_unknown_blocks: int = 8,
+        nbv_volumetric_radius: float = 8.0,
+        nbv_volumetric_weight: float = 0.3,
+        nbv_ray_max_targets: int = 500,
+        nbv_use_ray_tracing: bool = True,
     ):
         self.xmin, self.xmax, self.ymin, self.ymax, self.zmin, self.zmax = bounds
         self.resolution = resolution
@@ -522,6 +587,14 @@ class ExplorationPlanner:
         self.min_target_distance = min_target_distance
         self.inflation_margin = inflation_margin
 
+        # Random waypoint settings
+        self.use_random = use_random
+        self.random_max_attempts = random_max_attempts
+
+        # Reference to the PathPlanner (set by run_live) so that random
+        # target selection can use sample_near_obstacle_goal().
+        self._path_planner: "PathPlanner | None" = None
+
         # NBV settings
         self.use_nbv = use_nbv
         self.nbv_sensor_half_angle = nbv_sensor_half_angle
@@ -531,6 +604,12 @@ class ExplorationPlanner:
         self.nbv_local_radius = nbv_local_radius
         self.above_grid_margin = above_grid_margin
         self.nbv_lidar_max_range = nbv_lidar_max_range
+        self.nbv_unknown_block_size = nbv_unknown_block_size
+        self.nbv_n_unknown_blocks = nbv_n_unknown_blocks
+        self.nbv_volumetric_radius = nbv_volumetric_radius
+        self.nbv_volumetric_weight = nbv_volumetric_weight
+        self.nbv_ray_max_targets = nbv_ray_max_targets
+        self.nbv_use_ray_tracing = nbv_use_ray_tracing
 
         self.nx = int(np.ceil((self.xmax - self.xmin) / resolution))
         self.ny = int(np.ceil((self.ymax - self.ymin) / resolution))
@@ -793,6 +872,14 @@ class ExplorationPlanner:
             Random positions within ``nbv_local_radius`` of the drone in
             free space, for immediate opportunities.
 
+        Heuristic 4 — **Dense unknown region centroids**:
+            Divides the grid into coarse blocks of
+            ``nbv_unknown_block_size`` voxels, counts unknown voxels per
+            block, and generates candidates at viewable positions around
+            the densest blocks.  This targets interior unknown regions
+            that have no frontier boundary (e.g. behind walls or in
+            entirely unseen areas).
+
         Returns
         -------
         candidates : ndarray (N, 3)
@@ -858,6 +945,50 @@ class ExplorationPlanner:
                 continue
             raw.append(cand)
 
+        # ── H4: Dense unknown region centroids ───────────────────────
+        # Divide grid into coarse blocks and find the densest unknown
+        # regions.  These may have NO frontier boundary at all.
+        bs = self.nbv_unknown_block_size
+        n_bx = max(1, self.nx // bs)
+        n_by = max(1, self.ny // bs)
+        n_bz = max(1, self.nz // bs)
+        # Trim the unknown grid to an even multiple of bs for reshaping
+        unk_trimmed = unknown[:n_bx * bs, :n_by * bs, :n_bz * bs]
+        block_counts = unk_trimmed.reshape(
+            n_bx, bs, n_by, bs, n_bz, bs
+        ).sum(axis=(1, 3, 5))  # (n_bx, n_by, n_bz)
+
+        n_blocks = min(self.nbv_n_unknown_blocks, n_bx * n_by * n_bz)
+        flat_top_blk = np.argsort(block_counts.ravel())[::-1][:n_blocks]
+
+        for fi in flat_top_blk:
+            if block_counts.ravel()[fi] == 0:
+                break
+            bix, biy, biz = np.unravel_index(fi, block_counts.shape)
+            # Block centroid in grid coords
+            gcx = (bix + 0.5) * bs
+            gcy = (biy + 0.5) * bs
+            gcz = (biz + 0.5) * bs
+            wx, wy, wz = self._grid_to_world(gcx, gcy, gcz)
+
+            # Candidate at cruise altitude directly above the block
+            raw.append(np.array([wx, wy, cruise_z]))
+            # Candidate at the LiDAR offset above the block centroid
+            if self.lidar_altitude_offset > 0:
+                raw.append(np.array([wx, wy, wz - self.lidar_altitude_offset]))
+                raw.append(np.array([wx, wy, wz - self.lidar_altitude_offset * 2.0]))
+            # Candidate at the block's own Z (useful for enclosed regions)
+            raw.append(np.array([wx, wy, wz]))
+            # Offset candidates approaching from four horizontal sides
+            offset_d = bs * self.resolution * 0.5 + margin
+            for dx_, dy_ in [(offset_d, 0), (-offset_d, 0),
+                             (0, offset_d), (0, -offset_d)]:
+                sx_ = wx + dx_
+                sy_ = wy + dy_
+                if (self.xmin + margin <= sx_ <= self.xmax - margin and
+                        self.ymin + margin <= sy_ <= self.ymax - margin):
+                    raw.append(np.array([sx_, sy_, cruise_z]))
+
         if not raw:
             return np.empty((0, 3), dtype=np.float64)
 
@@ -882,17 +1013,32 @@ class ExplorationPlanner:
         cand: np.ndarray,
         occupied_grid: np.ndarray,
         unknown: np.ndarray,
-    ) -> int:
-        """Score *one* viewpoint by simulating its downward-facing LiDAR cone.
+    ) -> tuple[int, int]:
+        """Score a viewpoint — dispatches to ray-traced or columnar method."""
+        if self.nbv_use_ray_tracing:
+            return self._nbv_score_candidate_raytrace(cand, occupied_grid, unknown)
+        else:
+            return self._nbv_score_candidate_columnar(cand, occupied_grid, unknown)
 
-        Works at *any* altitude (above the grid, inside it, etc.).  For each
-        column (ix, iy) within the cone footprint the method walks downward
+    def _nbv_score_candidate_columnar(
+        self,
+        cand: np.ndarray,
+        occupied_grid: np.ndarray,
+        unknown: np.ndarray,
+    ) -> tuple[int, int]:
+        """Score *one* viewpoint using fast columnar (vertical) occlusion.
+
+        For each column (ix, iy) within the cone footprint, walks downward
         from the candidate's Z level and counts unknown voxels until an
-        occupied voxel occludes the rest of the column.  This correctly
-        handles overhangs: a candidate *below* an overhang can see the
-        voxels beneath it that a higher candidate cannot.
+        occupied voxel occludes the rest of the column.  Fast but does not
+        account for lateral obstacles (walls at the same altitude).
 
-        Returns the total visible-unknown-voxel count (information gain).
+        Returns
+        -------
+        frustum_gain : int
+            Visible unknown voxels inside the LiDAR cone.
+        volumetric_unknown : int
+            Total unknown voxels within ``nbv_volumetric_radius``.
         """
         cx, cy, cz = cand
         tan_ha = np.tan(np.radians(self.nbv_sensor_half_angle))
@@ -903,17 +1049,16 @@ class ExplorationPlanner:
         # Grid iz just at or above the candidate altitude
         ciz_float = (cz - self.zmin) / res
         ciz = int(np.clip(np.floor(ciz_float), -1, self.nz - 1))
-        # Start scanning from ciz+1 (first layer strictly below)
         iz_start = max(ciz + 1, 0)
         if iz_start >= self.nz:
-            return 0  # candidate below entire grid in NED → nothing to see
+            return 0, 0
 
         # Column world coordinates
-        col_x = self.xmin + (np.arange(self.nx) + 0.5) * res  # (nx,)
-        col_y = self.ymin + (np.arange(self.ny) + 0.5) * res  # (ny,)
-        dx2 = (col_x - cx) ** 2                               # (nx,)
-        dy2 = (col_y - cy) ** 2                               # (ny,)
-        dist_sq_xy = dx2[:, np.newaxis] + dy2[np.newaxis, :]   # (nx, ny)
+        col_x = self.xmin + (np.arange(self.nx) + 0.5) * res
+        col_y = self.ymin + (np.arange(self.ny) + 0.5) * res
+        dx2 = (col_x - cx) ** 2
+        dy2 = (col_y - cy) ** 2
+        dist_sq_xy = dx2[:, np.newaxis] + dy2[np.newaxis, :]
 
         # Per-column first-occupied below candidate
         first_occ = np.full((self.nx, self.ny), self.nz, dtype=np.intp)
@@ -921,29 +1066,176 @@ class ExplorationPlanner:
             mask = occupied_grid[:, :, iz] & (first_occ == self.nz)
             first_occ[mask] = iz
 
-        # Z centres for levels below the candidate
         wz_levels = self.zmin + (np.arange(iz_start, self.nz) + 0.5) * res
-        depths = wz_levels - cz                               # positive = below
-        cone_r_sq = np.where(depths > 0,
-                             (depths * tan_ha) ** 2, -1.0)    # (n_levels,)
+        depths = wz_levels - cz
+        cone_r_sq = np.where(depths > 0, (depths * tan_ha) ** 2, -1.0)
 
-        # 3-D distance² from candidate to each voxel centre:
-        # dist² = dx² + dy² + dz²  where dz = depth for each level.
-        # Voxels beyond the LiDAR max range produce unreliable returns.
-        dz2 = depths ** 2                                      # (n_levels,)
+        dz2 = depths ** 2
         dist3d_sq = (dist_sq_xy[:, :, np.newaxis]
-                     + dz2[np.newaxis, np.newaxis, :])         # (nx,ny,n_levels)
+                     + dz2[np.newaxis, np.newaxis, :])
 
-        iz_abs = np.arange(iz_start, self.nz)                 # absolute indices
-        # Broadcast: (nx, ny, 1) vs (1, 1, n_levels)
-        in_cone = (dist_sq_xy[:, :, np.newaxis]
-                   <= cone_r_sq[np.newaxis, np.newaxis, :])    # (nx,ny,n_levels)
-        in_range = dist3d_sq <= max_range_sq                   # (nx,ny,n_levels)
-        not_occ = (iz_abs[np.newaxis, np.newaxis, :]
-                   < first_occ[:, :, np.newaxis])              # (nx,ny,n_levels)
-        unk = unknown[:, :, iz_start:]                         # (nx,ny,n_levels)
+        iz_abs = np.arange(iz_start, self.nz)
+        in_cone = dist_sq_xy[:, :, np.newaxis] <= cone_r_sq[np.newaxis, np.newaxis, :]
+        in_range = dist3d_sq <= max_range_sq
+        not_occ = iz_abs[np.newaxis, np.newaxis, :] < first_occ[:, :, np.newaxis]
+        unk = unknown[:, :, iz_start:]
 
-        return int((in_cone & in_range & not_occ & unk).sum())
+        frustum_gain = int((in_cone & in_range & not_occ & unk).sum())
+
+        # Volumetric unknown density
+        vol_r = self.nbv_volumetric_radius
+        vol_r_vox = int(np.ceil(vol_r / res))
+        gxc = int(np.clip((cx - self.xmin) / res, 0, self.nx - 1))
+        gyc = int(np.clip((cy - self.ymin) / res, 0, self.ny - 1))
+        gzc = int(np.clip((cz - self.zmin) / res, 0, self.nz - 1))
+        x0 = max(gxc - vol_r_vox, 0); x1 = min(gxc + vol_r_vox + 1, self.nx)
+        y0 = max(gyc - vol_r_vox, 0); y1 = min(gyc + vol_r_vox + 1, self.ny)
+        z0 = max(gzc - vol_r_vox, 0); z1 = min(gzc + vol_r_vox + 1, self.nz)
+        volumetric_unknown = int(unknown[x0:x1, y0:y1, z0:z1].sum())
+
+        return frustum_gain, volumetric_unknown
+
+    def _nbv_score_candidate_raytrace(
+        self,
+        cand: np.ndarray,
+        occupied_grid: np.ndarray,
+        unknown: np.ndarray,
+    ) -> tuple[int, int]:
+        """Score *one* viewpoint using 3-D ray-traced visibility.
+
+        For each unknown voxel within the LiDAR cone and range, a 3-D
+        Bresenham-style ray is marched from the candidate to the voxel.
+        If any occupied voxel lies along that ray the unknown voxel is
+        considered occluded and is not counted.  This correctly handles
+        walls and obstacles in any direction, not just vertically.
+
+        To keep computation tractable the set of unknown target voxels
+        is randomly downsampled to ``nbv_ray_max_targets``; the final
+        count is then scaled up proportionally.
+
+        Returns
+        -------
+        frustum_gain : int
+            Estimated visible unknown voxels inside the LiDAR cone.
+        volumetric_unknown : int
+            Total unknown voxels within ``nbv_volumetric_radius`` of the
+            candidate (regardless of frustum visibility).
+        """
+        cx, cy, cz = cand
+        res = self.resolution
+        tan_ha = np.tan(np.radians(self.nbv_sensor_half_angle))
+        max_range = self.nbv_lidar_max_range
+        max_range_sq = max_range * max_range
+
+        # Candidate grid position (may be outside grid, that's OK)
+        gx0 = (cx - self.xmin) / res
+        gy0 = (cy - self.ymin) / res
+        gz0 = (cz - self.zmin) / res
+
+        # ── Collect all unknown voxels within cone & range ────────────
+        unk_ijs = np.argwhere(unknown)  # (N, 3) grid indices
+        if len(unk_ijs) == 0:
+            return 0, 0
+
+        # World centres of unknown voxels
+        wx = self.xmin + (unk_ijs[:, 0] + 0.5) * res
+        wy = self.ymin + (unk_ijs[:, 1] + 0.5) * res
+        wz = self.zmin + (unk_ijs[:, 2] + 0.5) * res
+
+        # 3-D distance filter
+        dx = wx - cx
+        dy = wy - cy
+        dz = wz - cz
+        dist_sq = dx * dx + dy * dy + dz * dz
+        in_range = dist_sq <= max_range_sq
+
+        # Cone filter: horizontal distance² <= (depth * tan_ha)²
+        # depth = distance along the look-down axis (positive = below in NED)
+        dist_xy_sq = dx * dx + dy * dy
+        cone_ok = dist_xy_sq <= (dz * tan_ha) ** 2
+        # Only count voxels below the candidate (dz > 0 in NED)
+        below = dz > 0
+
+        valid = in_range & cone_ok & below
+        n_total_in_cone = int(valid.sum())
+        if n_total_in_cone == 0:
+            # Still compute volumetric
+            vol_r = self.nbv_volumetric_radius
+            vol_r_vox = int(np.ceil(vol_r / res))
+            gxc = int(np.clip(gx0, 0, self.nx - 1))
+            gyc = int(np.clip(gy0, 0, self.ny - 1))
+            gzc = int(np.clip(gz0, 0, self.nz - 1))
+            x0 = max(gxc - vol_r_vox, 0); x1 = min(gxc + vol_r_vox + 1, self.nx)
+            y0 = max(gyc - vol_r_vox, 0); y1 = min(gyc + vol_r_vox + 1, self.ny)
+            z0 = max(gzc - vol_r_vox, 0); z1 = min(gzc + vol_r_vox + 1, self.nz)
+            vol_unk = int(unknown[x0:x1, y0:y1, z0:z1].sum())
+            return 0, vol_unk
+
+        valid_ijs = unk_ijs[valid]  # (M, 3)
+
+        # ── Downsample for speed ─────────────────────────────────────
+        budget = self.nbv_ray_max_targets
+        if len(valid_ijs) > budget:
+            chosen = np.random.choice(len(valid_ijs), budget, replace=False)
+            sample_ijs = valid_ijs[chosen]
+            scale_factor = n_total_in_cone / budget
+        else:
+            sample_ijs = valid_ijs
+            scale_factor = 1.0
+
+        # ── 3-D ray march (vectorised Bresenham) ─────────────────────
+        # For each sampled unknown voxel, march a ray from the candidate
+        # grid position to the target grid position and check if any
+        # cell along the way is occupied.
+        n_visible = 0
+        occ = occupied_grid  # alias
+        nx, ny, nz = self.nx, self.ny, self.nz
+        # Candidate grid coords (float)
+        ox, oy, oz = gx0, gy0, gz0
+
+        for ti in range(len(sample_ijs)):
+            tx, ty, tz = int(sample_ijs[ti, 0]), int(sample_ijs[ti, 1]), int(sample_ijs[ti, 2])
+            # Ray direction in grid space
+            rdx = tx - ox
+            rdy = ty - oy
+            rdz = tz - oz
+            steps = max(abs(int(round(rdx))), abs(int(round(rdy))),
+                        abs(int(round(rdz))), 1)
+            inv_steps = 1.0 / steps
+            sx = rdx * inv_steps
+            sy = rdy * inv_steps
+            sz = rdz * inv_steps
+
+            occluded = False
+            # Walk from candidate toward target, skip first (candidate) and
+            # last (the target voxel itself)
+            px, py, pz = ox, oy, oz
+            for s in range(1, steps):
+                px += sx; py += sy; pz += sz
+                ix = int(px)
+                iy = int(py)
+                iz = int(pz)
+                if 0 <= ix < nx and 0 <= iy < ny and 0 <= iz < nz:
+                    if occ[ix, iy, iz]:
+                        occluded = True
+                        break
+            if not occluded:
+                n_visible += 1
+
+        frustum_gain = int(round(n_visible * scale_factor))
+
+        # ── Volumetric unknown density around the candidate ──────────
+        vol_r = self.nbv_volumetric_radius
+        vol_r_vox = int(np.ceil(vol_r / res))
+        gxc = int(np.clip(gx0, 0, self.nx - 1))
+        gyc = int(np.clip(gy0, 0, self.ny - 1))
+        gzc = int(np.clip(gz0, 0, self.nz - 1))
+        x0 = max(gxc - vol_r_vox, 0); x1 = min(gxc + vol_r_vox + 1, self.nx)
+        y0 = max(gyc - vol_r_vox, 0); y1 = min(gyc + vol_r_vox + 1, self.ny)
+        z0 = max(gzc - vol_r_vox, 0); z1 = min(gzc + vol_r_vox + 1, self.nz)
+        volumetric_unknown = int(unknown[x0:x1, y0:y1, z0:z1].sum())
+
+        return frustum_gain, volumetric_unknown
 
     def _nbv_select_target(
         self,
@@ -1004,23 +1296,119 @@ class ExplorationPlanner:
                 if occupied_grid[gx, gy, gz]:
                     continue
 
-            gain = self._nbv_score_candidate(cand, occupied_grid, unknown)
-            if gain == 0:
+            frustum_gain, vol_unknown = self._nbv_score_candidate(
+                cand, occupied_grid, unknown)
+            # Combined gain: direct frustum visibility + weighted
+            # volumetric unknown density.  The volumetric term biases
+            # toward large unexplored regions even when the frustum
+            # can only see a few unknowns (e.g. behind walls).
+            combined_gain = (frustum_gain
+                             + self.nbv_volumetric_weight * vol_unknown)
+            if combined_gain <= 0:
                 continue
 
-            score = gain / max(dist, 0.01) ** self.distance_exponent
+            score = combined_gain / max(dist, 0.01) ** self.distance_exponent
             n_evaluated += 1
 
             if score > best_score:
                 best_score = score
                 best_candidate = cand.copy()
+                best_frustum = frustum_gain
+                best_vol = vol_unknown
 
-        print(f"    [nbv] {len(candidates)} candidates, "
-              f"{n_evaluated} scored, best gain/cost={best_score:.1f}")
+        if best_candidate is not None:
+            print(f"    [nbv] {len(candidates)} candidates, "
+                  f"{n_evaluated} scored, best score={best_score:.1f} "
+                  f"(frustum={best_frustum}, vol={best_vol})")
+        else:
+            print(f"    [nbv] {len(candidates)} candidates, "
+                  f"{n_evaluated} scored, no valid target")
 
         if best_candidate is not None:
             self._waypoint_history.append(best_candidate.copy())
         return best_candidate
+
+    # ── Random waypoint selection ─────────────────────────────────────────
+
+    def _random_select_target(
+        self,
+        current_pos: np.ndarray,
+        occupied_grid: np.ndarray,
+        path_planner: "PathPlanner | None" = None,
+    ) -> np.ndarray | None:
+        """Select a random goal near obstacles that forces non-trivial planning.
+
+        Uses the same strategy as ``sample_near_obstacle_goal`` from
+        obstacleAvoidance.py: picks goals 2–5 m from occupied voxels that
+        are traversable but whose straight line from the drone is blocked
+        by obstacles, guaranteeing the path planner must route around them.
+
+        Falls back to simple random sampling if no PathPlanner is available
+        or no near-obstacle goal can be found.
+        """
+        cur_xyz = current_pos[:3]
+
+        # ── Primary: near-obstacle goal via PathPlanner ───────────────
+        if path_planner is not None and path_planner.occupied is not None:
+            goal = sample_near_obstacle_goal(
+                path_planner,
+                cur_xyz,
+                min_dist_from_obstacle=2.0,
+                max_dist_from_obstacle=5.0,
+                min_dist_from_drone=self.min_target_distance,
+                max_attempts=self.random_max_attempts,
+            )
+            if goal is not None:
+                # Check proximity to previous waypoints
+                if self._waypoint_history:
+                    prev = np.array(self._waypoint_history)
+                    if np.any(np.linalg.norm(prev - goal, axis=1)
+                              < self.waypoint_exclusion_radius):
+                        goal = None
+            if goal is not None:
+                self._waypoint_history.append(goal.copy())
+                print(f"    [random] near-obstacle goal selected")
+                return goal
+            print(f"    [random] near-obstacle sampling failed, "
+                  f"falling back to free-space random")
+
+        # ── Fallback: simple random in observed free space ────────────
+        margin = self.inflation_margin
+        inflate_r = max(1, int(np.ceil(margin / self.resolution)))
+        struct = ndimage.generate_binary_structure(3, 1)
+        inflated = ndimage.binary_dilation(
+            occupied_grid, structure=struct, iterations=inflate_r)
+
+        for attempt in range(self.random_max_attempts):
+            x = np.random.uniform(self.xmin + margin, self.xmax - margin)
+            y = np.random.uniform(self.ymin + margin, self.ymax - margin)
+            z = np.random.uniform(self.zmin + margin, self.zmax - margin)
+            cand = np.array([x, y, z])
+
+            gx, gy, gz = self._world_to_grid(x, y, z)
+            if not self._observed[gx, gy, gz]:
+                continue
+            if inflated[gx, gy, gz]:
+                continue
+
+            dist = float(np.linalg.norm(cand - cur_xyz))
+            if dist < self.min_target_distance:
+                continue
+
+            if self._waypoint_history:
+                prev = np.array(self._waypoint_history)
+                if np.any(np.linalg.norm(prev - cand, axis=1)
+                          < self.waypoint_exclusion_radius):
+                    continue
+
+            self._waypoint_history.append(cand.copy())
+            print(f"    [random] free-space fallback after "
+                  f"{attempt + 1}/{self.random_max_attempts} attempts")
+            return cand
+
+        print(f"    [random] failed to find valid waypoint after "
+              f"{self.random_max_attempts} attempts")
+        return None
 
     # ── Core planner ──────────────────────────────────────────────────────
 
@@ -1121,7 +1509,26 @@ class ExplorationPlanner:
         unknown_adjacent = ndimage.binary_dilation(unknown, structure=struct)
         is_frontier = free & unknown_adjacent
 
-        # ── Branch: NBV or WFD ────────────────────────────────────────
+        # ── Branch: Random, NBV, or WFD ────────────────────────────────
+        if self.use_random:
+            # ── 4r) Random waypoint — uses PathPlanner if available ──
+            best_target = self._random_select_target(
+                current_pos, occupied_grid, self._path_planner)
+
+            # Still populate frontier overlay for the viewer
+            frt_ijs = np.argwhere(is_frontier)
+            if len(frt_ijs) > 0:
+                frontier_world = np.column_stack([
+                    self.xmin + (frt_ijs[:, 0] + 0.5) * self.resolution,
+                    self.ymin + (frt_ijs[:, 1] + 0.5) * self.resolution,
+                    self.zmin + (frt_ijs[:, 2] + 0.5) * self.resolution,
+                ])
+                info["frontier_world_pts"] = frontier_world
+                info["n_frontier_cells"] = len(frt_ijs)
+                info["n_frontier_cells_raw"] = len(frt_ijs)
+
+            return best_target, info
+
         if self.use_nbv:
             # ── 4a) NBV — frustum-based viewpoint scoring ────────────
             best_target = self._nbv_select_target(
@@ -1284,8 +1691,8 @@ SAVE_DIR = os.path.join(os.path.dirname(__file__), "flight_recordings")
 #REPLAY_DIR      = "flight_recordings"            # e.g. "flight_recordings/flight_1771909992"
 REPLAY_DIR      = ""  
 # ── Exploration parameters (shared by both modes) ────────────────────────
-EXPLORE_BOUNDS  = (-15, 15, -35, 5, -15, 0)   # (xmin,xmax,ymin,ymax,zmin,zmax) NED
-TAKEOFF_HEIGHT  = EXPLORE_BOUNDS[4] - 5         # NED z, 5 m above grid ceiling (LiDAR points down)
+EXPLORE_BOUNDS  = (-15, 20, -35, 5, -14, 0)   # (xmin,xmax,ymin,ymax,zmin,zmax) NED
+TAKEOFF_HEIGHT  = EXPLORE_BOUNDS[4] -5         
 VELOCITY        = 3             # m/s (live mode only)
 SCAN_HZ         = 1 / 1.5      # scans per second (live mode only)
 PLANNER_RES     = 1.0           # planning grid voxel size (m)
@@ -1296,7 +1703,7 @@ FRAME_SKIP      = 1             # process every Nth frame (replay mode, 1 = all)
 
 # ── Path-planning parameters (live mode) ─────────────────────────────────
 INFLATION_RADIUS    = 1.5       # safety margin (m) inflated around obstacles
-ABOVE_GRID_MARGIN   = 10.0      # metres of free airspace above the grid ceiling
+ABOVE_GRID_MARGIN   = 10.0      # metres of free airspace above the grid ceiling (Z)
 PATH_PLANNER_TYPE   = "ABITstar"
 PATH_SOLVE_TIMEOUT  = 2.0       # seconds per OMPL solve
 FLIGHT_MODE         = "velocity" # "path" (moveOnPathAsync) or "velocity" (pure-pursuit)
@@ -1311,10 +1718,14 @@ MIN_TARGET_DIST     = 3.0       # skip targets closer than this (m) to avoid re-
 WP_EXCLUSION_RADIUS = 3.0       # avoid re-selecting waypoints within this radius (m)
 
 # ── Target selection algorithm ───────────────────────────────────────────
+# Set USE_RANDOM = True for random waypoint selection (baseline comparison).
 # Set USE_NBV = True to use Next-Best-View frustum scoring instead of WFD
 # frontier-centroid scoring.  NBV generates candidate viewpoints on a grid
 # at cruise altitude and picks the one that maximises the number of unknown
 # voxels visible through a simulated downward-facing LiDAR cone.
+# Priority: USE_RANDOM > USE_NBV > WFD (only the first enabled mode runs).
+USE_RANDOM              = False
+RANDOM_MAX_ATTEMPTS     = 50
 USE_NBV                 = True
 NBV_SENSOR_HALF_ANGLE   = 45.0  # half-angle (deg) of the LiDAR cone
 NBV_CRUISE_ALTITUDE     = TAKEOFF_HEIGHT  # one of the altitude options for candidates (NED)
@@ -1322,6 +1733,12 @@ NBV_N_UNKNOWN_COLUMNS   = 10    # top-K columns by unknown-voxel count to sample
 NBV_N_LOCAL_SAMPLES     = 15    # random free-space samples near the drone
 NBV_LOCAL_RADIUS        = 10.0  # world-space radius for local samples (m)
 NBV_LIDAR_MAX_RANGE     = 40.0  # LiDAR max range (m); voxels beyond this are not scored
+NBV_UNKNOWN_BLOCK_SIZE  = 4     # coarse block size (voxels) for unknown-region heuristic
+NBV_N_UNKNOWN_BLOCKS    = 8     # top-K densest unknown blocks to generate candidates from
+NBV_VOLUMETRIC_RADIUS   = 8.0   # radius (m) for volumetric unknown density bonus
+NBV_VOLUMETRIC_WEIGHT   = 0.3   # weight of volumetric unknown term vs. frustum gain
+NBV_RAY_MAX_TARGETS     = 500   # max unknown voxels to ray-trace per candidate (downsample budget)
+NBV_USE_RAY_TRACING     = True  # True = 3D ray tracing, False = fast columnar occlusion
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Replay mode — offline exploration on saved LiDAR data
@@ -1359,16 +1776,25 @@ def run_replay(recording_dir: str):
         bounds=EXPLORE_BOUNDS,
         resolution=PLANNER_RES,
         min_frontier_size=3,
+        use_random=USE_RANDOM,
+        random_max_attempts=RANDOM_MAX_ATTEMPTS,
         use_nbv=USE_NBV,
         nbv_sensor_half_angle=NBV_SENSOR_HALF_ANGLE,
         nbv_cruise_altitude=NBV_CRUISE_ALTITUDE,
         nbv_n_unknown_columns=NBV_N_UNKNOWN_COLUMNS,
         nbv_n_local_samples=NBV_N_LOCAL_SAMPLES,
         nbv_local_radius=NBV_LOCAL_RADIUS,
+        nbv_unknown_block_size=NBV_UNKNOWN_BLOCK_SIZE,
+        nbv_n_unknown_blocks=NBV_N_UNKNOWN_BLOCKS,
+        nbv_volumetric_radius=NBV_VOLUMETRIC_RADIUS,
+        nbv_volumetric_weight=NBV_VOLUMETRIC_WEIGHT,
+        nbv_ray_max_targets=NBV_RAY_MAX_TARGETS,
+        nbv_use_ray_tracing=NBV_USE_RAY_TRACING,
     )
 
+    strategy = "random" if USE_RANDOM else ("NBV" if USE_NBV else "WFD")
     print(f"\n{'='*60}")
-    print(f"Exploration planner replay")
+    print(f"Exploration planner replay  (strategy: {strategy})")
     print(f"  Bounds: x=[{EXPLORE_BOUNDS[0]}, {EXPLORE_BOUNDS[1]}], "
           f"y=[{EXPLORE_BOUNDS[2]}, {EXPLORE_BOUNDS[3]}], "
           f"z=[{EXPLORE_BOUNDS[4]}, {EXPLORE_BOUNDS[5]}]")
@@ -1512,6 +1938,8 @@ def run_live():
         min_target_distance=MIN_TARGET_DIST,
         waypoint_exclusion_radius=WP_EXCLUSION_RADIUS,
         inflation_margin=INFLATION_RADIUS + 0.5,
+        use_random=USE_RANDOM,
+        random_max_attempts=RANDOM_MAX_ATTEMPTS,
         use_nbv=USE_NBV,
         nbv_sensor_half_angle=NBV_SENSOR_HALF_ANGLE,
         nbv_cruise_altitude=NBV_CRUISE_ALTITUDE,
@@ -1520,6 +1948,12 @@ def run_live():
         nbv_local_radius=NBV_LOCAL_RADIUS,
         above_grid_margin=ABOVE_GRID_MARGIN,
         nbv_lidar_max_range=NBV_LIDAR_MAX_RANGE,
+        nbv_unknown_block_size=NBV_UNKNOWN_BLOCK_SIZE,
+        nbv_n_unknown_blocks=NBV_N_UNKNOWN_BLOCKS,
+        nbv_volumetric_radius=NBV_VOLUMETRIC_RADIUS,
+        nbv_volumetric_weight=NBV_VOLUMETRIC_WEIGHT,
+        nbv_ray_max_targets=NBV_RAY_MAX_TARGETS,
+        nbv_use_ray_tracing=NBV_USE_RAY_TRACING,
     )
     buf.set_planner(exploration)
 
@@ -1531,6 +1965,9 @@ def run_live():
         ground_z=0.0,
         above_grid_margin=ABOVE_GRID_MARGIN,
     )
+    # Give the exploration planner a reference to the path planner so
+    # random mode can use sample_near_obstacle_goal().
+    exploration._path_planner = path_planner
 
     # ── Takeoff ──────────────────────────────────────────────────────────
     # Scan collection thread is already running (started above).
@@ -1588,6 +2025,8 @@ def run_live():
           f"y=[{EXPLORE_BOUNDS[2]}, {EXPLORE_BOUNDS[3]}], "
           f"z=[{EXPLORE_BOUNDS[4]}, {EXPLORE_BOUNDS[5]}]")
     print(f"  Grid:  {exploration.nx} x {exploration.ny} x {exploration.nz} voxels @ {PLANNER_RES} m")
+    strategy = "random" if USE_RANDOM else ("NBV" if USE_NBV else "WFD")
+    print(f"  Target strategy: {strategy}")
     print(f"  Path planner: {PATH_PLANNER_TYPE}  |  Inflation: {INFLATION_RADIUS} m")
     print(f"  Flight mode: {mode_label}  |  Max waypoints: {MAX_TARGETS}")
     print(f"{'='*60}\n")
@@ -1598,15 +2037,29 @@ def run_live():
         # The PathFollower background thread automatically holds altitude
         # between paths — no explicit hover command needed here.
 
+        buf.drain_overlays()
         quality_plot.update(live.pipeline)
 
         state = live.client.getMultirotorState()
         p = state.kinematics_estimated.position
         current_pos = np.array([p.x_val, p.y_val, p.z_val])
 
+        # ── Update PathPlanner's map BEFORE target selection so that
+        #    random mode has access to the current traversability grid.
+        origin = np.array([exploration.xmin, exploration.ymin, exploration.zmin])
+        path_planner.update_map(
+            exploration._observed.copy(),
+            exploration._last_occupied_grid.copy(),
+            origin, exploration.resolution,
+        )
+        vis_pts = live.pipeline.get_map_points()
+        if len(vis_pts) > 0:
+            path_planner.points = vis_pts.astype(np.float32)
+
         target, info = exploration.next_target(live.pipeline, current_pos)
 
-        live.set_frontier_points(info.get("frontier_world_pts"))
+        # Queue overlays for deferred display (syncs with SLAM buffer delay)
+        buf.queue_overlay(frontier_points=info.get("frontier_world_pts"))
 
         print(f"  [{wp_count + 1:02d}] Occupied: {info['n_occupied_cells']} | "
               f"Frontiers: {info['n_frontier_cells']}/{info['n_frontier_cells_raw']} "
@@ -1618,22 +2071,10 @@ def run_live():
 
         print(f"       -> target ({target[0]:.1f}, {target[1]:.1f}, {target[2]:.1f})")
 
-        live.set_target(target.tolist())
+        buf.queue_overlay(target_pos=target.tolist())
         wp_count += 1
 
-        # ── Update PathPlanner's map from exploration grids ──────────
-        origin = np.array([exploration.xmin, exploration.ymin, exploration.zmin])
-        path_planner.update_map(
-            exploration._observed.copy(),
-            exploration._last_occupied_grid.copy(),
-            origin, exploration.resolution,
-        )
-        # Store occupied world-frame points for viewer / clearance tracking
-        vis_pts = live.pipeline.get_map_points()
-        if len(vis_pts) > 0:
-            path_planner.points = vis_pts.astype(np.float32)
-
-        # ── Plan a collision-free path to the frontier target ────────
+        # ── Plan a collision-free path to the target ─────────────────
         t_plan = time.time()
         path = path_planner.plan(current_pos, target)
         dt_plan = time.time() - t_plan
@@ -1641,8 +2082,8 @@ def run_live():
         if path is not None:
             print(f"       Path: {len(path)} waypoints, {dt_plan:.2f}s")
 
-            # Show the planned path in the 3D viewer (cyan line)
-            live.set_path_points(np.asarray(path, dtype=np.float64))
+            # Queue the planned path for deferred display
+            buf.queue_overlay(path_points=np.asarray(path, dtype=np.float64))
 
             # Fly the planned path with the threaded PathFollower
             follower.follow(path, goal=target)
@@ -1650,6 +2091,7 @@ def run_live():
             # Wait for the follower to finish — scans are collected
             # continuously by the BufferedSLAM background thread.
             while follower.is_busy:
+                buf.drain_overlays()
                 quality_plot.update(live.pipeline)
                 time.sleep(0.05)
 
@@ -1665,15 +2107,13 @@ def run_live():
                       f"error: {result.arrival_error:.2f} m, "
                       f"clearance: {clearance_str}")
         else:
-            print(f"       No path found ({dt_plan:.2f}s) — flying direct")
-            live.set_path_points(None)  # clear path line from viewer
-            # Fall back to straight-line flight routed through the
-            # PathFollower so it uses the correct thread-local client.
-            straight_path = np.array([current_pos, target], dtype=np.float64)
-            follower.follow(straight_path, goal=target)
-            while follower.is_busy:
-                quality_plot.update(live.pipeline)
-                time.sleep(0.05)
+            print(f"       No path found ({dt_plan:.2f}s) — skipping target")
+            buf.queue_overlay(path_points=None)  # clear path line from viewer
+            # Do NOT fall back to straight-line flight — the path planner
+            # couldn't find a route, so flying direct would hit obstacles.
+            # Instead, skip this target and let the next iteration pick
+            # a different one.
+            continue
 
         # Brief pause to let the scan thread populate the map
         time.sleep(0.5)
@@ -1681,6 +2121,18 @@ def run_live():
     print(f"\nExploration finished after {wp_count} waypoints.")
 
     # ── Finalise ─────────────────────────────────────────────────────────
+    # Flush any remaining deferred overlays so the viewer is up to date
+    with buf._overlay_lock:
+        for _, data in buf._overlay_queue:
+            if "target_pos" in data:
+                live.set_target(data["target_pos"])
+            if "path_points" in data:
+                live.set_path_points(data["path_points"])
+            if "frontier_points" in data:
+                live.set_frontier_points(data["frontier_points"])
+        buf._overlay_queue.clear()
+    live.refresh_overlays()
+
     buf.stop_collection()
     follower.stop()
     buf.flush()

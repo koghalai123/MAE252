@@ -211,6 +211,20 @@ class PathPlanner:
                   f"({fixed[0]:.1f}, {fixed[1]:.1f}, {fixed[2]:.1f})")
             start = fixed
 
+        # Auto-fix invalid goal: same logic as start.
+        if not self._is_valid_point(goal):
+            fixed = self.find_nearest_free(goal, margin=3.0)
+            if fixed is None:
+                fixed = self.find_nearest_free(goal)  # try without margin
+            if fixed is None:
+                print(f"  [plan] Cannot fix invalid goal "
+                      f"({goal[0]:.1f}, {goal[1]:.1f}, {goal[2]:.1f})")
+                return None
+            print(f"  [plan] Auto-adjusted goal from "
+                  f"({goal[0]:.1f}, {goal[1]:.1f}, {goal[2]:.1f}) to "
+                  f"({fixed[0]:.1f}, {fixed[1]:.1f}, {fixed[2]:.1f})")
+            goal = fixed
+
         pdef = ob.ProblemDefinition(self._si)
 
         s = ob.State(self._space)
@@ -275,23 +289,9 @@ class PathPlanner:
     def is_traversable(self, x: float, y: float, z: float) -> bool:
         """True if the point is in known-free (observed & not inflated) space.
 
-        Points above the grid are free unless tall obstacles in the column
-        below project upward into the above-grid margin.
+        Points above the grid are treated as free airspace.
         """
         if self._is_above_grid(x, y, z):
-            res = self._resolution
-            ix = int((x - self._origin[0]) / res)
-            iy = int((y - self._origin[1]) / res)
-            if not (0 <= ix < self._nx and 0 <= iy < self._ny):
-                return True
-            z_ceil = float(self._origin[2])
-            height_above = z_ceil - z
-            n_check = max(1, int(np.ceil(
-                (self.inflation_radius + height_above) / res)))
-            n_check = min(n_check, self._nz)
-            if self._inflated_grid is not None:
-                if np.any(self._inflated_grid[ix, iy, :n_check]):
-                    return False
             return True
         if self._traversable is None:
             return False
@@ -510,9 +510,8 @@ class PathPlanner:
         """OMPL validity checker — True only for known-free space.
 
         Points above the grid (within ``above_grid_margin``) are treated as
-        free airspace **unless** the column below contains inflated obstacles
-        near the grid ceiling.  Tall obstacles therefore "project" upward
-        into above-grid airspace, forcing the planner to route around them.
+        free airspace.  Only the X/Y grid footprint is enforced; the drone
+        can fly at any height within the above-grid margin.
         """
         x, y, z = state[0], state[1], state[2]
 
@@ -520,25 +519,8 @@ class PathPlanner:
         if z > self.ground_z:
             return False
 
-        # Above-grid airspace — project downward into the grid to check
-        # for tall obstacles that extend into the above-grid margin.
+        # Above-grid airspace — free as long as within X/Y footprint
         if self._is_above_grid(x, y, z):
-            res = self._resolution
-            ix = int((x - self._origin[0]) / res)
-            iy = int((y - self._origin[1]) / res)
-            if not (0 <= ix < self._nx and 0 <= iy < self._ny):
-                return True  # outside grid XY footprint — nothing to hit
-            # How far above the grid ceiling is the point?
-            z_ceil = float(self._origin[2])
-            height_above = z_ceil - z  # positive value (NED: more negative = higher)
-            # Check top layers of the grid — any inflated obstacle whose
-            # top is within inflation_radius + height_above blocks this column.
-            n_check = max(1, int(np.ceil(
-                (self.inflation_radius + height_above) / res)))
-            n_check = min(n_check, self._nz)
-            if self._inflated_grid is not None:
-                if np.any(self._inflated_grid[ix, iy, :n_check]):
-                    return False
             return True
 
         # Grid index (no clamp)

@@ -48,7 +48,7 @@ from sensorFeed import Viewer3D
 
 from RegistrationComparison import (
     get_register_fn, resolve_recording_dir, filter_valid, xform_pts,
-    apply_T, fit_plane,
+    apply_T, fit_plane, evaluate_registration,
     ICP_VOXEL, NORM_NN, LOCAL_R, MIN_VOXELS,
 )
 
@@ -342,6 +342,7 @@ class SLAMPipeline:
         self.q_frames:   list[int]   = []
         self.q_fitness:  list[float] = []
         self.q_rmse:     list[float] = []
+        self.q_inlier_rmse: list[float] = []
         self.q_dt:       list[float] = []
         self.q_dr:       list[float] = []
         self.q_p_rmse:   list[float] = []
@@ -517,13 +518,27 @@ class SLAMPipeline:
                 target_pts.astype(np.float64))
             world_pts = apply_T(world_init, T_reg).astype(np.float32)
 
+            # Re-evaluate with all-points RMSE — Open3D's inlier_rmse only
+            # measures points within max_correspondence_distance, which
+            # stays deceptively low even on badly misaligned registrations.
+            _, inlier_rmse, full_rmse, mean_dist = evaluate_registration(
+                world_init.astype(np.float64),
+                target_pts.astype(np.float64),
+                T_reg,
+                max_correspondence_distance=ICP_VOXEL,
+                downsample_voxel=ICP_VOXEL,
+            )
+            rmse = full_rmse  # use all-points RMSE for quality gating
+            inlier_rmse_val = inlier_rmse  # keep for plotting
+
             ct = T_reg[:3, 3]
             ce = Rotation.from_matrix(T_reg[:3, :3]).as_euler("xyz", degrees=True)
             dt_mag = float(np.linalg.norm(ct))
             dr_mag = float(np.linalg.norm(ce))
             src_n = reg_detail.get('src_pts', 0) if isinstance(reg_detail, dict) else 0
             tgt_n = reg_detail.get('tgt_pts', 0) if isinstance(reg_detail, dict) else 0
-            print(f"  REG {idx:03d}: fit={fitness:.4f} rmse={rmse:.4f} "
+            print(f"  REG {idx:03d}: fit={fitness:.4f} rmse={full_rmse:.4f} "
+                  f"(inlier={inlier_rmse:.4f} mean={mean_dist:.4f}) "
                   f"\u0394t={dt_mag:.4f}m "
                   f"\u0394r=({ce[0]:+.2f},{ce[1]:+.2f},{ce[2]:+.2f})\u00b0"
                   f"  src={src_n:,} tgt={tgt_n:,}")
@@ -531,6 +546,7 @@ class SLAMPipeline:
             world_pts = world_init.astype(np.float32)
             T_reg = np.eye(4)
             fitness = rmse = dt_mag = dr_mag = 0.0
+            inlier_rmse_val = 0.0
             print(f"  frame {idx:03d}: "
                   f"{'baseline' if self.cfg.registration == 'state_only' else f'too few voxels ({self._vis_len})'}"
                   f", state pose only")
@@ -540,6 +556,7 @@ class SLAMPipeline:
         self.q_frames.append(idx)
         self.q_fitness.append(fitness)
         self.q_rmse.append(rmse)
+        self.q_inlier_rmse.append(inlier_rmse_val)
         self.q_dt.append(dt_mag)
         self.q_dr.append(dr_mag)
 
@@ -793,6 +810,7 @@ class SLAMPipeline:
         self.q_frames.clear()
         self.q_fitness.clear()
         self.q_rmse.clear()
+        self.q_inlier_rmse.clear()
         self.q_dt.clear()
         self.q_dr.clear()
         self.q_p_rmse.clear()
@@ -1221,9 +1239,12 @@ class _QualityPlot:
         self.ax_fit.axhline(0.2, color='r', ls='--', lw=0.7, label='poor')
         self.ax_fit.legend(fontsize=8)
 
-        self.line_rmse, = self.ax_rmse.plot([], [], 'r-', lw=1)
-        self.ax_rmse.set_ylabel('Inlier RMSE (m)'); self.ax_rmse.set_xlabel('Frame')
+        self.line_rmse, = self.ax_rmse.plot([], [], 'r-', lw=1, label='Full RMSE')
+        self.line_inlier_rmse, = self.ax_rmse.plot([], [], 'b-', lw=1,
+                                                    alpha=0.6, label='Inlier RMSE')
+        self.ax_rmse.set_ylabel('RMSE (m)'); self.ax_rmse.set_xlabel('Frame')
         self.ax_rmse.set_title('RMSE (lower = tighter fit)')
+        self.ax_rmse.legend(fontsize=8, loc='upper left')
         self.ax_rmse2 = self.ax_rmse.twinx()
         self.line_p_rmse, = self.ax_rmse2.plot([], [], color='orange', ls='--',
                                                 lw=0.8, alpha=0.7, label='p-value')
@@ -1263,6 +1284,7 @@ class _QualityPlot:
             p = pipeline
             self.line_fit.set_data(p.q_frames, p.q_fitness)
             self.line_rmse.set_data(p.q_frames, p.q_rmse)
+            self.line_inlier_rmse.set_data(p.q_frames, p.q_inlier_rmse)
             self.line_p_rmse.set_data(p.q_frames, p.q_p_rmse)
             self.line_dt.set_data(p.q_frames, p.q_dt)
             self.line_dr.set_data(p.q_frames, p.q_dr)

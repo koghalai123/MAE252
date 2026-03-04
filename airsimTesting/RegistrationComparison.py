@@ -129,6 +129,81 @@ def apply_T(pts, T):
     return (T @ h.T).T[:, :3]
 
 
+def evaluate_registration(
+    src_pts: np.ndarray,
+    tgt_pts: np.ndarray,
+    T: np.ndarray,
+    max_correspondence_distance: float = 0.25,
+    downsample_voxel: float = 0.0,
+) -> tuple[float, float, float, float]:
+    """Compute registration quality metrics using **all** source points.
+
+    Unlike Open3D’s ``inlier_rmse``, which only measures the RMSE of
+    source points that fall within ``max_correspondence_distance`` of a
+    target point (masking badly misaligned regions), this function returns
+    metrics that reflect the *entire* source cloud.
+
+    Parameters
+    ----------
+    src_pts : ndarray (N, 3)
+        Source points in their **original** frame (before ``T``).
+    tgt_pts : ndarray (M, 3)
+        Target points (the existing map).
+    T : ndarray (4, 4)
+        Homogeneous transform produced by the registration algorithm.
+    max_correspondence_distance : float
+        Distance threshold for the inlier/fitness calculation.
+    downsample_voxel : float
+        If > 0, voxel-downsample both clouds before evaluation to save
+        time on large clouds.  0 = use all points.
+
+    Returns
+    -------
+    fitness : float
+        Fraction of transformed source points that have a target
+        neighbour within ``max_correspondence_distance``.
+    inlier_rmse : float
+        Classic inlier RMSE (only inlier distances).
+    full_rmse : float
+        RMSE over **all** transformed source points (including outliers).
+        This is strictly ≥ inlier_rmse and spikes when alignment is bad.
+    mean_dist : float
+        Mean nearest-neighbour distance (all points).  More intuitive
+        than RMSE for spotting drift.
+    """
+    src = np.asarray(src_pts, dtype=np.float64)
+    tgt = np.asarray(tgt_pts, dtype=np.float64)
+    if src.shape[1] > 3:
+        src = src[:, :3]
+    if tgt.shape[1] > 3:
+        tgt = tgt[:, :3]
+
+    # Optional downsample for speed
+    if downsample_voxel > 0:
+        src_pcd = o3d.geometry.PointCloud()
+        src_pcd.points = o3d.utility.Vector3dVector(src)
+        src = np.asarray(src_pcd.voxel_down_sample(downsample_voxel).points)
+        tgt_pcd = o3d.geometry.PointCloud()
+        tgt_pcd.points = o3d.utility.Vector3dVector(tgt)
+        tgt = np.asarray(tgt_pcd.voxel_down_sample(downsample_voxel).points)
+
+    # Transform source
+    transformed = apply_T(src, T)
+
+    # Nearest-neighbour distances
+    tree = cKDTree(tgt)
+    dists, _ = tree.query(transformed, k=1)
+
+    inlier_mask = dists <= max_correspondence_distance
+    fitness = float(np.mean(inlier_mask)) if len(inlier_mask) else 0.0
+    inlier_rmse = (float(np.sqrt(np.mean(dists[inlier_mask] ** 2)))
+                   if np.any(inlier_mask) else 0.0)
+    full_rmse = float(np.sqrt(np.mean(dists ** 2))) if len(dists) else 0.0
+    mean_dist = float(np.mean(dists)) if len(dists) else 0.0
+
+    return fitness, inlier_rmse, full_rmse, mean_dist
+
+
 def fit_plane(pts):
     """Fit a plane via SVD.  Returns (normal, slope_x, slope_y, residual_std)."""
     if len(pts) < 10:
@@ -207,8 +282,8 @@ def register_state_only(src, tgt, init_T=np.eye(4)):
 #   let ICP progressively lock on.
 # ══════════════════════════════════════════════════════════════════════════════
 
-ICP_MULTI_CORR = [1.0, 0.5, 0.25]   # coarse → fine correspondence distances
-ICP_MULTI_ITER = [25, 15,  7 ]   # iterations per pass
+ICP_MULTI_CORR = [0.5, 0.25, 0.1]   # coarse → fine correspondence distances
+ICP_MULTI_ITER = [35, 15,  7 ]   # iterations per pass
 
 
 def register_icp_p2plane(src, tgt, init_T=np.eye(4)):
