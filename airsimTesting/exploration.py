@@ -121,7 +121,7 @@ class BufferedSLAM:
         """Schedule an overlay update to appear after the buffer delay.
 
         Accepted keyword arguments (all optional):
-          target_pos, path_points, frontier_points
+          target_pos, path_points, frontier_points, candidate_points
 
         The update is timestamped with ``time.time()`` and will be pushed
         to the viewer by ``drain_overlays()`` once ``overlay_delay``
@@ -152,6 +152,8 @@ class BufferedSLAM:
                 self.live.set_path_points(data["path_points"])
             if "frontier_points" in data:
                 self.live.set_frontier_points(data["frontier_points"])
+            if "candidate_points" in data:
+                self.live.set_candidate_points(data["candidate_points"])
         if ready:
             self.live.refresh_overlays()
 
@@ -1082,7 +1084,10 @@ class ExplorationPlanner:
 
         frustum_gain = int((in_cone & in_range & not_occ & unk).sum())
 
-        # Volumetric unknown density
+        # Volumetric unknown density — columnar occlusion applied within
+        # a sphere around the candidate so unknowns behind walls are not
+        # counted.  We reuse the columnar first-occupied map but extend
+        # to all Z levels (not just below the candidate).
         vol_r = self.nbv_volumetric_radius
         vol_r_vox = int(np.ceil(vol_r / res))
         gxc = int(np.clip((cx - self.xmin) / res, 0, self.nx - 1))
@@ -1091,111 +1096,57 @@ class ExplorationPlanner:
         x0 = max(gxc - vol_r_vox, 0); x1 = min(gxc + vol_r_vox + 1, self.nx)
         y0 = max(gyc - vol_r_vox, 0); y1 = min(gyc + vol_r_vox + 1, self.ny)
         z0 = max(gzc - vol_r_vox, 0); z1 = min(gzc + vol_r_vox + 1, self.nz)
-        volumetric_unknown = int(unknown[x0:x1, y0:y1, z0:z1].sum())
+        vol_unk_box = unknown[x0:x1, y0:y1, z0:z1]
+        # Distance filter within the box to make it a sphere
+        vx_ = self.xmin + (np.arange(x0, x1) + 0.5) * res
+        vy_ = self.ymin + (np.arange(y0, y1) + 0.5) * res
+        vz_ = self.zmin + (np.arange(z0, z1) + 0.5) * res
+        vdx2 = (vx_ - cx) ** 2
+        vdy2 = (vy_ - cy) ** 2
+        vdz2 = (vz_ - cz) ** 2
+        vdist_sq = (vdx2[:, None, None] + vdy2[None, :, None]
+                    + vdz2[None, None, :])
+        in_sphere = vdist_sq <= vol_r * vol_r
+        # Columnar occlusion: for each column, find the first occupied
+        # voxel below the candidate inside the sub-box, and mask
+        # everything beneath it.
+        occ_box = occupied_grid[x0:x1, y0:y1, z0:z1]
+        col_first_occ = np.full((x1 - x0, y1 - y0), z1 - z0, dtype=np.intp)
+        # iz relative to box z0; real iz = z0 + local_iz
+        # Walk downward from candidate altitude
+        local_iz_start = max(0, ciz + 1 - z0)
+        for liz in range(local_iz_start, z1 - z0):
+            m = occ_box[:, :, liz] & (col_first_occ == (z1 - z0))
+            col_first_occ[m] = liz
+        local_iz_arr = np.arange(z1 - z0)
+        not_occ_vol = local_iz_arr[None, None, :] < col_first_occ[:, :, None]
+        volumetric_unknown = int((vol_unk_box & in_sphere & not_occ_vol).sum())
 
         return frustum_gain, volumetric_unknown
 
-    def _nbv_score_candidate_raytrace(
+    # ── Helper: 3-D Bresenham ray-march visibility check ─────────
+    def _ray_march_visible(
         self,
-        cand: np.ndarray,
+        sample_ijs: np.ndarray,
+        ox: float, oy: float, oz: float,
         occupied_grid: np.ndarray,
-        unknown: np.ndarray,
-    ) -> tuple[int, int]:
-        """Score *one* viewpoint using 3-D ray-traced visibility.
+    ) -> int:
+        """Count how many *sample_ijs* voxels are visible via 3-D ray march.
 
-        For each unknown voxel within the LiDAR cone and range, a 3-D
-        Bresenham-style ray is marched from the candidate to the voxel.
-        If any occupied voxel lies along that ray the unknown voxel is
-        considered occluded and is not counted.  This correctly handles
-        walls and obstacles in any direction, not just vertically.
+        A Bresenham-style ray is marched from ``(ox, oy, oz)`` (candidate
+        grid position, float) to each target voxel.  If any occupied cell
+        lies along the ray the target is considered occluded.
 
-        To keep computation tractable the set of unknown target voxels
-        is randomly downsampled to ``nbv_ray_max_targets``; the final
-        count is then scaled up proportionally.
-
-        Returns
-        -------
-        frustum_gain : int
-            Estimated visible unknown voxels inside the LiDAR cone.
-        volumetric_unknown : int
-            Total unknown voxels within ``nbv_volumetric_radius`` of the
-            candidate (regardless of frustum visibility).
+        Returns the number of *unoccluded* targets.
         """
-        cx, cy, cz = cand
-        res = self.resolution
-        tan_ha = np.tan(np.radians(self.nbv_sensor_half_angle))
-        max_range = self.nbv_lidar_max_range
-        max_range_sq = max_range * max_range
-
-        # Candidate grid position (may be outside grid, that's OK)
-        gx0 = (cx - self.xmin) / res
-        gy0 = (cy - self.ymin) / res
-        gz0 = (cz - self.zmin) / res
-
-        # ── Collect all unknown voxels within cone & range ────────────
-        unk_ijs = np.argwhere(unknown)  # (N, 3) grid indices
-        if len(unk_ijs) == 0:
-            return 0, 0
-
-        # World centres of unknown voxels
-        wx = self.xmin + (unk_ijs[:, 0] + 0.5) * res
-        wy = self.ymin + (unk_ijs[:, 1] + 0.5) * res
-        wz = self.zmin + (unk_ijs[:, 2] + 0.5) * res
-
-        # 3-D distance filter
-        dx = wx - cx
-        dy = wy - cy
-        dz = wz - cz
-        dist_sq = dx * dx + dy * dy + dz * dz
-        in_range = dist_sq <= max_range_sq
-
-        # Cone filter: horizontal distance² <= (depth * tan_ha)²
-        # depth = distance along the look-down axis (positive = below in NED)
-        dist_xy_sq = dx * dx + dy * dy
-        cone_ok = dist_xy_sq <= (dz * tan_ha) ** 2
-        # Only count voxels below the candidate (dz > 0 in NED)
-        below = dz > 0
-
-        valid = in_range & cone_ok & below
-        n_total_in_cone = int(valid.sum())
-        if n_total_in_cone == 0:
-            # Still compute volumetric
-            vol_r = self.nbv_volumetric_radius
-            vol_r_vox = int(np.ceil(vol_r / res))
-            gxc = int(np.clip(gx0, 0, self.nx - 1))
-            gyc = int(np.clip(gy0, 0, self.ny - 1))
-            gzc = int(np.clip(gz0, 0, self.nz - 1))
-            x0 = max(gxc - vol_r_vox, 0); x1 = min(gxc + vol_r_vox + 1, self.nx)
-            y0 = max(gyc - vol_r_vox, 0); y1 = min(gyc + vol_r_vox + 1, self.ny)
-            z0 = max(gzc - vol_r_vox, 0); z1 = min(gzc + vol_r_vox + 1, self.nz)
-            vol_unk = int(unknown[x0:x1, y0:y1, z0:z1].sum())
-            return 0, vol_unk
-
-        valid_ijs = unk_ijs[valid]  # (M, 3)
-
-        # ── Downsample for speed ─────────────────────────────────────
-        budget = self.nbv_ray_max_targets
-        if len(valid_ijs) > budget:
-            chosen = np.random.choice(len(valid_ijs), budget, replace=False)
-            sample_ijs = valid_ijs[chosen]
-            scale_factor = n_total_in_cone / budget
-        else:
-            sample_ijs = valid_ijs
-            scale_factor = 1.0
-
-        # ── 3-D ray march (vectorised Bresenham) ─────────────────────
-        # For each sampled unknown voxel, march a ray from the candidate
-        # grid position to the target grid position and check if any
-        # cell along the way is occupied.
         n_visible = 0
-        occ = occupied_grid  # alias
+        occ = occupied_grid
         nx, ny, nz = self.nx, self.ny, self.nz
-        # Candidate grid coords (float)
-        ox, oy, oz = gx0, gy0, gz0
 
         for ti in range(len(sample_ijs)):
-            tx, ty, tz = int(sample_ijs[ti, 0]), int(sample_ijs[ti, 1]), int(sample_ijs[ti, 2])
-            # Ray direction in grid space
+            tx = int(sample_ijs[ti, 0])
+            ty = int(sample_ijs[ti, 1])
+            tz = int(sample_ijs[ti, 2])
             rdx = tx - ox
             rdy = ty - oy
             rdz = tz - oz
@@ -1207,8 +1158,6 @@ class ExplorationPlanner:
             sz = rdz * inv_steps
 
             occluded = False
-            # Walk from candidate toward target, skip first (candidate) and
-            # last (the target voxel itself)
             px, py, pz = ox, oy, oz
             for s in range(1, steps):
                 px += sx; py += sy; pz += sz
@@ -1222,18 +1171,105 @@ class ExplorationPlanner:
             if not occluded:
                 n_visible += 1
 
-        frustum_gain = int(round(n_visible * scale_factor))
+        return n_visible
 
-        # ── Volumetric unknown density around the candidate ──────────
+    def _nbv_score_candidate_raytrace(
+        self,
+        cand: np.ndarray,
+        occupied_grid: np.ndarray,
+        unknown: np.ndarray,
+    ) -> tuple[int, int]:
+        """Score *one* viewpoint using 3-D ray-traced visibility.
+
+        For each unknown voxel within the LiDAR cone/range (frustum) or
+        within ``nbv_volumetric_radius`` (volumetric sphere), a 3-D
+        Bresenham-style ray is marched from the candidate to the voxel.
+        If any occupied voxel lies along that ray the unknown voxel is
+        considered occluded and is not counted.
+
+        Both sets are independently downsampled to
+        ``nbv_ray_max_targets`` for speed and then scaled back up.
+
+        Returns
+        -------
+        frustum_gain : int
+            Estimated *visible* unknown voxels inside the LiDAR cone.
+        volumetric_unknown : int
+            Estimated *visible* unknown voxels within
+            ``nbv_volumetric_radius`` of the candidate.
+        """
+        cx, cy, cz = cand
+        res = self.resolution
+        tan_ha = np.tan(np.radians(self.nbv_sensor_half_angle))
+        max_range = self.nbv_lidar_max_range
+        max_range_sq = max_range * max_range
+
+        # Candidate grid position (may be outside grid, that's OK)
+        gx0 = (cx - self.xmin) / res
+        gy0 = (cy - self.ymin) / res
+        gz0 = (cz - self.zmin) / res
+
+        # ── Collect all unknown voxels ────────────────────────────────
+        unk_ijs = np.argwhere(unknown)  # (N, 3) grid indices
+        if len(unk_ijs) == 0:
+            return 0, 0
+
+        # World centres of unknown voxels
+        wx = self.xmin + (unk_ijs[:, 0] + 0.5) * res
+        wy = self.ymin + (unk_ijs[:, 1] + 0.5) * res
+        wz = self.zmin + (unk_ijs[:, 2] + 0.5) * res
+
+        dx = wx - cx
+        dy = wy - cy
+        dz = wz - cz
+        dist_sq = dx * dx + dy * dy + dz * dz
+
+        # ── Frustum mask: cone + range ───────────────────────────────
+        in_range = dist_sq <= max_range_sq
+        dist_xy_sq = dx * dx + dy * dy
+        cone_ok = dist_xy_sq <= (dz * tan_ha) ** 2
+        below = dz > 0
+        frustum_mask = in_range & cone_ok & below
+        n_frustum_total = int(frustum_mask.sum())
+
+        # ── Volumetric mask: sphere ──────────────────────────────────
         vol_r = self.nbv_volumetric_radius
-        vol_r_vox = int(np.ceil(vol_r / res))
-        gxc = int(np.clip(gx0, 0, self.nx - 1))
-        gyc = int(np.clip(gy0, 0, self.ny - 1))
-        gzc = int(np.clip(gz0, 0, self.nz - 1))
-        x0 = max(gxc - vol_r_vox, 0); x1 = min(gxc + vol_r_vox + 1, self.nx)
-        y0 = max(gyc - vol_r_vox, 0); y1 = min(gyc + vol_r_vox + 1, self.ny)
-        z0 = max(gzc - vol_r_vox, 0); z1 = min(gzc + vol_r_vox + 1, self.nz)
-        volumetric_unknown = int(unknown[x0:x1, y0:y1, z0:z1].sum())
+        vol_mask = dist_sq <= vol_r * vol_r
+        n_vol_total = int(vol_mask.sum())
+
+        budget = self.nbv_ray_max_targets
+
+        # ── Ray-trace frustum set ────────────────────────────────────
+        if n_frustum_total == 0:
+            frustum_gain = 0
+        else:
+            frustum_ijs = unk_ijs[frustum_mask]
+            if len(frustum_ijs) > budget:
+                chosen = np.random.choice(len(frustum_ijs), budget, replace=False)
+                sample = frustum_ijs[chosen]
+                scale = n_frustum_total / budget
+            else:
+                sample = frustum_ijs
+                scale = 1.0
+            n_vis = self._ray_march_visible(sample, gx0, gy0, gz0,
+                                            occupied_grid)
+            frustum_gain = int(round(n_vis * scale))
+
+        # ── Ray-trace volumetric set ─────────────────────────────────
+        if n_vol_total == 0:
+            volumetric_unknown = 0
+        else:
+            vol_ijs = unk_ijs[vol_mask]
+            if len(vol_ijs) > budget:
+                chosen = np.random.choice(len(vol_ijs), budget, replace=False)
+                sample = vol_ijs[chosen]
+                scale = n_vol_total / budget
+            else:
+                sample = vol_ijs
+                scale = 1.0
+            n_vis = self._ray_march_visible(sample, gx0, gy0, gz0,
+                                            occupied_grid)
+            volumetric_unknown = int(round(n_vis * scale))
 
         return frustum_gain, volumetric_unknown
 
@@ -1245,7 +1281,7 @@ class ExplorationPlanner:
         unknown: np.ndarray,
         is_frontier: np.ndarray,
         start: tuple[int, int, int],
-    ) -> np.ndarray | None:
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
         """Select next target using heuristic-generated candidates + frustum scoring.
 
         1. Generate candidate viewpoints via ``_nbv_generate_candidates``.
@@ -1264,18 +1300,22 @@ class ExplorationPlanner:
         Returns
         -------
         target : ndarray (3,) or None
+        evaluated_candidates : ndarray (M, 3) or None
+            World-space positions of all candidates that passed filtering
+            and were scored (for visualization).
         """
         candidates = self._nbv_generate_candidates(
             current_pos, occupied_grid, free, unknown, is_frontier, start)
 
         if len(candidates) == 0:
             print("    [nbv] 0 candidates generated")
-            return None
+            return None, None
 
         cur_xyz = current_pos[:3]
         best_score = -np.inf
         best_candidate = None
         n_evaluated = 0
+        evaluated_list: list[np.ndarray] = []
 
         for cand in candidates:
             dist = float(np.linalg.norm(cand - cur_xyz))
@@ -1298,23 +1338,32 @@ class ExplorationPlanner:
 
             frustum_gain, vol_unknown = self._nbv_score_candidate(
                 cand, occupied_grid, unknown)
-            # Combined gain: direct frustum visibility + weighted
-            # volumetric unknown density.  The volumetric term biases
-            # toward large unexplored regions even when the frustum
-            # can only see a few unknowns (e.g. behind walls).
+            # The frustum gain is the ray-traced count of unknown voxels
+            # actually *visible* from this candidate position.  If it is
+            # zero, the candidate cannot observe any new information
+            # (unknowns are fully occluded by walls / obstacles), so it
+            # must be skipped — the volumetric bonus must NOT rescue a
+            # candidate with zero visibility.
+            if frustum_gain <= 0:
+                continue
+            # Volumetric unknown density serves as a tiebreaker among
+            # candidates that all have non-zero frustum visibility,
+            # biasing toward large unexplored regions.
             combined_gain = (frustum_gain
                              + self.nbv_volumetric_weight * vol_unknown)
-            if combined_gain <= 0:
-                continue
 
             score = combined_gain / max(dist, 0.01) ** self.distance_exponent
             n_evaluated += 1
+            evaluated_list.append(cand.copy())
 
             if score > best_score:
                 best_score = score
                 best_candidate = cand.copy()
                 best_frustum = frustum_gain
                 best_vol = vol_unknown
+
+        evaluated_pts = (np.array(evaluated_list, dtype=np.float64)
+                         if evaluated_list else None)
 
         if best_candidate is not None:
             print(f"    [nbv] {len(candidates)} candidates, "
@@ -1326,7 +1375,7 @@ class ExplorationPlanner:
 
         if best_candidate is not None:
             self._waypoint_history.append(best_candidate.copy())
-        return best_candidate
+        return best_candidate, evaluated_pts
 
     # ── Random waypoint selection ─────────────────────────────────────────
 
@@ -1531,9 +1580,13 @@ class ExplorationPlanner:
 
         if self.use_nbv:
             # ── 4a) NBV — frustum-based viewpoint scoring ────────────
-            best_target = self._nbv_select_target(
+            best_target, evaluated_candidates = self._nbv_select_target(
                 current_pos, occupied_grid, free, unknown,
                 is_frontier, start)
+
+            # Store evaluated candidate positions for viewer overlay
+            if evaluated_candidates is not None:
+                info["candidate_world_pts"] = evaluated_candidates
 
             # Populate frontier overlay from the frontier mask so the
             # viewer still shows frontier voxels even in NBV mode.
@@ -1691,7 +1744,7 @@ SAVE_DIR = os.path.join(os.path.dirname(__file__), "flight_recordings")
 #REPLAY_DIR      = "flight_recordings"            # e.g. "flight_recordings/flight_1771909992"
 REPLAY_DIR      = ""  
 # ── Exploration parameters (shared by both modes) ────────────────────────
-EXPLORE_BOUNDS  = (-15, 20, -35, 5, -14, 0)   # (xmin,xmax,ymin,ymax,zmin,zmax) NED
+EXPLORE_BOUNDS  = (-13, 27, -35, 5, -14, 0)   # (xmin,xmax,ymin,ymax,zmin,zmax) NED
 TAKEOFF_HEIGHT  = EXPLORE_BOUNDS[4] -5         
 VELOCITY        = 3             # m/s (live mode only)
 SCAN_HZ         = 1 / 1.5      # scans per second (live mode only)
@@ -1739,6 +1792,7 @@ NBV_VOLUMETRIC_RADIUS   = 8.0   # radius (m) for volumetric unknown density bonu
 NBV_VOLUMETRIC_WEIGHT   = 0.3   # weight of volumetric unknown term vs. frustum gain
 NBV_RAY_MAX_TARGETS     = 500   # max unknown voxels to ray-trace per candidate (downsample budget)
 NBV_USE_RAY_TRACING     = True  # True = 3D ray tracing, False = fast columnar occlusion
+NBV_SHOW_CANDIDATES     = True  # show evaluated candidate positions as magenta points in viewer
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Replay mode — offline exploration on saved LiDAR data
@@ -2060,6 +2114,8 @@ def run_live():
 
         # Queue overlays for deferred display (syncs with SLAM buffer delay)
         buf.queue_overlay(frontier_points=info.get("frontier_world_pts"))
+        if NBV_SHOW_CANDIDATES:
+            buf.queue_overlay(candidate_points=info.get("candidate_world_pts"))
 
         print(f"  [{wp_count + 1:02d}] Occupied: {info['n_occupied_cells']} | "
               f"Frontiers: {info['n_frontier_cells']}/{info['n_frontier_cells_raw']} "
@@ -2130,6 +2186,8 @@ def run_live():
                 live.set_path_points(data["path_points"])
             if "frontier_points" in data:
                 live.set_frontier_points(data["frontier_points"])
+            if "candidate_points" in data:
+                live.set_candidate_points(data["candidate_points"])
         buf._overlay_queue.clear()
     live.refresh_overlays()
 

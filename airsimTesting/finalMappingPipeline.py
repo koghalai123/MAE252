@@ -75,8 +75,8 @@ class SLAMConfig:
     # Registration outlier rejection
     reject_outliers: bool  = True
     reject_warmup: int     = 7
-    reject_rmse_ci: float  = 0.80
-    reject_rot_ci: float   = 0.0
+    reject_dt_ci: float    = 0.80     # translation CI threshold
+    reject_rot_ci: float   = 0.80    # rotation CI threshold
 
     # Registration target cropping
     reg_local_radius: float = 40.0    # crop target cloud to this radius (m, 0 = no crop)
@@ -210,15 +210,19 @@ def _icp_noise(rmse: float, scale: float = 1.0):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class RegistrationOutlierDetector:
-    """Detect bad registrations via confidence-interval spike detection."""
+    """Detect bad registrations via confidence-interval spike detection.
 
-    def __init__(self, warmup: int = 4, rmse_ci: float = 0.80,
-                 rot_ci: float = 0.0):
-        self.warmup  = max(3, warmup)
-        self.rmse_ci = rmse_ci
-        self.rot_ci  = rot_ci
-        self._rmse_hist: list[float] = []
-        self._rot_hist:  list[float] = []
+    Rejects frames where **both** the translation magnitude and the
+    rotation magnitude exceed their respective CI thresholds.
+    """
+
+    def __init__(self, warmup: int = 4, dt_ci: float = 0.70,
+                 rot_ci: float = 0.70):
+        self.warmup = max(3, warmup)
+        self.dt_ci  = dt_ci
+        self.rot_ci = rot_ci
+        self._dt_hist:  list[float] = []
+        self._rot_hist: list[float] = []
         self.rejected_count = 0
 
     @staticmethod
@@ -226,54 +230,51 @@ class RegistrationOutlierDetector:
         from scipy.stats import norm
         return float(norm.ppf((1.0 + ci) / 2.0))
 
-    def check(self, rmse: float, dr_mag: float) -> tuple[bool, str]:
-        if rmse == 0.0:
-            return False, ""
-        n = len(self._rmse_hist)
+    def check(self, dt_mag: float, dr_mag: float) -> tuple[bool, str]:
+        n = len(self._dt_hist)
         if n < self.warmup:
             return False, ""
-        rmse_arr = np.array(self._rmse_hist)
-        rot_arr  = np.array(self._rot_hist)
-        rmse_mean, rmse_std = float(rmse_arr.mean()), float(rmse_arr.std(ddof=1))
-        rot_mean,  rot_std  = float(rot_arr.mean()),  float(rot_arr.std(ddof=1))
-        z_rmse = self._z(self.rmse_ci)
-        z_rot  = self._z(self.rot_ci)
-        rmse_thresh = rmse_mean + z_rmse * rmse_std
-        rot_thresh  = rot_mean  + z_rot  * rot_std
-        rmse_bad = rmse > rmse_thresh
-        rot_bad  = dr_mag > rot_thresh
-        if rmse_bad and rot_bad:
-            reason = (f"RMSE {rmse:.4f} > {rmse_thresh:.4f} "
-                      f"({self.rmse_ci*100:.0f}% CI, \u03bc={rmse_mean:.4f} \u03c3={rmse_std:.4f}) "
+        dt_arr  = np.array(self._dt_hist)
+        rot_arr = np.array(self._rot_hist)
+        dt_mean,  dt_std  = float(dt_arr.mean()),  float(dt_arr.std(ddof=1))
+        rot_mean, rot_std = float(rot_arr.mean()), float(rot_arr.std(ddof=1))
+        z_dt  = self._z(self.dt_ci)
+        z_rot = self._z(self.rot_ci)
+        dt_thresh  = dt_mean  + z_dt  * dt_std
+        rot_thresh = rot_mean + z_rot * rot_std
+        dt_bad  = dt_mag > dt_thresh
+        rot_bad = dr_mag > rot_thresh
+        if dt_bad and rot_bad:
+            reason = (f"\u0394t {dt_mag:.4f}m > {dt_thresh:.4f}m "
+                      f"({self.dt_ci*100:.0f}% CI, \u03bc={dt_mean:.4f} \u03c3={dt_std:.4f}) "
                       f"AND \u0394r {dr_mag:.2f}\u00b0 > {rot_thresh:.2f}\u00b0 "
                       f"({self.rot_ci*100:.0f}% CI, \u03bc={rot_mean:.2f} \u03c3={rot_std:.2f})")
             self.rejected_count += 1
             return True, reason
         return False, ""
 
-    def accept(self, rmse: float, dr_mag: float):
-        if rmse > 0:
-            self._rmse_hist.append(rmse)
-            self._rot_hist.append(dr_mag)
+    def accept(self, dt_mag: float, dr_mag: float):
+        self._dt_hist.append(dt_mag)
+        self._rot_hist.append(dr_mag)
 
-    def p_values(self, rmse: float, dr_mag: float) -> tuple[float, float]:
+    def p_values(self, dt_mag: float, dr_mag: float) -> tuple[float, float]:
         from scipy.stats import norm
-        n = len(self._rmse_hist)
-        if n < self.warmup or rmse == 0.0:
+        n = len(self._dt_hist)
+        if n < self.warmup:
             return 1.0, 1.0
-        rmse_arr = np.array(self._rmse_hist)
-        rot_arr  = np.array(self._rot_hist)
-        rmse_mean, rmse_std = float(rmse_arr.mean()), float(rmse_arr.std(ddof=1))
-        rot_mean,  rot_std  = float(rot_arr.mean()),  float(rot_arr.std(ddof=1))
-        z_rmse = (rmse - rmse_mean) / max(rmse_std, 1e-12)
-        z_rot  = (dr_mag - rot_mean) / max(rot_std, 1e-12)
-        p_rmse = float(norm.sf(z_rmse))
-        p_rot  = float(norm.sf(z_rot))
-        return p_rmse, p_rot
+        dt_arr  = np.array(self._dt_hist)
+        rot_arr = np.array(self._rot_hist)
+        dt_mean,  dt_std  = float(dt_arr.mean()),  float(dt_arr.std(ddof=1))
+        rot_mean, rot_std = float(rot_arr.mean()), float(rot_arr.std(ddof=1))
+        z_dt  = (dt_mag - dt_mean)  / max(dt_std,  1e-12)
+        z_rot = (dr_mag - rot_mean) / max(rot_std, 1e-12)
+        p_dt  = float(norm.sf(z_dt))
+        p_rot = float(norm.sf(z_rot))
+        return p_dt, p_rot
 
     @property
     def history_len(self) -> int:
-        return len(self._rmse_hist)
+        return len(self._dt_hist)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -325,11 +326,12 @@ class SLAMPipeline:
         self._target_pos: np.ndarray | None = None
         self._frontier_points: np.ndarray | None = None
         self._path_points: np.ndarray | None = None
+        self._candidate_points: np.ndarray | None = None
 
         # Outlier detector
         self._outlier_det = RegistrationOutlierDetector(
             warmup=self.cfg.reject_warmup,
-            rmse_ci=self.cfg.reject_rmse_ci,
+            dt_ci=self.cfg.reject_dt_ci,
             rot_ci=self.cfg.reject_rot_ci,
         )
 
@@ -345,7 +347,7 @@ class SLAMPipeline:
         self.q_inlier_rmse: list[float] = []
         self.q_dt:       list[float] = []
         self.q_dr:       list[float] = []
-        self.q_p_rmse:   list[float] = []
+        self.q_p_dt:     list[float] = []
         self.q_p_dr:     list[float] = []
         self.q_rejected: list[int]   = []
 
@@ -418,8 +420,15 @@ class SLAMPipeline:
         else:
             self._path_points = None
 
+    def set_candidate_points(self, pts):
+        """Set NBV candidate overlay points (Nx3) shown as magenta in the viewer."""
+        if pts is not None and len(pts) > 0:
+            self._candidate_points = np.asarray(pts, dtype=np.float64)
+        else:
+            self._candidate_points = None
+
     def refresh_overlays(self):
-        """Push current drone/target/path overlays to the viewer without a new scan.
+        """Push current drone/target/path/candidate overlays to the viewer without a new scan.
 
         This is much cheaper than a full ``update()`` because it skips the
         point-cloud copy.  Call at high frequency (e.g. 20 Hz) for smooth
@@ -430,6 +439,7 @@ class SLAMPipeline:
                 drone_pos=self._drone_pos,
                 target_pos=self._target_pos,
                 path_points=self._path_points,
+                candidate_points=self._candidate_points,
             )
 
     # ── Callback registration ─────────────────────────────────────────────
@@ -561,19 +571,19 @@ class SLAMPipeline:
         self.q_dr.append(dr_mag)
 
         # ── Outlier rejection ─────────────────────────────────────────────
-        p_rmse_val, p_dr_val = self._outlier_det.p_values(rmse, dr_mag)
-        self.q_p_rmse.append(p_rmse_val)
+        p_dt_val, p_dr_val = self._outlier_det.p_values(dt_mag, dr_mag)
+        self.q_p_dt.append(p_dt_val)
         self.q_p_dr.append(p_dr_val)
 
-        if self.cfg.reject_outliers and rmse > 0:
-            is_outlier, reason = self._outlier_det.check(rmse, dr_mag)
+        if self.cfg.reject_outliers and dt_mag > 0:
+            is_outlier, reason = self._outlier_det.check(dt_mag, dr_mag)
             if is_outlier:
                 print(f"  \u2717 REJECTED frame {idx:03d}: {reason}")
                 self.q_rejected.append(len(self.q_frames) - 1)
                 self.timings["total"].append(time.perf_counter() - t_frame)
                 result.update(fitness=fitness, rmse=rmse, dt=dt_mag, dr=dr_mag)
                 return result
-            self._outlier_det.accept(rmse, dr_mag)
+            self._outlier_det.accept(dt_mag, dr_mag)
 
         # ── GTSAM factor graph ────────────────────────────────────────────
         t0 = time.perf_counter()
@@ -650,7 +660,8 @@ class SLAMPipeline:
                                     drone_pos=self._drone_pos,
                                     target_pos=self._target_pos,
                                     frontier_points=self._frontier_points,
-                                    path_points=self._path_points)
+                                    path_points=self._path_points,
+                                    candidate_points=self._candidate_points)
         self.timings["vis"].append(time.perf_counter() - t0)
 
         self.timings["total"].append(time.perf_counter() - t_frame)
@@ -758,8 +769,8 @@ class SLAMPipeline:
               f"{s['submap_frames']} frames/submap")
         if self.cfg.reject_outliers:
             print(f"  Outlier rejection: {s['rejected_count']} frames rejected "
-                  f"(warmup={self.cfg.reject_warmup}, RMSE CI={self.cfg.reject_rmse_ci*100:.0f}%, "
-                  f"Rot CI={self.cfg.reject_rot_ci*100:.0f}%)")
+                  f"(warmup={self.cfg.reject_warmup}, \u0394t CI={self.cfg.reject_dt_ci*100:.0f}%, "
+                  f"\u0394r CI={self.cfg.reject_rot_ci*100:.0f}%)")
         print(f"  Raw pts total:    {s['raw_total']:,}")
         print(f"  Occupied voxels:  {s['voxel_count']:,}  "
               f"({ratio:.1f}% -> {s['raw_total']/max(s['voxel_count'],1):.1f}x)")
@@ -802,7 +813,7 @@ class SLAMPipeline:
         self._vis_len = 0
         self._outlier_det = RegistrationOutlierDetector(
             warmup=self.cfg.reject_warmup,
-            rmse_ci=self.cfg.reject_rmse_ci,
+            dt_ci=self.cfg.reject_dt_ci,
             rot_ci=self.cfg.reject_rot_ci)
         self._raw_total = 0
         self._frame_index = 0
@@ -813,7 +824,7 @@ class SLAMPipeline:
         self.q_inlier_rmse.clear()
         self.q_dt.clear()
         self.q_dr.clear()
-        self.q_p_rmse.clear()
+        self.q_p_dt.clear()
         self.q_p_dr.clear()
         self.q_rejected.clear()
         self.timings = {k: [] for k in self._tkeys}
@@ -1017,6 +1028,10 @@ class LiveSLAM:
     def set_path_points(self, pts):
         """Set planned-path overlay (Nx3) shown as cyan line in the viewer."""
         self.pipeline.set_path_points(pts)
+
+    def set_candidate_points(self, pts):
+        """Set NBV candidate overlay (Nx3) shown as magenta in the viewer."""
+        self.pipeline.set_candidate_points(pts)
 
     def refresh_overlays(self):
         """Push current overlays to the viewer without a new scan."""
@@ -1245,16 +1260,16 @@ class _QualityPlot:
         self.ax_rmse.set_ylabel('RMSE (m)'); self.ax_rmse.set_xlabel('Frame')
         self.ax_rmse.set_title('RMSE (lower = tighter fit)')
         self.ax_rmse.legend(fontsize=8, loc='upper left')
-        self.ax_rmse2 = self.ax_rmse.twinx()
-        self.line_p_rmse, = self.ax_rmse2.plot([], [], color='orange', ls='--',
-                                                lw=0.8, alpha=0.7, label='p-value')
-        self.ax_rmse2.set_ylabel('p-value', color='orange')
-        self.ax_rmse2.tick_params(axis='y', labelcolor='orange')
-        self.ax_rmse2.set_ylim(-0.05, 1.05)
 
         self.line_dt,   = self.ax_dt.plot([], [], 'm-', lw=1)
         self.ax_dt.set_ylabel('\u0394t (m)'); self.ax_dt.set_xlabel('Frame')
         self.ax_dt.set_title('Translation correction')
+        self.ax_dt2 = self.ax_dt.twinx()
+        self.line_p_dt, = self.ax_dt2.plot([], [], color='orange', ls='--',
+                                            lw=0.8, alpha=0.7, label='p-value')
+        self.ax_dt2.set_ylabel('p-value', color='orange')
+        self.ax_dt2.tick_params(axis='y', labelcolor='orange')
+        self.ax_dt2.set_ylim(-0.05, 1.05)
 
         self.line_dr,   = self.ax_dr.plot([], [], 'c-', lw=1)
         self.ax_dr.set_ylabel('\u0394r (\u00b0)'); self.ax_dr.set_xlabel('Frame')
@@ -1266,8 +1281,8 @@ class _QualityPlot:
         self.ax_dr2.tick_params(axis='y', labelcolor='orange')
         self.ax_dr2.set_ylim(-0.05, 1.05)
 
-        self.scat_rej_rmse = self.ax_rmse.scatter([], [], c='red', marker='x',
-                                                   s=40, zorder=5, linewidths=1.5)
+        self.scat_rej_dt   = self.ax_dt.scatter([], [], c='red', marker='x',
+                                                  s=40, zorder=5, linewidths=1.5)
         self.scat_rej_dr   = self.ax_dr.scatter([], [], c='red', marker='x',
                                                   s=40, zorder=5, linewidths=1.5)
 
@@ -1285,24 +1300,24 @@ class _QualityPlot:
             self.line_fit.set_data(p.q_frames, p.q_fitness)
             self.line_rmse.set_data(p.q_frames, p.q_rmse)
             self.line_inlier_rmse.set_data(p.q_frames, p.q_inlier_rmse)
-            self.line_p_rmse.set_data(p.q_frames, p.q_p_rmse)
             self.line_dt.set_data(p.q_frames, p.q_dt)
+            self.line_p_dt.set_data(p.q_frames, p.q_p_dt)
             self.line_dr.set_data(p.q_frames, p.q_dr)
             self.line_p_dr.set_data(p.q_frames, p.q_p_dr)
 
             if p.q_rejected:
-                rej_xy_rmse = np.column_stack(
+                rej_xy_dt = np.column_stack(
                     ([p.q_frames[j] for j in p.q_rejected],
-                     [p.q_rmse[j]   for j in p.q_rejected]))
+                     [p.q_dt[j]     for j in p.q_rejected]))
                 rej_xy_dr = np.column_stack(
                     ([p.q_frames[j] for j in p.q_rejected],
                      [p.q_dr[j]     for j in p.q_rejected]))
-                self.scat_rej_rmse.set_offsets(rej_xy_rmse)
+                self.scat_rej_dt.set_offsets(rej_xy_dt)
                 self.scat_rej_dr.set_offsets(rej_xy_dr)
 
             for ax in self.axes.flat:
                 ax.relim(); ax.autoscale_view()
-            self.ax_rmse2.set_ylim(-0.05, 1.05)
+            self.ax_dt2.set_ylim(-0.05, 1.05)
             self.ax_dr2.set_ylim(-0.05, 1.05)
             self.fig.canvas.draw_idle()
             self.fig.canvas.flush_events()
@@ -1323,10 +1338,10 @@ class _QualityPlot:
 
         if p.q_rejected:
             rej_f = [p.q_frames[j] for j in p.q_rejected]
-            self.ax_rmse.scatter(rej_f, [p.q_rmse[j] for j in p.q_rejected],
-                                 c='red', marker='x', s=40, zorder=5,
-                                 linewidths=1.5, label='rejected')
-            self.ax_rmse.legend(fontsize=8, loc='upper left')
+            self.ax_dt.scatter(rej_f, [p.q_dt[j] for j in p.q_rejected],
+                               c='red', marker='x', s=40, zorder=5,
+                               linewidths=1.5, label='rejected')
+            self.ax_dt.legend(fontsize=8, loc='upper left')
             self.ax_dr.scatter(rej_f, [p.q_dr[j] for j in p.q_rejected],
                                c='red', marker='x', s=40, zorder=5,
                                linewidths=1.5, label='rejected')
@@ -1334,7 +1349,7 @@ class _QualityPlot:
 
         for ax in self.axes.flat:
             ax.relim(); ax.autoscale_view()
-        self.ax_rmse2.set_ylim(-0.05, 1.05)
+        self.ax_dt2.set_ylim(-0.05, 1.05)
         self.ax_dr2.set_ylim(-0.05, 1.05)
         self.fig.savefig(path, dpi=150, bbox_inches='tight')
 
