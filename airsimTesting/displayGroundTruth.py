@@ -83,28 +83,36 @@ def read_binvox(path, center=np.zeros(3)):
     if len(grid_flat) < total:
         grid_flat = np.append(grid_flat, np.zeros(total - len(grid_flat), dtype=bool))
 
-    # CosysAirSim binvox: dims are stored as (d0, d1, d2) where d1 is the
-    # vertical (UE Z-up) axis and d0/d2 are the horizontal axes.
-    # Standard binvox linearisation: d0-slowest, d1-middle, d2-fastest.
-    # Keep the natural reshape so argwhere indices match the storage order.
-    grid = grid_flat[:total].reshape((d0, d1, d2))
-    print(f"  [parse] RLE decode + reshape: {time.time()-t3:.3f}s")
+    # Standard binvox linearisation: dim-0 varies **fastest** (Fortran order).
+    # NumPy's default reshape uses C-order (last axis fastest), so we must
+    # specify order='F' to decode correctly.  Using C-order scatters surface
+    # voxels into long diagonal streaks — the severity depends on how far
+    # the grid dimensions differ from each other.
+    grid = grid_flat[:total].reshape((d0, d1, d2), order='F')
+    print(f"  [parse] RLE decode + reshape (Fortran order): {time.time()-t3:.3f}s")
 
     # --- Convert occupied voxel indices to NED world coordinates ---------
-    # Empirically determined axis mapping (verified against simGetCollisionInfo):
-    #   NED X  ←  occupied[:,2]  (binvox dim 2, fastest-varying)
-    #   NED Y  ←  occupied[:,0]  (binvox dim 0, slowest-varying)
-    #   NED Z  ← -occupied[:,1]  (binvox dim 1, vertical / UE-Z-up, negated for NED-Z-down)
-    # translate is in NED (X, Y, Z) order, NOT in binvox dim order.
+    # With Fortran-order reshape, argwhere columns correspond directly to
+    # binvox dimensions:
+    #   occupied[:,0] = binvox dim 0  (x, fastest-varying in the file)
+    #   occupied[:,1] = binvox dim 1  (y, middle)
+    #   occupied[:,2] = binvox dim 2  (z, slowest-varying)
+    #
+    # CosysAirSim axis mapping (verified against simGetCollisionInfo):
+    #   NED X  ←  binvox dim 0  (occupied[:,0])
+    #   NED Y  ←  binvox dim 2  (occupied[:,2])
+    #   NED Z  ← −binvox dim 1  (occupied[:,1], UE Z-up → NED Z-down)
+    # translate is in NED (X, Y, Z) order.
     t4 = time.time()
     occupied = np.argwhere(grid)  # (N, 3)
     print(f"  [parse] argwhere ({len(occupied):,} occupied): {time.time()-t4:.3f}s")
 
     t5 = time.time()
     points = np.empty((len(occupied), 3), dtype=np.float64)
-    points[:, 0] = occupied[:, 2] / max_d * scale + translate[0] + center[0]    # NED X
-    points[:, 1] = occupied[:, 0] / max_d * scale + translate[1] + center[1]    # NED Y
-    points[:, 2] = -(occupied[:, 1] / max_d * scale + translate[2] + center[2]) # NED Z
+    # +0.5 centres the coordinate within each voxel (standard binvox convention)
+    points[:, 0] = (occupied[:, 0] + 0.5) / max_d * scale + translate[0] + center[0]    # NED X
+    points[:, 1] = (occupied[:, 2] + 0.5) / max_d * scale + translate[1] + center[1]    # NED Y
+    points[:, 2] = -((occupied[:, 1] + 0.5) / max_d * scale + translate[2] + center[2]) # NED Z
     print(f"  [parse] Coordinate transform → NED: {time.time()-t5:.3f}s")
     print(f"  [parse] TOTAL parse time: {time.time()-t0:.3f}s")
     print(f"  [parse] NED X: [{points[:,0].min():.2f}, {points[:,0].max():.2f}]")
@@ -116,10 +124,10 @@ def read_binvox(path, center=np.zeros(3)):
 
 # ── Configuration ────────────────────────────────────────────────────────────
 SAVE_DIR = "/home/koghalai/MAE252/airsimTesting/flight_recordings/"
-CENTER   = airsim.Vector3r(0, -15, 0)   # centre of the voxel grid
-X_SIZE   = 60                          # metres
+CENTER   = airsim.Vector3r(10, -15, 0)   # centre of the voxel grid
+X_SIZE   = 60                         # metres
 Y_SIZE   = 60
-Z_SIZE   = 25
+Z_SIZE   = 20
 RES      = 0.15                          # voxel resolution in metres
 BINVOX   = "/tmp/airsim_ground_truth.binvox"
 

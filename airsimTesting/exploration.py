@@ -2291,6 +2291,30 @@ def run_replay(recording_dir: str):
     pipeline.get_corrected_map_points()
     pipeline.print_summary()
 
+    # Save the final SLAM map for later analysis
+    map_out_dir = os.path.join(os.path.dirname(__file__), "savedMaps",
+                               f"slam_map_{int(time.time())}")
+    os.makedirs(map_out_dir, exist_ok=True)
+    all_pts = pipeline.get_map_points()
+    # Clip to exploration bounds so only the mapped voxels inside the
+    # region of interest are saved (excludes misregistered outliers).
+    bx0, bx1, by0, by1, bz0, bz1 = EXPLORE_BOUNDS
+    mask = ((all_pts[:, 0] >= bx0) & (all_pts[:, 0] <= bx1) &
+            (all_pts[:, 1] >= by0) & (all_pts[:, 1] <= by1) &
+            (all_pts[:, 2] >= bz0) & (all_pts[:, 2] <= bz1))
+    final_pts = all_pts[mask]
+    print(f"  Clipped map: {len(final_pts):,} / {len(all_pts):,} points inside bounds")
+    np.savez(
+        os.path.join(map_out_dir, "slam_map.npz"),
+        points=final_pts.astype(np.float32),
+        bounds=np.array(EXPLORE_BOUNDS, dtype=np.float64),
+        resolution=np.array(PLANNER_RES),
+        timestamp=np.array(time.time()),
+        source=np.array("replay"),
+    )
+    print(f"  SLAM map saved to {map_out_dir}/slam_map.npz "
+          f"({len(final_pts):,} points)")
+
     print("\n  Viewer is still open — close the Open3D window or press Enter to exit.")
     try:
         input()
@@ -2564,6 +2588,30 @@ def run_live():
     print(f"  Buffer stats: {buf._n_collected} total scans collected")
 
     live.pipeline.get_corrected_map_points()
+
+    # Save the final SLAM map for later analysis
+    map_out_dir = os.path.join(os.path.dirname(__file__), "savedMaps",
+                               f"slam_map_{int(time.time())}")
+    os.makedirs(map_out_dir, exist_ok=True)
+    all_pts = live.pipeline.get_map_points()
+    # Clip to exploration bounds so only the mapped voxels inside the
+    # region of interest are saved (excludes misregistered outliers).
+    bx0, bx1, by0, by1, bz0, bz1 = EXPLORE_BOUNDS
+    mask = ((all_pts[:, 0] >= bx0) & (all_pts[:, 0] <= bx1) &
+            (all_pts[:, 1] >= by0) & (all_pts[:, 1] <= by1) &
+            (all_pts[:, 2] >= bz0) & (all_pts[:, 2] <= bz1))
+    final_pts = all_pts[mask]
+    print(f"  Clipped map: {len(final_pts):,} / {len(all_pts):,} points inside bounds")
+    np.savez(
+        os.path.join(map_out_dir, "slam_map.npz"),
+        points=final_pts.astype(np.float32),
+        bounds=np.array(EXPLORE_BOUNDS, dtype=np.float64),
+        resolution=np.array(PLANNER_RES),
+        timestamp=np.array(time.time()),
+        source=np.array("live"),
+    )
+    print(f"  SLAM map saved to {map_out_dir}/slam_map.npz "
+          f"({len(final_pts):,} points)")
 
     # Save the quality plot
     if out_dir:
