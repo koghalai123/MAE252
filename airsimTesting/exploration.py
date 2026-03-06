@@ -1307,25 +1307,37 @@ class ExplorationPlanner:
         candidates = self._nbv_generate_candidates(
             current_pos, occupied_grid, free, unknown, is_frontier, start)
 
+        # Per-candidate debug records: list of dicts with scoring details
+        debug_records: list[dict] = []
+
         if len(candidates) == 0:
             print("    [nbv] 0 candidates generated")
+            self._last_nbv_debug = debug_records
             return None, None
 
         cur_xyz = current_pos[:3]
         best_score = -np.inf
         best_candidate = None
+        best_idx = -1
         n_evaluated = 0
         evaluated_list: list[np.ndarray] = []
 
-        for cand in candidates:
+        for ci, cand in enumerate(candidates):
             dist = float(np.linalg.norm(cand - cur_xyz))
+
             if dist < self.min_target_distance:
+                debug_records.append(dict(
+                    pos=cand.copy(), dist=dist, frustum=0, vol=0,
+                    combined_gain=0.0, score=0.0, status="too_close"))
                 continue
 
             if self._waypoint_history:
                 prev = np.array(self._waypoint_history)
                 if np.any(np.linalg.norm(prev - cand, axis=1)
                           < self.waypoint_exclusion_radius):
+                    debug_records.append(dict(
+                        pos=cand.copy(), dist=dist, frustum=0, vol=0,
+                        combined_gain=0.0, score=0.0, status="revisited"))
                     continue
 
             # Check that the candidate voxel (if inside grid) is not occupied
@@ -1334,6 +1346,9 @@ class ExplorationPlanner:
                     self.zmin <= cand[2] <= self.zmax):
                 gx, gy, gz = self._world_to_grid(*cand)
                 if occupied_grid[gx, gy, gz]:
+                    debug_records.append(dict(
+                        pos=cand.copy(), dist=dist, frustum=0, vol=0,
+                        combined_gain=0.0, score=0.0, status="occupied"))
                     continue
 
             frustum_gain, vol_unknown = self._nbv_score_candidate(
@@ -1345,6 +1360,10 @@ class ExplorationPlanner:
             # must be skipped — the volumetric bonus must NOT rescue a
             # candidate with zero visibility.
             if frustum_gain <= 0:
+                debug_records.append(dict(
+                    pos=cand.copy(), dist=dist, frustum=frustum_gain,
+                    vol=vol_unknown, combined_gain=0.0, score=0.0,
+                    status="zero_frustum"))
                 continue
             # Volumetric unknown density serves as a tiebreaker among
             # candidates that all have non-zero frustum visibility,
@@ -1356,19 +1375,30 @@ class ExplorationPlanner:
             n_evaluated += 1
             evaluated_list.append(cand.copy())
 
+            debug_records.append(dict(
+                pos=cand.copy(), dist=dist, frustum=frustum_gain,
+                vol=vol_unknown, combined_gain=combined_gain,
+                score=score, status="scored"))
+
             if score > best_score:
                 best_score = score
                 best_candidate = cand.copy()
-                best_frustum = frustum_gain
-                best_vol = vol_unknown
+                best_idx = len(debug_records) - 1
+
+        # Mark the winning record
+        if best_idx >= 0:
+            debug_records[best_idx]["status"] = "selected"
+
+        self._last_nbv_debug = debug_records
 
         evaluated_pts = (np.array(evaluated_list, dtype=np.float64)
                          if evaluated_list else None)
 
         if best_candidate is not None:
+            best_rec = debug_records[best_idx]
             print(f"    [nbv] {len(candidates)} candidates, "
                   f"{n_evaluated} scored, best score={best_score:.1f} "
-                  f"(frustum={best_frustum}, vol={best_vol})")
+                  f"(frustum={best_rec['frustum']}, vol={best_rec['vol']})")
         else:
             print(f"    [nbv] {len(candidates)} candidates, "
                   f"{n_evaluated} scored, no valid target")
@@ -1588,6 +1618,11 @@ class ExplorationPlanner:
             if evaluated_candidates is not None:
                 info["candidate_world_pts"] = evaluated_candidates
 
+            # Attach per-candidate debug records for _NBVDebugPlot
+            info["nbv_debug"] = getattr(self, "_last_nbv_debug", [])
+            info["nbv_volumetric_weight"] = self.nbv_volumetric_weight
+            info["nbv_distance_exponent"] = self.distance_exponent
+
             # Populate frontier overlay from the frontier mask so the
             # viewer still shows frontier voxels even in NBV mode.
             frt_ijs = np.argwhere(is_frontier)  # (N, 3)
@@ -1732,6 +1767,319 @@ class ExplorationPlanner:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# _NBVDebugPlot — live candidate-comparison dashboard
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _NBVDebugPlot:
+    """Live matplotlib dashboard showing *why* each NBV candidate was
+    selected or rejected.
+
+    Three panels:
+
+    1. **Left (large) — Top-down spatial map**
+       A top-down (X–Y) projection of the SLAM map points rendered as a
+       grey density background.  Candidate viewpoints are overlaid as
+       circles whose **size** is proportional to how preferable they are
+       (final score).  Lines are drawn from the drone to each scored
+       candidate.  Filtered-out candidates are shown as small faded
+       markers.  The selected winner gets a bright lime star.
+
+    2. **Top-right — Gain components (stacked bar)**
+       Frustum vs weighted-volumetric gain for each scored candidate.
+
+    3. **Bottom-right — Frustum gain vs Distance (scatter)**
+       Scored candidates at (distance, frustum_gain) coloured by score.
+    """
+
+    _STATUS_COLORS = {
+        "scored":       "#1f77b4",   # mpl blue
+        "selected":     "#2ca02c",   # green
+        "too_close":    "#d62728",   # red
+        "revisited":    "#ff7f0e",   # orange
+        "occupied":     "#7f7f7f",   # grey
+        "zero_frustum": "#9467bd",   # purple
+    }
+
+    def __init__(self):
+        try:
+            import matplotlib
+            matplotlib.use("TkAgg")
+            import matplotlib.pyplot as plt
+        except Exception:
+            self._ok = False
+            return
+
+        self._ok = True
+        self._plt = plt
+        plt.ion()
+        # Layout: left half = spatial map (spans both rows),
+        #         right column = gain bars (top) + scatter (bottom)
+        self.fig = plt.figure(figsize=(16, 9))
+        gs = self.fig.add_gridspec(2, 2, width_ratios=[1.3, 1])
+        self.ax_map   = self.fig.add_subplot(gs[:, 0])   # left, full height
+        self.ax_stack = self.fig.add_subplot(gs[0, 1])    # top-right
+        self.ax_scat  = self.fig.add_subplot(gs[1, 1])    # bottom-right
+        self.fig.suptitle("NBV Candidate Debug", fontsize=14)
+
+        for ax in [self.ax_map, self.ax_stack, self.ax_scat]:
+            ax.grid(True, alpha=0.3)
+        self.fig.tight_layout(rect=[0, 0, 1, 0.95])
+        plt.show(block=False)
+        plt.pause(0.01)
+
+        self._iter = 0
+        self._cbar = None  # track colorbar so we can remove on redraw
+
+    # ──────────────────────────────────────────────────────────────────
+    def update(
+        self,
+        info: dict,
+        drone_pos: np.ndarray | None = None,
+        map_points: np.ndarray | None = None,
+    ) -> None:
+        """Redraw the dashboard from the latest ``info`` dict.
+
+        Parameters
+        ----------
+        info : dict
+            The info dict returned by ``ExplorationPlanner.next_target``.
+            Must contain ``nbv_debug`` (list of per-candidate dicts).
+        drone_pos : ndarray (3,), optional
+            Current drone NED position.
+        map_points : ndarray (N, 3), optional
+            SLAM map points (NED) used as a grey background projection.
+        """
+        if not self._ok:
+            return
+        records = info.get("nbv_debug", [])
+        if not records:
+            return
+
+        self._iter += 1
+        plt = self._plt
+
+        # ── Separate scored vs filtered records ───────────────────────
+        scored   = [r for r in records if r["status"] in ("scored", "selected")]
+        filtered = [r for r in records if r["status"] not in ("scored", "selected")]
+        selected = [r for r in records if r["status"] == "selected"]
+
+        # Sort scored by score descending
+        scored.sort(key=lambda r: r["score"], reverse=True)
+
+        # ── Hypothetical winners: frustum-only and volume-only ────────
+        # Compute what the selection *would* have been if only one
+        # component were used, so you can see which term is pulling.
+        dist_exp = info.get("nbv_distance_exponent", 1.0)
+        frustum_only_winner = None
+        vol_only_winner = None
+        if scored:
+            best_f_score = -np.inf
+            best_v_score = -np.inf
+            for r in scored:
+                d = max(r["dist"], 0.01)
+                f_score = r["frustum"] / d ** dist_exp
+                v_score = r["vol"] / d ** dist_exp
+                if f_score > best_f_score:
+                    best_f_score = f_score
+                    frustum_only_winner = r
+                if v_score > best_v_score:
+                    best_v_score = v_score
+                    vol_only_winner = r
+
+        # ── [left] Top-down spatial map with SLAM background ──────────
+        ax = self.ax_map
+        ax.clear()
+
+        # Background: SLAM map points projected to XY
+        if map_points is not None and len(map_points) > 0:
+            # Subsample for performance if very large
+            pts = np.asarray(map_points, dtype=np.float32)
+            if len(pts) > 60_000:
+                idx = np.random.choice(len(pts), 60_000, replace=False)
+                pts = pts[idx]
+            ax.scatter(pts[:, 1], pts[:, 0], c="#c0c0c0", s=0.4,
+                       alpha=0.30, rasterized=True, zorder=1)
+
+        # Frontier overlay (light blue)
+        frt = info.get("frontier_world_pts")
+        if frt is not None and len(frt) > 0:
+            frt = np.asarray(frt)
+            ax.scatter(frt[:, 1], frt[:, 0], c="#87ceeb", s=1.5,
+                       alpha=0.35, rasterized=True, zorder=2, label="frontier")
+
+        # Compute score range for marker sizing (scored candidates)
+        if scored:
+            all_scores = np.array([r["score"] for r in scored])
+            s_min, s_max = all_scores.min(), all_scores.max()
+            s_range = s_max - s_min if s_max > s_min else 1.0
+            MIN_SIZE, MAX_SIZE = 30, 350
+
+        # Filtered candidates: small faded dots by status
+        for status, color in self._STATUS_COLORS.items():
+            if status in ("scored", "selected"):
+                continue
+            pts_f = [r["pos"] for r in records if r["status"] == status]
+            if not pts_f:
+                continue
+            pts_f = np.array(pts_f)
+            ax.scatter(pts_f[:, 1], pts_f[:, 0],
+                       c=color, s=15, alpha=0.30, edgecolors="none",
+                       label=status, zorder=3)
+
+        # Scored candidates: size ∝ score, lines from drone
+        if scored:
+            for r in scored:
+                sz = MIN_SIZE + (r["score"] - s_min) / s_range * (MAX_SIZE - MIN_SIZE)
+                color = self._STATUS_COLORS[r["status"]]
+                pos = r["pos"]
+                ax.scatter([pos[1]], [pos[0]], c=color, s=sz,
+                           edgecolors="k", linewidths=0.5, alpha=0.85,
+                           zorder=5)
+                # Line from drone to candidate
+                if drone_pos is not None:
+                    ax.plot([drone_pos[1], pos[1]], [drone_pos[0], pos[0]],
+                            color="#888888", linewidth=0.4, alpha=0.4,
+                            zorder=4)
+
+        # Winner star
+        if selected:
+            s = selected[0]["pos"]
+            ax.scatter([s[1]], [s[0]], marker="*", s=400, c="lime",
+                       edgecolors="k", linewidths=1.3, zorder=7,
+                       label="selected")
+            # Bold line from drone to winner
+            if drone_pos is not None:
+                ax.plot([drone_pos[1], s[1]], [drone_pos[0], s[0]],
+                        color="lime", linewidth=1.5, alpha=0.7, zorder=6)
+
+        # Hypothetical winners: frustum-only (cyan diamond) & vol-only (orange diamond)
+        if frustum_only_winner is not None:
+            fp = frustum_only_winner["pos"]
+            ax.scatter([fp[1]], [fp[0]], marker="D", s=180, c="cyan",
+                       edgecolors="k", linewidths=1.0, zorder=9,
+                       label="frustum-only pick")
+            if drone_pos is not None:
+                ax.plot([drone_pos[1], fp[1]], [drone_pos[0], fp[0]],
+                        color="cyan", linewidth=1.0, linestyle="--",
+                        alpha=0.6, zorder=6)
+        if vol_only_winner is not None:
+            vp = vol_only_winner["pos"]
+            ax.scatter([vp[1]], [vp[0]], marker="D", s=180, c="#ff7f0e",
+                       edgecolors="k", linewidths=1.0, zorder=9,
+                       label="vol-only pick")
+            if drone_pos is not None:
+                ax.plot([drone_pos[1], vp[1]], [drone_pos[0], vp[0]],
+                        color="#ff7f0e", linewidth=1.0, linestyle="--",
+                        alpha=0.6, zorder=6)
+
+        # Drone marker
+        if drone_pos is not None:
+            ax.scatter([drone_pos[1]], [drone_pos[0]], marker="P", s=200,
+                       c="white", edgecolors="k", linewidths=1.5,
+                       zorder=8, label="drone")
+
+        ax.set_xlabel("Y (m)")
+        ax.set_ylabel("X (m)")
+        ax.set_aspect("equal", adjustable="datalim")
+        # Filter summary annotation
+        from collections import Counter
+        filt_counts = Counter(r["status"] for r in filtered)
+        filt_str = ", ".join(f"{v} {k}" for k, v in filt_counts.items())
+        ax.set_title(f"Candidates on Map  (iter {self._iter})\n"
+                     f"filtered: {filt_str if filt_str else 'none'}",
+                     fontsize=10)
+        ax.legend(fontsize=7, loc="upper left", ncol=2,
+                  markerscale=0.6, handletextpad=0.3)
+
+        # ── [top-right] Stacked gain components ──────────────────────
+        ax = self.ax_stack
+        ax.clear()
+        if scored:
+            labels = [f"({r['pos'][0]:.0f},{r['pos'][1]:.0f},{r['pos'][2]:.0f})"
+                      for r in scored]
+            frustums = np.array([r["frustum"] for r in scored], dtype=float)
+            vols     = np.array([r["vol"] for r in scored], dtype=float)
+            w = info.get("nbv_volumetric_weight", 0.0)
+            weighted_vols = vols * w if w else vols
+            y_pos = np.arange(len(scored))
+            ax.barh(y_pos, frustums, color="#1f77b4",
+                    label="Frustum gain", edgecolor="k", linewidth=0.3)
+            ax.barh(y_pos, weighted_vols, left=frustums, color="#ff7f0e",
+                    label=f"Vol ×{w:.2f}" if w else "Vol (unweighted)",
+                    edgecolor="k", linewidth=0.3)
+            ax.set_yticks(y_pos)
+            ax.set_yticklabels(labels, fontsize=7)
+            ax.invert_yaxis()
+            ax.set_xlabel("Gain (voxels)")
+            ax.legend(fontsize=8, loc="lower right")
+
+            # Mark hypothetical winners on the bar chart
+            labels_list = [f"({r['pos'][0]:.0f},{r['pos'][1]:.0f},{r['pos'][2]:.0f})"
+                           for r in scored]
+            if frustum_only_winner is not None:
+                fow_label = (f"({frustum_only_winner['pos'][0]:.0f},"
+                             f"{frustum_only_winner['pos'][1]:.0f},"
+                             f"{frustum_only_winner['pos'][2]:.0f})")
+                if fow_label in labels_list:
+                    fi = labels_list.index(fow_label)
+                    ax.annotate("\u25C6 frustum-only", xy=(frustums[fi], fi),
+                                xytext=(frustums[fi] + frustums.max() * 0.05, fi),
+                                fontsize=7, color="cyan", fontweight="bold",
+                                va="center")
+            if vol_only_winner is not None:
+                vow_label = (f"({vol_only_winner['pos'][0]:.0f},"
+                             f"{vol_only_winner['pos'][1]:.0f},"
+                             f"{vol_only_winner['pos'][2]:.0f})")
+                if vow_label in labels_list:
+                    vi = labels_list.index(vow_label)
+                    bar_end = frustums[vi] + (weighted_vols[vi] if len(weighted_vols) > vi else 0)
+                    ax.annotate("\u25C6 vol-only", xy=(bar_end, vi),
+                                xytext=(bar_end + frustums.max() * 0.05, vi),
+                                fontsize=7, color="#ff7f0e", fontweight="bold",
+                                va="center")
+        ax.set_title("Gain Components", fontsize=10)
+        ax.grid(True, alpha=0.3)
+
+        # ── [bottom-right] Frustum gain vs distance scatter ──────────
+        ax = self.ax_scat
+        ax.clear()
+        if scored:
+            dists    = [r["dist"] for r in scored]
+            frustums = [r["frustum"] for r in scored]
+            sc_vals  = [r["score"] for r in scored]
+            sp = ax.scatter(dists, frustums, c=sc_vals, cmap="viridis",
+                            edgecolors="k", linewidths=0.4, s=50)
+            if selected:
+                s = selected[0]
+                ax.scatter([s["dist"]], [s["frustum"]], marker="*",
+                           s=250, c="lime", edgecolors="k", linewidths=1,
+                           zorder=5, label="selected")
+                ax.legend(fontsize=8)
+            try:
+                if self._cbar is not None:
+                    self._cbar.remove()
+                self._cbar = self.fig.colorbar(
+                    sp, ax=ax, pad=0.02, aspect=30, label="score")
+            except Exception:
+                pass
+        ax.set_xlabel("Distance to drone (m)")
+        ax.set_ylabel("Frustum gain (visible unknown voxels)")
+        ax.set_title("Frustum Gain vs Distance", fontsize=10)
+        ax.grid(True, alpha=0.3)
+
+        # ── Redraw ────────────────────────────────────────────────────
+        self.fig.tight_layout(rect=[0, 0, 1, 0.95])
+        self.fig.canvas.draw_idle()
+        self.fig.canvas.flush_events()
+
+    def save(self, path: str) -> None:
+        """Save the current figure to *path*."""
+        if not self._ok:
+            return
+        self.fig.savefig(path, dpi=150, bbox_inches="tight")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Configuration
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1741,15 +2089,15 @@ SAVE_DIR = os.path.join(os.path.dirname(__file__), "flight_recordings")
 # Set REPLAY_DIR to a recording directory (or parent) to run offline on
 # saved LiDAR data.  Leave empty ("") for live AirSim flight.
 
-#REPLAY_DIR      = "flight_recordings"            # e.g. "flight_recordings/flight_1771909992"
-REPLAY_DIR      = ""  
+REPLAY_DIR      = "flight_recordings"            # e.g. "flight_recordings/flight_1771909992"
+#REPLAY_DIR      = ""  
 # ── Exploration parameters (shared by both modes) ────────────────────────
 EXPLORE_BOUNDS  = (-13, 27, -35, 5, -14, 0)   # (xmin,xmax,ymin,ymax,zmin,zmax) NED
 TAKEOFF_HEIGHT  = EXPLORE_BOUNDS[4] -5         
 VELOCITY        = 3             # m/s (live mode only)
 SCAN_HZ         = 1 / 1.5      # scans per second (live mode only)
 PLANNER_RES     = 1.0           # planning grid voxel size (m)
-MAX_TARGETS     = 50            # safety cap on autonomous waypoints
+MAX_TARGETS     = 10000            # safety cap on autonomous waypoints
 SCAN_DELAY      = 3             # register a scan only after N newer scans (live mode)
 PLAN_EVERY      = 3             # run planner every N frames (replay mode)
 FRAME_SKIP      = 1             # process every Nth frame (replay mode, 1 = all)
@@ -1789,7 +2137,7 @@ NBV_LIDAR_MAX_RANGE     = 40.0  # LiDAR max range (m); voxels beyond this are no
 NBV_UNKNOWN_BLOCK_SIZE  = 4     # coarse block size (voxels) for unknown-region heuristic
 NBV_N_UNKNOWN_BLOCKS    = 8     # top-K densest unknown blocks to generate candidates from
 NBV_VOLUMETRIC_RADIUS   = 8.0   # radius (m) for volumetric unknown density bonus
-NBV_VOLUMETRIC_WEIGHT   = 0.3   # weight of volumetric unknown term vs. frustum gain
+NBV_VOLUMETRIC_WEIGHT   = 0.0   # weight of volumetric unknown term vs. frustum gain
 NBV_RAY_MAX_TARGETS     = 500   # max unknown voxels to ray-trace per candidate (downsample budget)
 NBV_USE_RAY_TRACING     = True  # True = 3D ray tracing, False = fast columnar occlusion
 NBV_SHOW_CANDIDATES     = True  # show evaluated candidate positions as magenta points in viewer
@@ -1847,6 +2195,10 @@ def run_replay(recording_dir: str):
     )
 
     strategy = "random" if USE_RANDOM else ("NBV" if USE_NBV else "WFD")
+
+    # NBV candidate comparison dashboard (replay mode)
+    nbv_debug_plot = _NBVDebugPlot() if USE_NBV else None
+
     print(f"\n{'='*60}")
     print(f"Exploration planner replay  (strategy: {strategy})")
     print(f"  Bounds: x=[{EXPLORE_BOUNDS[0]}, {EXPLORE_BOUNDS[1]}], "
@@ -1901,6 +2253,12 @@ def run_replay(recording_dir: str):
             t_plan = time.perf_counter()
             target, info = planner.next_target(pipeline, current_pos)
             dt_plan = time.perf_counter() - t_plan
+
+            # Update NBV debug dashboard
+            if nbv_debug_plot is not None and "nbv_debug" in info:
+                nbv_debug_plot.update(
+                    info, drone_pos=current_pos,
+                    map_points=pipeline.get_map_points())
 
             # Update viewer overlays
             pipeline.set_frontier_points(info.get("frontier_world_pts"))
@@ -1976,6 +2334,9 @@ def run_live():
 
     # Live quality plot (RMSE / fitness / rejections)
     quality_plot = _QualityPlot(cfg.registration)
+
+    # NBV candidate comparison dashboard (only active when USE_NBV=True)
+    nbv_debug_plot = _NBVDebugPlot() if USE_NBV else None
 
     # Start background scan collection immediately so the viewer
     # and SLAM map are populated from the very first moment.
@@ -2112,6 +2473,12 @@ def run_live():
 
         target, info = exploration.next_target(live.pipeline, current_pos)
 
+        # Update the NBV debug dashboard
+        if nbv_debug_plot is not None and "nbv_debug" in info:
+            nbv_debug_plot.update(
+                info, drone_pos=current_pos,
+                map_points=vis_pts if len(vis_pts) > 0 else None)
+
         # Queue overlays for deferred display (syncs with SLAM buffer delay)
         buf.queue_overlay(frontier_points=info.get("frontier_world_pts"))
         if NBV_SHOW_CANDIDATES:
@@ -2203,6 +2570,12 @@ def run_live():
         qp_path = os.path.join(out_dir, "quality.png")
         quality_plot.save(qp_path, live.pipeline)
         print(f"  Quality plot saved to {qp_path}")
+
+    # Save the NBV debug dashboard
+    if out_dir and nbv_debug_plot is not None:
+        nbv_path = os.path.join(out_dir, "nbv_debug.png")
+        nbv_debug_plot.save(nbv_path)
+        print(f"  NBV debug plot saved to {nbv_path}")
 
     if out_dir:
         bt_path = os.path.join(out_dir, "map.bt")
