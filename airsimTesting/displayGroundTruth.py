@@ -124,7 +124,7 @@ def read_binvox(path, center=np.zeros(3)):
 
 # ── Configuration ────────────────────────────────────────────────────────────
 SAVE_DIR = "/home/koghalai/MAE252/airsimTesting/flight_recordings/"
-CENTER   = airsim.Vector3r(10, -15, 0)   # centre of the voxel grid
+CENTER   = airsim.Vector3r(0, -15, 0)   # centre of the voxel grid
 X_SIZE   = 60                         # metres
 Y_SIZE   = 60
 Z_SIZE   = 20

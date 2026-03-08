@@ -340,6 +340,64 @@ class Viewer3D:
                         self._candidate_buf[:nc] = candidate_points[:nc].astype(self._dtype)
         self._update_event.set()
 
+    def get_displayed_points(self) -> np.ndarray:
+        """Return a copy of the points currently in the viewer's shared-memory buffer.
+
+        This captures *exactly* the 3-D map that the viewer is displaying,
+        bypassing any GTSAM recomposition or other post-processing.  Only
+        non-zero rows (actual points) are returned.
+        """
+        if self._buf is None:
+            return np.empty((0, 3), dtype=np.float32)
+        with self._lock:
+            pts = self._buf.copy()
+        mask = np.any(pts != 0, axis=1)
+        return pts[mask].astype(np.float32)
+
+    def export_map(self, path: str, *,
+                   bounds: np.ndarray | None = None,
+                   resolution: float | None = None,
+                   source: str = "viewer") -> str:
+        """Save the currently displayed 3-D map to a ``.npz`` file.
+
+        Parameters
+        ----------
+        path : str
+            Output file path (should end in ``.npz``) **or** a directory.
+            If a directory, the file is named ``slam_map.npz`` inside it.
+        bounds : ndarray or None
+            Optional (6,) exploration bounds to store alongside the points.
+            Points are **not** clipped — all displayed points are saved.
+        resolution : float or None
+            Optional voxel resolution metadata.
+        source : str
+            Tag stored in the file for provenance.
+
+        Returns
+        -------
+        str  — the path the file was written to.
+        """
+        import os, time as _time
+        if os.path.isdir(path) or not path.endswith(".npz"):
+            os.makedirs(path, exist_ok=True)
+            path = os.path.join(path, "slam_map.npz")
+        else:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+        pts = self.get_displayed_points()
+        kw = dict(
+            points=pts,
+            timestamp=np.array(_time.time()),
+            source=np.array(source),
+        )
+        if bounds is not None:
+            kw["bounds"] = np.asarray(bounds, dtype=np.float64)
+        if resolution is not None:
+            kw["resolution"] = np.array(resolution)
+        np.savez(path, **kw)
+        print(f"  Viewer export: {len(pts):,} points saved to {path}")
+        return path
+
     def stop(self):
         self._stop_event.set()
         if self._proc is not None:

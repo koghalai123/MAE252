@@ -81,6 +81,10 @@ OUT_DIR = None
 # Set True to skip matplotlib plots (text + CSV output only).
 NO_PLOT = False
 
+# Set True to open separate Open3D windows for GT and each SLAM map
+# with coordinate axes displayed, useful for diagnosing orientation issues.
+SHOW_INDIVIDUAL_MAPS = False
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Helpers
@@ -235,14 +239,25 @@ def print_metrics(m: dict, label: str = "") -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def plot_single(m: dict, slam_pts: np.ndarray, gt_pts: np.ndarray,
-                label: str = "", save_path: str | None = None) -> None:
-    """Three-panel figure for a single SLAM-vs-GT comparison."""
+                label: str = "", save_path: str | None = None,
+                slam_pts_full: np.ndarray | None = None,
+                gt_pts_full: np.ndarray | None = None) -> None:
+    """Three-panel figure for a single SLAM-vs-GT comparison.
+
+    If *slam_pts_full* / *gt_pts_full* are provided they are used for
+    the top-down overlay so the viewer can see the full maps for spatial
+    orientation.  Metrics are still computed on the clipped clouds.
+    """
     import matplotlib
     matplotlib.use("TkAgg")
     import matplotlib.pyplot as plt
 
     d_s2g = m["_d_s2g"]
     d_g2s = m["_d_g2s"]
+
+    # Use the full clouds for display if available
+    slam_display = slam_pts_full if slam_pts_full is not None else slam_pts
+    gt_display   = gt_pts_full   if gt_pts_full   is not None else gt_pts
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
     fig.suptitle(f"Map Quality Analysis{f'  —  {label}' if label else ''}",
@@ -261,20 +276,20 @@ def plot_single(m: dict, slam_pts: np.ndarray, gt_pts: np.ndarray,
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
 
-    # ── (b) Top-down XY overlay ───────────────────────────────────────
+    # ── (b) Top-down XY overlay (full maps for orientation) ───────────
     ax = axes[1]
     # Subsample for plotting speed
     max_draw = 50_000
-    if len(gt_pts) > max_draw:
-        idx = np.random.choice(len(gt_pts), max_draw, replace=False)
-        gt_draw = gt_pts[idx]
+    if len(gt_display) > max_draw:
+        idx = np.random.choice(len(gt_display), max_draw, replace=False)
+        gt_draw = gt_display[idx]
     else:
-        gt_draw = gt_pts
-    if len(slam_pts) > max_draw:
-        idx = np.random.choice(len(slam_pts), max_draw, replace=False)
-        sl_draw = slam_pts[idx]
+        gt_draw = gt_display
+    if len(slam_display) > max_draw:
+        idx = np.random.choice(len(slam_display), max_draw, replace=False)
+        sl_draw = slam_display[idx]
     else:
-        sl_draw = slam_pts
+        sl_draw = slam_display
 
     ax.scatter(gt_draw[:, 1], gt_draw[:, 0], c="#c0c0c0", s=0.3,
                alpha=0.3, rasterized=True, label="Ground truth")
@@ -282,7 +297,7 @@ def plot_single(m: dict, slam_pts: np.ndarray, gt_pts: np.ndarray,
                alpha=0.3, rasterized=True, label="SLAM map")
     ax.set_xlabel("Y (m)")
     ax.set_ylabel("X (m)")
-    ax.set_title("Top-Down Overlay (X–Y)")
+    ax.set_title("Top-Down Overlay (X–Y) — Full Maps")
     ax.set_aspect("equal", adjustable="datalim")
     ax.legend(fontsize=9, markerscale=10)
     ax.grid(True, alpha=0.3)
@@ -381,8 +396,14 @@ def plot_comparison(results: list[tuple[str, dict]],
 
 def plot_3d_overlay(slam_pts: np.ndarray, gt_pts: np.ndarray,
                     label: str = "",
-                    max_draw: int = 500_000) -> None:
+                    max_draw: int = 500_000,
+                    slam_pts_full: np.ndarray | None = None,
+                    gt_pts_full: np.ndarray | None = None) -> None:
     """Open an interactive Open3D window showing both clouds together.
+
+    If *slam_pts_full* / *gt_pts_full* are provided they are displayed
+    instead of the clipped clouds so the viewer can use the full maps
+    for spatial orientation.
 
     * Ground truth  — grey  (0.70, 0.70, 0.70)
     * SLAM map      — blue  (0.12, 0.47, 0.71)
@@ -391,18 +412,22 @@ def plot_3d_overlay(slam_pts: np.ndarray, gt_pts: np.ndarray,
     """
     import open3d as o3d
 
-    # Subsample if needed so the viewer stays responsive
-    if len(gt_pts) > max_draw:
-        idx = np.random.default_rng(0).choice(len(gt_pts), max_draw, replace=False)
-        gt_draw = gt_pts[idx]
-    else:
-        gt_draw = gt_pts
+    # Use full clouds for display when available
+    gt_src   = gt_pts_full   if gt_pts_full   is not None else gt_pts
+    slam_src = slam_pts_full if slam_pts_full is not None else slam_pts
 
-    if len(slam_pts) > max_draw:
-        idx = np.random.default_rng(1).choice(len(slam_pts), max_draw, replace=False)
-        sl_draw = slam_pts[idx]
+    # Subsample if needed so the viewer stays responsive
+    if len(gt_src) > max_draw:
+        idx = np.random.default_rng(0).choice(len(gt_src), max_draw, replace=False)
+        gt_draw = gt_src[idx]
     else:
-        sl_draw = slam_pts
+        gt_draw = gt_src
+
+    if len(slam_src) > max_draw:
+        idx = np.random.default_rng(1).choice(len(slam_src), max_draw, replace=False)
+        sl_draw = slam_src[idx]
+    else:
+        sl_draw = slam_src
 
     # Ground truth point cloud (grey)
     gt_pcd = o3d.geometry.PointCloud()
@@ -430,6 +455,51 @@ def plot_3d_overlay(slam_pts: np.ndarray, gt_pts: np.ndarray,
 
     o3d.visualization.draw_geometries(
         [gt_pcd, sl_pcd, bbox],
+        window_name=title,
+        width=1280, height=720,
+        point_show_normal=False,
+    )
+
+
+def plot_individual_map(pts: np.ndarray, title: str,
+                        color: list[float],
+                        axis_size: float | None = None) -> None:
+    """Open an Open3D window showing a single point cloud with a coordinate frame.
+
+    All points are displayed (no subsampling or bounding-box clipping)
+    so the full extent of the map is visible.
+
+    Parameters
+    ----------
+    pts : (N, 3) float
+        Point cloud to display.
+    title : str
+        Window title.
+    color : list[float]
+        RGB colour in [0, 1] for the point cloud.
+    axis_size : float or None
+        Length of the coordinate-frame axes.  *None* → auto (10 % of the
+        point-cloud diagonal).
+    """
+    import open3d as o3d
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
+    pcd.paint_uniform_color(color)
+
+    # Coordinate frame at the origin
+    if axis_size is None:
+        diag = np.linalg.norm(pts.max(axis=0) - pts.min(axis=0))
+        axis_size = max(diag * 0.10, 1.0)
+    frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+        size=axis_size, origin=[0.0, 0.0, 0.0])
+
+    print(f"  [{title}] Displaying {len(pts):,} points  "
+          f"(axis size = {axis_size:.1f} m)")
+    print(f"  Close the window to continue.")
+
+    o3d.visualization.draw_geometries(
+        [pcd, frame],
         window_name=title,
         width=1280, height=720,
         point_show_normal=False,
@@ -515,16 +585,27 @@ def main():
         print_metrics(m, label=label)
         results.append((label, m))
 
-        # Per-map plot
+        # Per-map plot (full maps shown for spatial orientation)
         if not no_plot:
             out_dir = out or str(Path(slam_path).parent)
             os.makedirs(out_dir, exist_ok=True)
             fig_path = os.path.join(out_dir, f"map_analysis_{label}.png")
-            plot_single(m, slam_pts, gt_pts, label=label, save_path=fig_path)
+            plot_single(m, slam_pts, gt_pts, label=label, save_path=fig_path,
+                        slam_pts_full=slam_pts_raw, gt_pts_full=gt_pts_raw)
 
         # 3-D overlay so you can visually verify alignment
         if not no_plot:
-            plot_3d_overlay(slam_pts, gt_pts, label=label)
+            plot_3d_overlay(slam_pts, gt_pts, label=label,
+                            slam_pts_full=slam_pts_raw, gt_pts_full=gt_pts_raw)
+
+        # Individual windows with coordinate axes for orientation diagnosis
+        if SHOW_INDIVIDUAL_MAPS:
+            plot_individual_map(gt_pts_raw,
+                                title=f"Ground Truth  [{label}]",
+                                color=[0.70, 0.70, 0.70])
+            plot_individual_map(slam_pts_raw,
+                                title=f"SLAM Map  [{label}]",
+                                color=[0.12, 0.47, 0.71])
 
     # ── Multi-map comparison ──────────────────────────────────────────
     if len(results) > 1:

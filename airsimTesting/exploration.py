@@ -2092,7 +2092,7 @@ SAVE_DIR = os.path.join(os.path.dirname(__file__), "flight_recordings")
 REPLAY_DIR      = "flight_recordings"            # e.g. "flight_recordings/flight_1771909992"
 #REPLAY_DIR      = ""  
 # ── Exploration parameters (shared by both modes) ────────────────────────
-EXPLORE_BOUNDS  = (-13, 27, -35, 5, -14, 0)   # (xmin,xmax,ymin,ymax,zmin,zmax) NED
+EXPLORE_BOUNDS  = (-13, 27, -35, 5, -14, 0.15)   # (xmin,xmax,ymin,ymax,zmin,zmax) NED
 TAKEOFF_HEIGHT  = EXPLORE_BOUNDS[4] -5         
 VELOCITY        = 3             # m/s (live mode only)
 SCAN_HZ         = 1 / 1.5      # scans per second (live mode only)
@@ -2291,29 +2291,17 @@ def run_replay(recording_dir: str):
     pipeline.get_corrected_map_points()
     pipeline.print_summary()
 
-    # Save the final SLAM map for later analysis
+    # Save the final SLAM map directly from the viewer's shared-memory
+    # buffer — this is exactly what was displayed, avoiding any GTSAM
+    # recomposition artefacts.
     map_out_dir = os.path.join(os.path.dirname(__file__), "savedMaps",
                                f"slam_map_{int(time.time())}")
-    os.makedirs(map_out_dir, exist_ok=True)
-    all_pts = pipeline.get_map_points()
-    # Clip to exploration bounds so only the mapped voxels inside the
-    # region of interest are saved (excludes misregistered outliers).
-    bx0, bx1, by0, by1, bz0, bz1 = EXPLORE_BOUNDS
-    mask = ((all_pts[:, 0] >= bx0) & (all_pts[:, 0] <= bx1) &
-            (all_pts[:, 1] >= by0) & (all_pts[:, 1] <= by1) &
-            (all_pts[:, 2] >= bz0) & (all_pts[:, 2] <= bz1))
-    final_pts = all_pts[mask]
-    print(f"  Clipped map: {len(final_pts):,} / {len(all_pts):,} points inside bounds")
-    np.savez(
-        os.path.join(map_out_dir, "slam_map.npz"),
-        points=final_pts.astype(np.float32),
+    pipeline._viewer.export_map(
+        map_out_dir,
         bounds=np.array(EXPLORE_BOUNDS, dtype=np.float64),
-        resolution=np.array(PLANNER_RES),
-        timestamp=np.array(time.time()),
-        source=np.array("replay"),
+        resolution=PLANNER_RES,
+        source="replay",
     )
-    print(f"  SLAM map saved to {map_out_dir}/slam_map.npz "
-          f"({len(final_pts):,} points)")
 
     print("\n  Viewer is still open — close the Open3D window or press Enter to exit.")
     try:
@@ -2589,29 +2577,17 @@ def run_live():
 
     live.pipeline.get_corrected_map_points()
 
-    # Save the final SLAM map for later analysis
+    # Save the final SLAM map directly from the viewer's shared-memory
+    # buffer — this is exactly what was displayed, avoiding any GTSAM
+    # recomposition artefacts.
     map_out_dir = os.path.join(os.path.dirname(__file__), "savedMaps",
                                f"slam_map_{int(time.time())}")
-    os.makedirs(map_out_dir, exist_ok=True)
-    all_pts = live.pipeline.get_map_points()
-    # Clip to exploration bounds so only the mapped voxels inside the
-    # region of interest are saved (excludes misregistered outliers).
-    bx0, bx1, by0, by1, bz0, bz1 = EXPLORE_BOUNDS
-    mask = ((all_pts[:, 0] >= bx0) & (all_pts[:, 0] <= bx1) &
-            (all_pts[:, 1] >= by0) & (all_pts[:, 1] <= by1) &
-            (all_pts[:, 2] >= bz0) & (all_pts[:, 2] <= bz1))
-    final_pts = all_pts[mask]
-    print(f"  Clipped map: {len(final_pts):,} / {len(all_pts):,} points inside bounds")
-    np.savez(
-        os.path.join(map_out_dir, "slam_map.npz"),
-        points=final_pts.astype(np.float32),
+    live.pipeline._viewer.export_map(
+        map_out_dir,
         bounds=np.array(EXPLORE_BOUNDS, dtype=np.float64),
-        resolution=np.array(PLANNER_RES),
-        timestamp=np.array(time.time()),
-        source=np.array("live"),
+        resolution=PLANNER_RES,
+        source="live",
     )
-    print(f"  SLAM map saved to {map_out_dir}/slam_map.npz "
-          f"({len(final_pts):,} points)")
 
     # Save the quality plot
     if out_dir:
