@@ -77,12 +77,26 @@ class BufferedSLAM:
         # Total scans collected
         self._n_collected: int = 0
 
-        # High-rate GPS ring buffer (populated by _gps_loop on its own
-        # thread, interpolated in drain_ready).  Protected by _gps_lock.
-        self._gps_buf_ts: list[float] = []   # sorted AirSim timestamps (ns)
+        # High-rate sensor ring buffers (populated by _sensor_loop on
+        # its own thread, interpolated in drain_ready).  Protected by
+        # _sensor_lock.  All *_ts lists store AirSim timestamps (ns).
+        self._sensor_lock = threading.Lock()
+        self._SENSOR_BUF_MAX = 2000          # trim safety cap
+
+        # GPS
+        self._gps_buf_ts: list[float] = []
         self._gps_buf_geo: list[np.ndarray] = []  # [lat, lon, alt]
-        self._GPS_BUF_MAX = 2000             # trim safety cap
-        self._gps_lock = threading.Lock()    # guards _gps_buf_*
+
+        # IMU / gyro
+        self._imu_buf_ts: list[float] = []
+        self._imu_buf_angular_vel: list[np.ndarray] = []   # [wx, wy, wz]
+        self._imu_buf_linear_acc: list[np.ndarray] = []    # [ax, ay, az]
+        self._imu_buf_orientation: list[np.ndarray] = []   # [w, x, y, z]
+
+        # Vehicle state (position + orientation from kinematics_estimated)
+        self._state_buf_ts: list[float] = []
+        self._state_buf_pos: list[np.ndarray] = []         # [x, y, z]
+        self._state_buf_ori: list[np.ndarray] = []         # [w, x, y, z]
 
         # Optional planner reference — when set, each registered scan's
         # world-frame points are forwarded via planner.feed_scan() so the
@@ -90,14 +104,14 @@ class BufferedSLAM:
         self._planner: "ExplorationPlanner | None" = None
 
         # Threading — two threads:
-        #   _thread      : LiDAR collect + drain (SLAM processing)
-        #   _gps_thread  : high-rate GPS polling (never blocked by SLAM)
+        #   _thread        : LiDAR collect + drain (SLAM processing)
+        #   _sensor_thread : high-rate GPS/IMU/state polling (never blocked by SLAM)
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
-        self._gps_thread: threading.Thread | None = None
+        self._sensor_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
-        self._thread_client = None   # collection thread AirSim client
-        self._gps_client = None      # GPS thread AirSim client
+        self._thread_client = None    # collection thread AirSim client
+        self._sensor_client = None    # sensor thread AirSim client
 
         # ── Deferred overlay queue ─────────────────────────────────────
         # Path / target overlays are queued and released after the same
@@ -182,22 +196,22 @@ class BufferedSLAM:
         if client is None:
             raise RuntimeError("Call live.connect() first")
 
-        # Sample state BEFORE LiDAR
-        state_before = client.getMultirotorState()
-
-        # Get sensor data
+        # Get LiDAR data — pose will be interpolated from the high-rate
+        # state ring buffer in drain_ready().
         lidar_data = client.getLidarData()
-
-        # Sample state AFTER LiDAR
-        state_after = client.getMultirotorState()
 
         if len(lidar_data.point_cloud) < 9:
             return None
 
         points = np.array(lidar_data.point_cloud, dtype=np.float32).reshape((-1, 3))
 
-        # Interpolate pose to LiDAR timestamp
-        pos, ori = self.live._interpolate_pose(state_before, state_after, lidar_data)
+        # Position and orientation are left as None here — they will be
+        # filled by drain_ready() via interpolation from the high-rate
+        # sensor ring buffers.  If the buffers aren't ready yet,
+        # drain_ready() simply defers the scan (leaves it in the buffer)
+        # until the data arrives.
+        pos = None
+        ori = None
 
         # LiDAR mount offset
         lpos = lidar_data.pose.position
@@ -205,24 +219,23 @@ class BufferedSLAM:
         lidar_position = np.array([lpos.x_val, lpos.y_val, lpos.z_val])
         lidar_orientation = np.array([lori.w_val, lori.x_val, lori.y_val, lori.z_val])
 
-        # GPS — grabbed at high rate by _sample_gps(); NOT grabbed here.
-        # A placeholder None is stored; drain_ready() will interpolate
-        # from the high-rate GPS buffer.
+        # GPS, IMU, and state are all grabbed at high rate by
+        # _sample_sensors(); placeholders are stored here and filled by
+        # drain_ready() via ring-buffer interpolation.
 
         lidar_ts = float(lidar_data.time_stamp)
-        state_before_ts = float(state_before.timestamp)
-        state_after_ts = float(state_after.timestamp)
 
         scan = {
             "points": points,
-            "position": pos,
-            "orientation": ori,
+            "position": pos,           # filled by drain_ready
+            "orientation": ori,        # filled by drain_ready
             "lidar_position": lidar_position,
             "lidar_orientation": lidar_orientation,
-            "gps": None,  # filled by drain_ready via GPS buffer interpolation
+            "gps": None,               # filled by drain_ready
+            "imu_angular_vel": None,    # filled by drain_ready
+            "imu_linear_acc": None,     # filled by drain_ready
+            "imu_orientation": None,    # filled by drain_ready
             "lidar_ts": lidar_ts,
-            "state_before_ts": state_before_ts,
-            "state_after_ts": state_after_ts,
             "collect_time": now,
             "frame_label": self.live._frame_count,
         }
@@ -259,73 +272,141 @@ class BufferedSLAM:
         while self._n_registered < ready_count and self._n_registered < len(self._scan_buf):
             scan = self._scan_buf[self._n_registered]
 
-            # ── Interpolate GPS from the high-rate buffer ─────────────
+            # ── Interpolate all sensors from the high-rate buffers ──
             lidar_ts = scan["lidar_ts"]
-            gps_interp = None
-            gps_bracket_ms = None
-            with self._gps_lock:
-                buf_ts = list(self._gps_buf_ts)    # snapshot
-                buf_geo = list(self._gps_buf_geo)
-            if len(buf_ts) >= 2:
-                idx = bisect.bisect_right(buf_ts, lidar_ts)
-                i_before = max(idx - 1, 0)
-                i_after = min(idx, len(buf_ts) - 1)
-                ts_a = buf_ts[i_before]
-                ts_b = buf_ts[i_after]
-                near_ms = min(abs(lidar_ts - ts_a),
-                              abs(lidar_ts - ts_b)) / 1e6
-                far_ms = max(abs(lidar_ts - ts_a),
-                             abs(lidar_ts - ts_b)) / 1e6
-                gps_bracket_ms = (near_ms, far_ms)
-                if ts_b != ts_a:
-                    t = np.clip((lidar_ts - ts_a) / (ts_b - ts_a), 0.0, 1.0)
-                    gps_interp = ((1 - t) * buf_geo[i_before]
-                                  + t * buf_geo[i_after])
+            with self._sensor_lock:
+                gps_ts   = list(self._gps_buf_ts)
+                gps_geo  = list(self._gps_buf_geo)
+                imu_ts   = list(self._imu_buf_ts)
+                imu_avel = list(self._imu_buf_angular_vel)
+                imu_lacc = list(self._imu_buf_linear_acc)
+                imu_ori  = list(self._imu_buf_orientation)
+                st_ts    = list(self._state_buf_ts)
+                st_pos   = list(self._state_buf_pos)
+                st_ori   = list(self._state_buf_ori)
+
+            # Helper: interpolate a list of vectors from a timestamped buffer
+            def _interp_vec(buf_ts, buf_vals, ts):
+                if len(buf_ts) < 2:
+                    return None, None
+                idx = bisect.bisect_right(buf_ts, ts)
+                ib = max(idx - 1, 0)
+                ia = min(idx, len(buf_ts) - 1)
+                ta, tb = buf_ts[ib], buf_ts[ia]
+                near = min(abs(ts - ta), abs(ts - tb)) / 1e6
+                far  = max(abs(ts - ta), abs(ts - tb)) / 1e6
+                if tb != ta:
+                    t = np.clip((ts - ta) / (tb - ta), 0.0, 1.0)
+                    val = (1 - t) * buf_vals[ib] + t * buf_vals[ia]
                 else:
-                    gps_interp = buf_geo[i_before].copy()
+                    val = buf_vals[ib].copy()
+                return val, (near, far)
+
+            # GPS
+            gps_interp, gps_bracket_ms = _interp_vec(gps_ts, gps_geo, lidar_ts)
             scan["gps"] = gps_interp
 
-            # Print timing: how far the bracketing state samples are from LiDAR
-            state_near_ms = min(abs(scan["lidar_ts"] - scan["state_before_ts"]),
-                                abs(scan["lidar_ts"] - scan["state_after_ts"])) / 1e6
-            state_far_ms = max(abs(scan["lidar_ts"] - scan["state_before_ts"]),
-                               abs(scan["lidar_ts"] - scan["state_after_ts"])) / 1e6
+            # IMU / gyro
+            imu_av, imu_av_br = _interp_vec(imu_ts, imu_avel, lidar_ts)
+            imu_la, imu_la_br = _interp_vec(imu_ts, imu_lacc, lidar_ts)
+            imu_or, _         = _interp_vec(imu_ts, imu_ori, lidar_ts)
+            scan["imu_angular_vel"] = imu_av
+            scan["imu_linear_acc"]  = imu_la
+            scan["imu_orientation"] = imu_or
+
+            # State (position + orientation) — SLERP for quaternion
+            state_pos_interp, state_bracket_ms = _interp_vec(st_ts, st_pos, lidar_ts)
+            state_ori_interp = None
+            if len(st_ts) >= 2:
+                idx = bisect.bisect_right(st_ts, lidar_ts)
+                ib = max(idx - 1, 0)
+                ia = min(idx, len(st_ts) - 1)
+                ta, tb = st_ts[ib], st_ts[ia]
+                if tb != ta:
+                    t_param = np.clip((lidar_ts - ta) / (tb - ta), 0.0, 1.0)
+                    o_a = st_ori[ib]  # w,x,y,z
+                    o_b = st_ori[ia]
+                    rots = Rotation.from_quat([
+                        [o_a[1], o_a[2], o_a[3], o_a[0]],
+                        [o_b[1], o_b[2], o_b[3], o_b[0]],
+                    ])
+                    from scipy.spatial.transform import Slerp as _Slerp
+                    slerp = _Slerp([0.0, 1.0], rots)
+                    q_scipy = slerp([t_param])[0].as_quat()  # x,y,z,w
+                    state_ori_interp = np.array([q_scipy[3], q_scipy[0],
+                                                q_scipy[1], q_scipy[2]])
+                else:
+                    state_ori_interp = st_ori[ib].copy()
+            scan["position"]    = state_pos_interp
+            scan["orientation"] = state_ori_interp
+
+            # ── Build log strings ─────────────────────────────────────
             gps_str = (f"GPS: {gps_bracket_ms[0]:5.1f}/{gps_bracket_ms[1]:5.1f} ms"
                        if gps_bracket_ms else "GPS: n/a")
+            state_str = (f"state: {state_bracket_ms[0]:5.1f}/{state_bracket_ms[1]:5.1f} ms"
+                         if state_bracket_ms else "state: n/a")
+            imu_str = (f"IMU: {imu_av_br[0]:5.1f}/{imu_av_br[1]:5.1f} ms"
+                       if imu_av_br else "IMU: n/a")
             buf_depth = len(self._scan_buf) - self._n_registered
 
-            # ── GPS quality gate ──────────────────────────────────────
-            # Reject scan if the nearest GPS sample is >20 ms away or
-            # the furthest bracket sample is >40 ms away.
-            GPS_NEAR_MAX_MS = 10.0
-            GPS_FAR_MAX_MS  = 40.0
+            # ── Sensor-readiness gate ─────────────────────────────────
+            # If any required sensor data hasn't arrived yet, DEFER this
+            # scan — leave it in the buffer and stop processing.  The
+            # drone simply hovers until the sensor thread fills the
+            # ring buffers and drain_ready() is called again.
+            if state_pos_interp is None or state_ori_interp is None:
+                n_waiting = getattr(self, '_n_sensor_waiting', 0) + 1
+                self._n_sensor_waiting = n_waiting
+                if n_waiting <= 5 or n_waiting % 50 == 0:
+                    print(f"  [buf] WAITING scan {scan['frame_label']:03d}  "
+                          f"| state buffer not ready yet  "
+                          f"(waiting count: {n_waiting})")
+                break  # stop processing — try again next call
+
+            if gps_interp is None:
+                n_waiting = getattr(self, '_n_sensor_waiting', 0) + 1
+                self._n_sensor_waiting = n_waiting
+                if n_waiting <= 5 or n_waiting % 50 == 0:
+                    print(f"  [buf] WAITING scan {scan['frame_label']:03d}  "
+                          f"| GPS buffer not ready yet  "
+                          f"(waiting count: {n_waiting})")
+                break  # stop processing — try again next call
+
+            # ── Quality gate ──────────────────────────────────────────
+            # Reject scan if GPS or state brackets are too wide
+            # (data exists but timestamps are too spread out).
+            GPS_NEAR_MAX_MS   = 9.0
+            GPS_FAR_MAX_MS    = 15.0
+            STATE_NEAR_MAX_MS = 9.0
+            STATE_FAR_MAX_MS  = 15.0
+
+            rejected = False
+            reject_reason = ""
+
             if gps_bracket_ms is not None:
                 gps_near, gps_far = gps_bracket_ms
                 if gps_near > GPS_NEAR_MAX_MS or gps_far > GPS_FAR_MAX_MS:
-                    self._n_gps_rejected = getattr(self, '_n_gps_rejected', 0) + 1
-                    if self._n_gps_rejected <= 5 or self._n_gps_rejected % 20 == 0:
-                        print(f"  [buf] REJECTED scan {scan['frame_label']:03d}  "
-                              f"| state: {state_near_ms:5.1f}/{state_far_ms:5.1f} ms  "
-                              f"| {gps_str}  "
-                              f"| reason: GPS bracket too wide  "
-                              f"(total rejected: {self._n_gps_rejected})")
-                    self._n_registered += 1
-                    continue
-            elif gps_interp is None:
-                # No GPS data at all — also reject
-                self._n_gps_rejected = getattr(self, '_n_gps_rejected', 0) + 1
-                if self._n_gps_rejected <= 5 or self._n_gps_rejected % 20 == 0:
+                    rejected = True
+                    reject_reason = "GPS bracket too wide"
+
+            if not rejected and state_bracket_ms is not None:
+                st_near, st_far = state_bracket_ms
+                if st_near > STATE_NEAR_MAX_MS or st_far > STATE_FAR_MAX_MS:
+                    rejected = True
+                    reject_reason = "state bracket too wide"
+
+            if rejected:
+                self._n_sensor_rejected = getattr(self, '_n_sensor_rejected', 0) + 1
+                if self._n_sensor_rejected <= 5 or self._n_sensor_rejected % 20 == 0:
                     print(f"  [buf] REJECTED scan {scan['frame_label']:03d}  "
-                          f"| state: {state_near_ms:5.1f}/{state_far_ms:5.1f} ms  "
-                          f"| GPS: n/a  "
-                          f"| reason: no GPS data  "
-                          f"(total rejected: {self._n_gps_rejected})")
+                          f"| {state_str}  | {gps_str}  | {imu_str}  "
+                          f"| reason: {reject_reason}  "
+                          f"(total rejected: {self._n_sensor_rejected})")
                 self._n_registered += 1
                 continue
 
             print(f"  [buf] registering scan {scan['frame_label']:03d}  "
-                  f"| state: {state_near_ms:5.1f}/{state_far_ms:5.1f} ms  "
-                  f"| {gps_str}  "
+                  f"| {state_str}  | {gps_str}  | {imu_str}  "
                   f"| buf depth: {buf_depth}")
 
             # Feed to SLAM pipeline (drone pos updated below after
@@ -418,20 +499,21 @@ class BufferedSLAM:
     # ── Background-thread scan collection ────────────────────────────
 
     def start_collection(self) -> None:
-        """Launch background threads for scan collection and GPS polling.
+        """Launch background threads for scan collection and sensor polling.
 
         Two threads are started, each with its own AirSim client:
-          * **collection thread** — grabs LiDAR + state, runs SLAM
-          * **GPS thread** — polls GPS at high rate (~5 ms) so the ring
-            buffer always brackets every LiDAR timestamp tightly, even
-            while SLAM registration is blocking the collection thread.
+          * **collection thread** — grabs LiDAR, runs SLAM
+          * **sensor thread** — polls GPS, IMU/gyro, and vehicle state at
+            high rate (~200 Hz) so the ring buffers always bracket every
+            LiDAR timestamp tightly, even while SLAM registration is
+            blocking the collection thread.
         """
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop_event.clear()
-        self._gps_thread = threading.Thread(
-            target=self._gps_loop, name="BufferedSLAM-GPS", daemon=True)
-        self._gps_thread.start()
+        self._sensor_thread = threading.Thread(
+            target=self._sensor_loop, name="BufferedSLAM-Sensor", daemon=True)
+        self._sensor_thread.start()
         self._thread = threading.Thread(
             target=self._collection_loop, name="BufferedSLAM", daemon=True)
         self._thread.start()
@@ -439,14 +521,14 @@ class BufferedSLAM:
     def stop_collection(self, timeout: float = 5.0) -> None:
         """Signal both background threads to stop and wait."""
         self._stop_event.set()
-        if self._gps_thread is not None:
-            self._gps_thread.join(timeout=timeout)
-            self._gps_thread = None
+        if self._sensor_thread is not None:
+            self._sensor_thread.join(timeout=timeout)
+            self._sensor_thread = None
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             self._thread = None
         self._thread_client = None
-        self._gps_client = None
+        self._sensor_client = None
 
     def _collection_loop(self) -> None:
         """Background thread: LiDAR collection + SLAM registration."""
@@ -468,39 +550,85 @@ class BufferedSLAM:
             # Sleep just under the scan interval so we never miss a window
             time.sleep(self.live._min_interval * 0.5)
 
-    def _gps_loop(self) -> None:
-        """Background thread: high-rate GPS polling.
+    def _sensor_loop(self) -> None:
+        """Background thread: high-rate GPS, IMU, and state polling.
 
         Runs on its own AirSim client so it is never blocked by the
         SLAM processing in ``drain_ready()``.
         """
         import cosysairsim as airsim
-        self._gps_client = airsim.MultirotorClient()
-        self._gps_client.confirmConnection()
-        print("  [BufferedSLAM] GPS thread AirSim client connected")
+        self._sensor_client = airsim.MultirotorClient()
+        self._sensor_client.confirmConnection()
+        print("  [BufferedSLAM] Sensor thread AirSim client connected")
 
         while not self._stop_event.is_set():
-            self._sample_gps()
-            time.sleep(0.005)  # ~200 Hz
+            self._sample_sensors()
+            time.sleep(0.003)  # ~200 Hz
 
-    def _sample_gps(self) -> None:
-        """Poll GPS once and append to the high-rate ring buffer."""
-        client = self._gps_client if self._gps_client is not None else self.live.client
+    def _sample_sensors(self) -> None:
+        """Poll GPS, IMU, and vehicle state once and append to ring buffers."""
+        client = self._sensor_client if self._sensor_client is not None else self.live.client
         if client is None:
             return
         try:
+            # GPS
             gps_data = client.getGpsData()
-            ts = float(gps_data.time_stamp)
+            gps_ts = float(gps_data.time_stamp)
             gp = gps_data.gnss.geo_point
-            geo = np.array([gp.latitude, gp.longitude, gp.altitude])
-            with self._gps_lock:
-                self._gps_buf_ts.append(ts)
-                self._gps_buf_geo.append(geo)
-                # Trim if too large
-                if len(self._gps_buf_ts) > self._GPS_BUF_MAX:
-                    trim = len(self._gps_buf_ts) - self._GPS_BUF_MAX
-                    self._gps_buf_ts = self._gps_buf_ts[trim:]
+            gps_geo = np.array([gp.latitude, gp.longitude, gp.altitude])
+
+            # IMU / gyro
+            imu_data = client.getImuData()
+            imu_ts = float(imu_data.time_stamp)
+            imu_av = np.array([imu_data.angular_velocity.x_val,
+                               imu_data.angular_velocity.y_val,
+                               imu_data.angular_velocity.z_val])
+            imu_la = np.array([imu_data.linear_acceleration.x_val,
+                               imu_data.linear_acceleration.y_val,
+                               imu_data.linear_acceleration.z_val])
+            imu_or = np.array([imu_data.orientation.w_val,
+                               imu_data.orientation.x_val,
+                               imu_data.orientation.y_val,
+                               imu_data.orientation.z_val])
+
+            # Vehicle state (position + orientation)
+            state = client.getMultirotorState()
+            state_ts = float(state.timestamp)
+            sp = state.kinematics_estimated.position
+            so = state.kinematics_estimated.orientation
+            state_pos = np.array([sp.x_val, sp.y_val, sp.z_val])
+            state_ori = np.array([so.w_val, so.x_val, so.y_val, so.z_val])
+
+            with self._sensor_lock:
+                # GPS
+                self._gps_buf_ts.append(gps_ts)
+                self._gps_buf_geo.append(gps_geo)
+                if len(self._gps_buf_ts) > self._SENSOR_BUF_MAX:
+                    trim = len(self._gps_buf_ts) - self._SENSOR_BUF_MAX
+                    self._gps_buf_ts  = self._gps_buf_ts[trim:]
                     self._gps_buf_geo = self._gps_buf_geo[trim:]
+
+                # IMU
+                self._imu_buf_ts.append(imu_ts)
+                self._imu_buf_angular_vel.append(imu_av)
+                self._imu_buf_linear_acc.append(imu_la)
+                self._imu_buf_orientation.append(imu_or)
+                if len(self._imu_buf_ts) > self._SENSOR_BUF_MAX:
+                    trim = len(self._imu_buf_ts) - self._SENSOR_BUF_MAX
+                    self._imu_buf_ts          = self._imu_buf_ts[trim:]
+                    self._imu_buf_angular_vel = self._imu_buf_angular_vel[trim:]
+                    self._imu_buf_linear_acc  = self._imu_buf_linear_acc[trim:]
+                    self._imu_buf_orientation = self._imu_buf_orientation[trim:]
+
+                # State
+                self._state_buf_ts.append(state_ts)
+                self._state_buf_pos.append(state_pos)
+                self._state_buf_ori.append(state_ori)
+                if len(self._state_buf_ts) > self._SENSOR_BUF_MAX:
+                    trim = len(self._state_buf_ts) - self._SENSOR_BUF_MAX
+                    self._state_buf_ts  = self._state_buf_ts[trim:]
+                    self._state_buf_pos = self._state_buf_pos[trim:]
+                    self._state_buf_ori = self._state_buf_ori[trim:]
         except Exception:
             pass
 
@@ -2089,8 +2217,8 @@ SAVE_DIR = os.path.join(os.path.dirname(__file__), "flight_recordings")
 # Set REPLAY_DIR to a recording directory (or parent) to run offline on
 # saved LiDAR data.  Leave empty ("") for live AirSim flight.
 
-REPLAY_DIR      = "flight_recordings"            # e.g. "flight_recordings/flight_1771909992"
-#REPLAY_DIR      = ""  
+#REPLAY_DIR      = "flight_recordings"            # e.g. "flight_recordings/flight_1771909992"
+REPLAY_DIR      = ""  
 # ── Exploration parameters (shared by both modes) ────────────────────────
 EXPLORE_BOUNDS  = (-13, 27, -35, 5, -14, 0.15)   # (xmin,xmax,ymin,ymax,zmin,zmax) NED
 TAKEOFF_HEIGHT  = EXPLORE_BOUNDS[4] -5         
@@ -2165,7 +2293,8 @@ def run_replay(recording_dir: str):
 
     # ── Set up SLAM pipeline + viewer ────────────────────────────────────
     cfg = SLAMConfig(
-        registration="vgicp",
+        registration="state_only",  #Valid keywords: state_only, icp, p2plane, gicp, ndt, fpfh, fpfh_ransac,
+                    #small_gicp, vgicp, kiss_icp
         octo_resolution=0.15,
         frame_skip=1,
         enable_viewer=True,
@@ -2322,7 +2451,8 @@ def run_live():
     import cosysairsim as airsim
 
     cfg = SLAMConfig(
-        registration="vgicp",
+        registration="state_only",#Valid keywords: state_only, icp, p2plane, gicp, ndt, fpfh, fpfh_ransac,
+                    #small_gicp, vgicp, kiss_icp
         octo_resolution=0.15,
         frame_skip=0,
         live_max_hz=SCAN_HZ,
@@ -2406,6 +2536,25 @@ def run_live():
     print(f"Rising to altitude z={TAKEOFF_HEIGHT} ...")
     live.client.moveToPositionAsync(0, 0, TAKEOFF_HEIGHT, velocity=VELOCITY).join()
     live.client.hoverAsync().join()
+
+    # Wait for the sensor thread to populate its ring buffers so that
+    # drain_ready() can actually interpolate poses.  The drone hovers
+    # at cruise altitude until data is flowing.
+    SENSOR_READY_TIMEOUT = 15.0   # seconds
+    print("  Waiting for sensor buffers to fill...")
+    t0 = time.time()
+    while (time.time() - t0) < SENSOR_READY_TIMEOUT:
+        with buf._sensor_lock:
+            gps_ok   = len(buf._gps_buf_ts) >= 2
+            state_ok = len(buf._state_buf_ts) >= 2
+            imu_ok   = len(buf._imu_buf_ts) >= 2
+        if gps_ok and state_ok and imu_ok:
+            break
+        time.sleep(0.05)
+    with buf._sensor_lock:
+        print(f"  Sensor buffers: GPS={len(buf._gps_buf_ts)}, "
+              f"state={len(buf._state_buf_ts)}, IMU={len(buf._imu_buf_ts)}  "
+              f"({time.time() - t0:.1f}s)")
 
     # Hover at cruise altitude and collect several scans so the planner
     # has a proper observed region centred at the operating height.
