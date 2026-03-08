@@ -164,9 +164,9 @@ class BufferedSLAM:
                 self.live.set_target(data["target_pos"])
             if "path_points" in data:
                 self.live.set_path_points(data["path_points"])
-            if "frontier_points" in data:
+            if "frontier_points" in data and NBV_SHOW_FRONTIERS:
                 self.live.set_frontier_points(data["frontier_points"])
-            if "candidate_points" in data:
+            if "candidate_points" in data and NBV_SHOW_CANDIDATES:
                 self.live.set_candidate_points(data["candidate_points"])
         if ready:
             self.live.refresh_overlays()
@@ -375,10 +375,10 @@ class BufferedSLAM:
             # ── Quality gate ──────────────────────────────────────────
             # Reject scan if GPS or state brackets are too wide
             # (data exists but timestamps are too spread out).
-            GPS_NEAR_MAX_MS   = 9.0
-            GPS_FAR_MAX_MS    = 15.0
-            STATE_NEAR_MAX_MS = 9.0
-            STATE_FAR_MAX_MS  = 15.0
+            GPS_NEAR_MAX_MS   = 10.0
+            GPS_FAR_MAX_MS    = 20.0
+            STATE_NEAR_MAX_MS = 10.0
+            STATE_FAR_MAX_MS  = 20.0
 
             rejected = False
             reject_reason = ""
@@ -441,9 +441,10 @@ class BufferedSLAM:
                         world_pts.astype(np.float32),
                     )
                     # Push updated frontier overlay to the viewer
-                    frontier_pts = self._planner.get_frontier_points()
-                    self.live.pipeline.set_frontier_points(
-                        frontier_pts if len(frontier_pts) > 0 else None)
+                    if NBV_SHOW_FRONTIERS:
+                        frontier_pts = self._planner.get_frontier_points()
+                        self.live.pipeline.set_frontier_points(
+                            frontier_pts if len(frontier_pts) > 0 else None)
 
             # Single authoritative drone-position update per scan.
             # This is the ONLY place that should call set_drone_pos
@@ -683,7 +684,7 @@ class ExplorationPlanner:
         ray_subsample: float | None = None,
         waypoint_exclusion_radius: float = 3.0,
         unknown_gain_radius: int = 3,
-        distance_exponent: float = 0.5,
+        distance_exponent: float = 1,
         lidar_altitude_offset: float = 0.0,
         min_target_distance: float = 3.0,
         inflation_margin: float = 2.0,
@@ -2217,8 +2218,8 @@ SAVE_DIR = os.path.join(os.path.dirname(__file__), "flight_recordings")
 # Set REPLAY_DIR to a recording directory (or parent) to run offline on
 # saved LiDAR data.  Leave empty ("") for live AirSim flight.
 
-REPLAY_DIR      = "flight_recordings"            # e.g. "flight_recordings/flight_1771909992"
-#REPLAY_DIR      = ""  
+#REPLAY_DIR      = "flight_recordings"            # e.g. "flight_recordings/flight_1771909992"
+REPLAY_DIR      = ""  
 # ── Exploration parameters (shared by both modes) ────────────────────────
 EXPLORE_BOUNDS  = (-13, 27, -35, 5, -14, 0.15)   # (xmin,xmax,ymin,ymax,zmin,zmax) NED
 TAKEOFF_HEIGHT  = EXPLORE_BOUNDS[4] -5         
@@ -2268,7 +2269,8 @@ NBV_VOLUMETRIC_RADIUS   = 8.0   # radius (m) for volumetric unknown density bonu
 NBV_VOLUMETRIC_WEIGHT   = 0.0   # weight of volumetric unknown term vs. frustum gain
 NBV_RAY_MAX_TARGETS     = 500   # max unknown voxels to ray-trace per candidate (downsample budget)
 NBV_USE_RAY_TRACING     = True  # True = 3D ray tracing, False = fast columnar occlusion
-NBV_SHOW_CANDIDATES     = True  # show evaluated candidate positions as magenta points in viewer
+NBV_SHOW_FRONTIERS      = False  # show frontier voxels as orange points in viewer
+NBV_SHOW_CANDIDATES     = False  # show evaluated candidate positions as magenta points in viewer
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2393,6 +2395,7 @@ class ReplayRunner:
         pipeline = SLAMPipeline(cfg)
         if self.enable_viewer:
             pipeline.start_viewer()
+            pipeline.set_bounds(self.bounds)
         self.pipeline = pipeline
 
         # ── Optional exploration planner ─────────────────────────────
@@ -2456,7 +2459,8 @@ class ReplayRunner:
                     if nbv_debug_plot is not None and "nbv_debug" in info:
                         nbv_debug_plot.update(info, drone_pos=pos.copy(),
                                               map_points=pipeline.get_map_points())
-                    pipeline.set_frontier_points(info.get("frontier_world_pts"))
+                    if NBV_SHOW_FRONTIERS:
+                        pipeline.set_frontier_points(info.get("frontier_world_pts"))
                     if target is not None:
                         wp_count += 1
                         targets_chosen.append(target.copy())
@@ -2593,6 +2597,7 @@ def run_live():
     # Start the 3-D viewer as early as possible so the user can see
     # the map being populated from the very first scan.
     live.pipeline.start_viewer()
+    live.pipeline.set_bounds(EXPLORE_BOUNDS)
 
     live.connect()
 
@@ -2770,7 +2775,8 @@ def run_live():
                 map_points=vis_pts if len(vis_pts) > 0 else None)
 
         # Queue overlays for deferred display (syncs with SLAM buffer delay)
-        buf.queue_overlay(frontier_points=info.get("frontier_world_pts"))
+        if NBV_SHOW_FRONTIERS:
+            buf.queue_overlay(frontier_points=info.get("frontier_world_pts"))
         if NBV_SHOW_CANDIDATES:
             buf.queue_overlay(candidate_points=info.get("candidate_world_pts"))
 
@@ -2841,9 +2847,9 @@ def run_live():
                 live.set_target(data["target_pos"])
             if "path_points" in data:
                 live.set_path_points(data["path_points"])
-            if "frontier_points" in data:
+            if "frontier_points" in data and NBV_SHOW_FRONTIERS:
                 live.set_frontier_points(data["frontier_points"])
-            if "candidate_points" in data:
+            if "candidate_points" in data and NBV_SHOW_CANDIDATES:
                 live.set_candidate_points(data["candidate_points"])
         buf._overlay_queue.clear()
     live.refresh_overlays()

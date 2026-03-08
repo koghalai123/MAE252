@@ -392,6 +392,15 @@ class SLAMPipeline:
         if self._viewer is None:
             self._viewer = Viewer3D()
 
+    def set_bounds(self, bounds):
+        """Set exploration bounds shown as a wireframe in the viewer.
+
+        Must be called before the viewer's ``start()`` (i.e. before the
+        first frame is processed with the viewer active).
+        """
+        if self._viewer is not None:
+            self._viewer.set_bounds(bounds)
+
     def stop_viewer(self):
         """Stop the viewer process."""
         if self._viewer is not None:

@@ -45,7 +45,7 @@ OCTO_RESOLUTION = 0.15
 # Set to None to run ALL available methods automatically.
 # Otherwise provide a list of method keywords, e.g.:
 #   ["state_only", "icp", "gicp", "ndt", "fpfh_ransac", "small_gicp", "vgicp", "kiss_icp"]
-METHODS = None
+METHODS = ["state_only", "fpfh_ransac", "vgicp"]
 
 # Show the Open3D viewer while processing each method.
 ENABLE_VIEWER = True

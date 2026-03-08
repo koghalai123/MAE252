@@ -28,11 +28,41 @@ def _make_sphere(color, radius=_MARKER_RADIUS):
     return s
 
 
+def _make_bounds_lineset(bounds):
+    """Create a wireframe LineSet for a rectangular prism from (xmin,xmax,ymin,ymax,zmin,zmax)."""
+    import open3d as _o3d
+    xmin, xmax, ymin, ymax, zmin, zmax = bounds
+    # 8 corners of the rectangular prism
+    corners = [
+        [xmin, ymin, zmin],  # 0
+        [xmax, ymin, zmin],  # 1
+        [xmax, ymax, zmin],  # 2
+        [xmin, ymax, zmin],  # 3
+        [xmin, ymin, zmax],  # 4
+        [xmax, ymin, zmax],  # 5
+        [xmax, ymax, zmax],  # 6
+        [xmin, ymax, zmax],  # 7
+    ]
+    # 12 edges of the prism
+    edges = [
+        [0, 1], [1, 2], [2, 3], [3, 0],  # bottom face
+        [4, 5], [5, 6], [6, 7], [7, 4],  # top face
+        [0, 4], [1, 5], [2, 6], [3, 7],  # vertical edges
+    ]
+    ls = _o3d.geometry.LineSet(
+        points=_o3d.utility.Vector3dVector(corners),
+        lines=_o3d.utility.Vector2iVector(edges),
+    )
+    # Yellow-green colour for bounds
+    ls.colors = _o3d.utility.Vector3dVector([[0.2, 0.8, 0.2]] * len(edges))
+    return ls
+
+
 def _vis_process(shm_name, shape, dtype_str, lock, update_event, stop_event,
                  marker_shm_name=None, frontier_shm_name=None,
                  frontier_shape=None, path_shm_name=None,
                  path_shape=None, candidate_shm_name=None,
-                 candidate_shape=None):
+                 candidate_shape=None, bounds=None):
     """Visualizer loop running in a separate process."""
     import numpy as _np
     import open3d as _o3d
@@ -90,11 +120,25 @@ def _vis_process(shm_name, shape, dtype_str, lock, update_event, stop_event,
     path_lineset = _o3d.geometry.LineSet()
     path_visible = False
 
+    # Bounds wireframe (static)
+    bounds_lineset = None
+    if bounds is not None:
+        bounds_lineset = _make_bounds_lineset(bounds)
+
     vis = _o3d.visualization.Visualizer()
     vis.create_window(window_name="3D Map Viewer", width=1280, height=720)
     vis.add_geometry(pcd)
     vis.add_geometry(frontier_pcd)
     vis.add_geometry(candidate_pcd)
+    if bounds_lineset is not None:
+        vis.add_geometry(bounds_lineset)
+
+    # Set initial viewpoint for NED convention (negative Z = up in world)
+    vc = vis.get_view_control()
+    vc.set_front([0.5, -0.5, -0.6])   
+    vc.set_lookat([0.0, 0.0, 0.0])
+    vc.set_up([0.0, 0.0, -1.0])      # negative Z is "up" in NED
+    vc.set_zoom(0.65)
 
     while not stop_event.is_set():
         if update_event.is_set():
@@ -209,6 +253,7 @@ class Viewer3D:
         self._path_buf = None
         self._candidate_shm = None
         self._candidate_buf = None
+        self._bounds = None   # (xmin,xmax,ymin,ymax,zmin,zmax) or None
         self._proc = None
         self._lock = multiprocessing.Lock()
         self._update_event = multiprocessing.Event()
@@ -271,10 +316,19 @@ class Viewer3D:
                         path_shm_name=self._path_shm.name,
                         path_shape=self._path_shape,
                         candidate_shm_name=self._candidate_shm.name,
-                        candidate_shape=self._candidate_shape),
+                        candidate_shape=self._candidate_shape,
+                        bounds=self._bounds),
             daemon=True,
         )
         self._proc.start()
+
+    def set_bounds(self, bounds):
+        """Set exploration bounds (xmin,xmax,ymin,ymax,zmin,zmax).
+
+        Must be called before ``start()`` so the wireframe is visible
+        from the first frame.
+        """
+        self._bounds = tuple(bounds) if bounds is not None else None
 
     def update(self, points, *, drone_pos=None, target_pos=None,
                frontier_points=None, path_points=None,

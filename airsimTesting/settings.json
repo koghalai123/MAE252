@@ -14,8 +14,9 @@
         "LidarSensor1": {
           "SensorType": 6,
           "Enabled": true,
-          "NumberOfChannels": 300,
-          "MeasurementsPerCycle": 1000,
+          "Range": 50,
+          "NumberOfChannels": 250,
+          "MeasurementsPerCycle": 800,
           "RotationsPerSecond": 500,
           "UpdateFrequency": 10000,
           "X": 0,
@@ -24,11 +25,11 @@
           "Roll": 0,
           "Pitch": 0,
           "Yaw": 0,
-          "VerticalFOVUpper": 10,
-          "VerticalFOVLower": -30,
+          "VerticalFOVUpper": 0,
+          "VerticalFOVLower": -60,
           "HorizontalFOVStart": -180,
           "HorizontalFOVEnd": 180,
-          "DrawDebugPoints": false,
+          "DrawDebugPoints": false
         }
       }
     }
