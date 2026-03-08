@@ -2217,8 +2217,8 @@ SAVE_DIR = os.path.join(os.path.dirname(__file__), "flight_recordings")
 # Set REPLAY_DIR to a recording directory (or parent) to run offline on
 # saved LiDAR data.  Leave empty ("") for live AirSim flight.
 
-#REPLAY_DIR      = "flight_recordings"            # e.g. "flight_recordings/flight_1771909992"
-REPLAY_DIR      = ""  
+REPLAY_DIR      = "flight_recordings"            # e.g. "flight_recordings/flight_1771909992"
+#REPLAY_DIR      = ""  
 # ── Exploration parameters (shared by both modes) ────────────────────────
 EXPLORE_BOUNDS  = (-13, 27, -35, 5, -14, 0.15)   # (xmin,xmax,ymin,ymax,zmin,zmax) NED
 TAKEOFF_HEIGHT  = EXPLORE_BOUNDS[4] -5         
@@ -2270,6 +2270,269 @@ NBV_RAY_MAX_TARGETS     = 500   # max unknown voxels to ray-trace per candidate 
 NBV_USE_RAY_TRACING     = True  # True = 3D ray tracing, False = fast columnar occlusion
 NBV_SHOW_CANDIDATES     = True  # show evaluated candidate positions as magenta points in viewer
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ReplayRunner — reusable object for replaying saved LiDAR data through the
+#                SLAM pipeline.  Used by run_replay() below AND importable by
+#                other scripts (e.g. registrationBenchmark.py).
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ReplayRunner:
+    """Replay saved flight data through a configurable SLAM pipeline.
+
+    Parameters
+    ----------
+    recording_dir : str
+        Path to a directory containing ``frame_*.npz`` files, or a parent
+        directory that contains such sub-directories.
+    registration : str
+        Registration method keyword (see ``SLAMConfig``).
+    octo_resolution : float
+        Voxel / OctoMap resolution in metres.
+    bounds : tuple[float, ...] | None
+        (xmin, xmax, ymin, ymax, zmin, zmax) exploration bounding box.
+        Stored alongside the map for ``mapAnalysis.py``.
+    planner_res : float
+        Planning grid voxel size (m).  Used for map export metadata.
+    frame_skip : int
+        Process every Nth frame (1 = all frames).
+    enable_viewer : bool
+        Open the Open3D 3-D viewer while processing.
+    enable_planner : bool
+        Run the exploration planner during replay (for visualisation).
+    """
+
+    def __init__(
+        self,
+        recording_dir: str,
+        *,
+        registration: str = "state_only",
+        octo_resolution: float = 0.15,
+        bounds: tuple[float, ...] | None = None,
+        planner_res: float = 1.0,
+        frame_skip: int = 1,
+        enable_viewer: bool = True,
+        enable_planner: bool = False,
+    ):
+        self.recording_dir = resolve_recording_dir(recording_dir)
+        self.registration = registration
+        self.octo_resolution = octo_resolution
+        self.bounds = bounds if bounds is not None else EXPLORE_BOUNDS
+        self.planner_res = planner_res
+        self.frame_skip = frame_skip
+        self.enable_viewer = enable_viewer
+        self.enable_planner = enable_planner
+
+        # Populated after run()
+        self.pipeline: SLAMPipeline | None = None
+        self.n_frames: int = 0
+
+    # ── Frame loading ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _get_npz(d, key, default=None):
+        """Load an array from an ``.npz``, returning *default* if missing or *None*.
+
+        ``np.savez`` stores ``None`` as a 0-d object array.  This helper
+        transparently unwraps that so callers always get a usable value.
+        """
+        if key not in d.files:
+            return default
+        v = d[key]
+        if v.ndim == 0 and v.dtype == object:
+            item = v.item()
+            return item if item is not None else default
+        return v
+
+    def _load_frame_paths(self) -> list[str]:
+        all_frames = sorted(glob.glob(
+            os.path.join(self.recording_dir, "frame_*.npz")))
+        return all_frames[::self.frame_skip]
+
+    def _load_one_frame(self, path: str) -> dict:
+        """Load a single ``frame_*.npz`` with robust None handling."""
+        d = np.load(path, allow_pickle=True)
+        _g = self._get_npz
+        return {
+            "points":            d["points"],
+            "position":          _g(d, "position", np.zeros(3)),
+            "orientation":       _g(d, "orientation",
+                                    np.array([1, 0, 0, 0], dtype=float)),
+            "lidar_position":    _g(d, "lidar_position"),
+            "lidar_orientation": _g(d, "lidar_orientation"),
+            "gps":               _g(d, "gps"),
+        }
+
+    # ── Core replay loop ──────────────────────────────────────────────
+
+    def run(self) -> SLAMPipeline:
+        """Feed every frame through the SLAM pipeline and return it.
+
+        The pipeline's corrected map is computed before returning, and the
+        viewer (if enabled) stays open.
+        """
+        frame_paths = self._load_frame_paths()
+        if not frame_paths:
+            raise FileNotFoundError(
+                f"No frame_*.npz files in {self.recording_dir}")
+
+        self.n_frames = len(frame_paths)
+        print(f"Replaying {self.n_frames} frames from {self.recording_dir}")
+        all_count = len(sorted(glob.glob(
+            os.path.join(self.recording_dir, "frame_*.npz"))))
+        print(f"  (available: {all_count}, skip={self.frame_skip}, "
+              f"registration={self.registration})")
+
+        # ── Pipeline ─────────────────────────────────────────────────
+        cfg = SLAMConfig(
+            registration=self.registration,
+            octo_resolution=self.octo_resolution,
+            frame_skip=1,
+            enable_viewer=self.enable_viewer,
+        )
+        pipeline = SLAMPipeline(cfg)
+        if self.enable_viewer:
+            pipeline.start_viewer()
+        self.pipeline = pipeline
+
+        # ── Optional exploration planner ─────────────────────────────
+        planner = None
+        nbv_debug_plot = None
+        if self.enable_planner:
+            planner = ExplorationPlanner(
+                bounds=self.bounds,
+                resolution=self.planner_res,
+                min_frontier_size=3,
+                use_random=USE_RANDOM,
+                random_max_attempts=RANDOM_MAX_ATTEMPTS,
+                use_nbv=USE_NBV,
+                nbv_sensor_half_angle=NBV_SENSOR_HALF_ANGLE,
+                nbv_cruise_altitude=NBV_CRUISE_ALTITUDE,
+                nbv_n_unknown_columns=NBV_N_UNKNOWN_COLUMNS,
+                nbv_n_local_samples=NBV_N_LOCAL_SAMPLES,
+                nbv_local_radius=NBV_LOCAL_RADIUS,
+                nbv_unknown_block_size=NBV_UNKNOWN_BLOCK_SIZE,
+                nbv_n_unknown_blocks=NBV_N_UNKNOWN_BLOCKS,
+                nbv_volumetric_radius=NBV_VOLUMETRIC_RADIUS,
+                nbv_volumetric_weight=NBV_VOLUMETRIC_WEIGHT,
+                nbv_ray_max_targets=NBV_RAY_MAX_TARGETS,
+                nbv_use_ray_tracing=NBV_USE_RAY_TRACING,
+            )
+            nbv_debug_plot = _NBVDebugPlot() if USE_NBV else None
+
+        # ── Process frames ───────────────────────────────────────────
+        wp_count = 0
+        targets_chosen: list[np.ndarray] = []
+        n = self.n_frames
+
+        for i, path in enumerate(frame_paths):
+            f = self._load_one_frame(path)
+            pos = f["position"]
+            ori = f["orientation"]
+
+            pipeline.set_drone_pos(pos)
+            pipeline.process_frame(
+                f["points"], pos, ori,
+                gps=f["gps"],
+                lidar_position=f["lidar_position"],
+                lidar_orientation=f["lidar_orientation"],
+                frame_label=i,
+            )
+
+            # ── Exploration planner (optional) ───────────────────────
+            if planner is not None:
+                valid_pts = filter_valid(f["points"])
+                if len(valid_pts) > 0:
+                    lp = f["lidar_position"] if f["lidar_position"] is not None else np.zeros(3)
+                    lo = f["lidar_orientation"] if f["lidar_orientation"] is not None else np.array([1,0,0,0], dtype=float)
+                    R_l = Rotation.from_quat([lo[1], lo[2], lo[3], lo[0]]).as_matrix()
+                    body = (R_l @ valid_pts.T).T + lp
+                    R_b = Rotation.from_quat([ori[1], ori[2], ori[3], ori[0]]).as_matrix()
+                    world_pts = (R_b @ body.T).T + pos
+                    planner.feed_scan(pos.copy(), world_pts.astype(np.float32))
+
+                if (i + 1) % PLAN_EVERY == 0 or i == n - 1:
+                    target, info = planner.next_target(pipeline, pos.copy())
+                    if nbv_debug_plot is not None and "nbv_debug" in info:
+                        nbv_debug_plot.update(info, drone_pos=pos.copy(),
+                                              map_points=pipeline.get_map_points())
+                    pipeline.set_frontier_points(info.get("frontier_world_pts"))
+                    if target is not None:
+                        wp_count += 1
+                        targets_chosen.append(target.copy())
+                        pipeline.set_target_pos(target.tolist())
+
+            if (i + 1) % 20 == 0 or i == n - 1:
+                print(f"    [{self.registration}] frame {i+1:3d}/{n}  "
+                      f"voxels={pipeline.voxel_count:,}  "
+                      f"submaps={pipeline.submap_count}")
+
+        # ── Finalise ─────────────────────────────────────────────────
+        pipeline.get_corrected_map_points()
+        return pipeline
+
+    # ── Map saving ────────────────────────────────────────────────────
+
+    def save_map(self, out_dir: str | None = None, *,
+                 source: str = "replay",
+                 extra_metadata: dict | None = None) -> str:
+        """Save the SLAM map in the same ``.npz`` format used by exploration.py.
+
+        Parameters
+        ----------
+        out_dir : str or None
+            Directory to save into.  *None* → ``flight_recordings/slam_map_<timestamp>``.
+        source : str
+            Provenance tag stored in the file.
+        extra_metadata : dict or None
+            Additional key/value pairs to store in the ``.npz``.
+
+        Returns
+        -------
+        str — path to the saved ``.npz`` file.
+        """
+        if self.pipeline is None:
+            raise RuntimeError("Must call run() before save_map()")
+
+        if out_dir is None:
+            out_dir = os.path.join(os.path.dirname(__file__), "flight_recordings",
+                                   f"slam_map_{int(time.time())}")
+        os.makedirs(out_dir, exist_ok=True)
+
+        # Use the viewer export if the viewer is running (preserves exactly
+        # what was displayed).  Otherwise fall back to the pipeline's voxel
+        # centres directly.
+        if (self.enable_viewer and self.pipeline._viewer is not None
+                and self.pipeline._viewer._proc is not None):
+            return self.pipeline._viewer.export_map(
+                out_dir,
+                bounds=np.array(self.bounds, dtype=np.float64),
+                resolution=self.planner_res,
+                source=source,
+            )
+
+        pts = self.pipeline.get_map_points()
+        kw = dict(
+            points=pts,
+            timestamp=np.array(time.time()),
+            source=np.array(source),
+            bounds=np.array(self.bounds, dtype=np.float64),
+            resolution=np.array(self.octo_resolution),
+        )
+        if extra_metadata:
+            for k, v in extra_metadata.items():
+                kw[k] = np.array(v)
+        npz_path = os.path.join(out_dir, "slam_map.npz")
+        np.savez(npz_path, **kw)
+        print(f"  Map saved: {npz_path}  ({len(pts):,} points)")
+        return npz_path
+
+    def stop_viewer(self):
+        """Stop the Open3D viewer (if running)."""
+        if self.pipeline is not None:
+            self.pipeline.stop_viewer()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Replay mode — offline exploration on saved LiDAR data
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2281,156 +2544,22 @@ def run_replay(recording_dir: str):
     the WFD planner periodically so you can see frontier detection and target
     selection in the Open3D viewer without a running simulator.
     """
-    recording_dir = resolve_recording_dir(recording_dir)
-    all_frames = sorted(glob.glob(os.path.join(recording_dir, "frame_*.npz")))
-    if not all_frames:
-        print(f"No frame_*.npz files found in {recording_dir}")
-        return
-
-    frames = all_frames[::FRAME_SKIP]
-    print(f"Replaying {len(frames)} frames from {recording_dir}")
-    print(f"  (available: {len(all_frames)}, skip={FRAME_SKIP})")
-
-    # ── Set up SLAM pipeline + viewer ────────────────────────────────────
-    cfg = SLAMConfig(
-        registration="state_only",  #Valid keywords: state_only, icp, p2plane, gicp, ndt, fpfh, fpfh_ransac,
-                    #small_gicp, vgicp, kiss_icp
+    runner = ReplayRunner(
+        recording_dir,
+        registration="state_only",  # Valid keywords: state_only, icp, p2plane, gicp, ndt, fpfh, fpfh_ransac,
+                                     # small_gicp, vgicp, kiss_icp
         octo_resolution=0.15,
-        frame_skip=1,
-        enable_viewer=True,
-    )
-    pipeline = SLAMPipeline(cfg)
-    pipeline.start_viewer()
-
-    # ── Set up planner ───────────────────────────────────────────────────
-    planner = ExplorationPlanner(
         bounds=EXPLORE_BOUNDS,
-        resolution=PLANNER_RES,
-        min_frontier_size=3,
-        use_random=USE_RANDOM,
-        random_max_attempts=RANDOM_MAX_ATTEMPTS,
-        use_nbv=USE_NBV,
-        nbv_sensor_half_angle=NBV_SENSOR_HALF_ANGLE,
-        nbv_cruise_altitude=NBV_CRUISE_ALTITUDE,
-        nbv_n_unknown_columns=NBV_N_UNKNOWN_COLUMNS,
-        nbv_n_local_samples=NBV_N_LOCAL_SAMPLES,
-        nbv_local_radius=NBV_LOCAL_RADIUS,
-        nbv_unknown_block_size=NBV_UNKNOWN_BLOCK_SIZE,
-        nbv_n_unknown_blocks=NBV_N_UNKNOWN_BLOCKS,
-        nbv_volumetric_radius=NBV_VOLUMETRIC_RADIUS,
-        nbv_volumetric_weight=NBV_VOLUMETRIC_WEIGHT,
-        nbv_ray_max_targets=NBV_RAY_MAX_TARGETS,
-        nbv_use_ray_tracing=NBV_USE_RAY_TRACING,
+        planner_res=PLANNER_RES,
+        frame_skip=FRAME_SKIP,
+        enable_viewer=True,
+        enable_planner=True,
     )
 
-    strategy = "random" if USE_RANDOM else ("NBV" if USE_NBV else "WFD")
-
-    # NBV candidate comparison dashboard (replay mode)
-    nbv_debug_plot = _NBVDebugPlot() if USE_NBV else None
-
-    print(f"\n{'='*60}")
-    print(f"Exploration planner replay  (strategy: {strategy})")
-    print(f"  Bounds: x=[{EXPLORE_BOUNDS[0]}, {EXPLORE_BOUNDS[1]}], "
-          f"y=[{EXPLORE_BOUNDS[2]}, {EXPLORE_BOUNDS[3]}], "
-          f"z=[{EXPLORE_BOUNDS[4]}, {EXPLORE_BOUNDS[5]}]")
-    print(f"  Grid:  {planner.nx} x {planner.ny} x {planner.nz} voxels @ {PLANNER_RES} m")
-    print(f"  Observation: raycasted from LiDAR  |  Plan every {PLAN_EVERY} frames")
-    print(f"{'='*60}\n")
-
-    wp_count = 0
-    targets_chosen: list[np.ndarray] = []
-
-    for i, path in enumerate(frames):
-        t_load = time.perf_counter()
-        data = np.load(path)
-        pts = data["points"]
-        pos = data["position"] if "position" in data.files else np.zeros(3)
-        ori = (data["orientation"] if "orientation" in data.files
-               else np.array([1, 0, 0, 0], dtype=float))
-        lp = data["lidar_position"] if "lidar_position" in data.files else None
-        lo = data["lidar_orientation"] if "lidar_orientation" in data.files else None
-        gps = data["gps"] if "gps" in data.files else None
-
-        # ── Feed frame to SLAM pipeline ──────────────────────────────────
-        pipeline.set_drone_pos(pos)
-        result = pipeline.process_frame(
-            pts, pos, ori,
-            gps=gps,
-            lidar_position=lp,
-            lidar_orientation=lo,
-            frame_label=i,
-        )
-
-        # ── Feed scan to planner for raycasting ─────────────────────────
-        valid_pts = filter_valid(pts)
-        if len(valid_pts) > 0:
-            lp_arr = lp if lp is not None else np.zeros(3)
-            lo_arr = lo if lo is not None else np.array([1, 0, 0, 0], dtype=float)
-            R_l = Rotation.from_quat(
-                [lo_arr[1], lo_arr[2], lo_arr[3], lo_arr[0]]).as_matrix()
-            body = (R_l @ valid_pts.T).T + lp_arr
-
-            ori_arr = np.asarray(ori, dtype=float)
-            R_b = Rotation.from_quat(
-                [ori_arr[1], ori_arr[2], ori_arr[3], ori_arr[0]]).as_matrix()
-            world_pts = (R_b @ body.T).T + np.asarray(pos, dtype=float)
-            planner.feed_scan(pos.copy(), world_pts.astype(np.float32))
-
-        # ── Run planner periodically ─────────────────────────────────────
-        if (i + 1) % PLAN_EVERY == 0 or i == len(frames) - 1:
-            current_pos = np.asarray(pos, dtype=float)
-            t_plan = time.perf_counter()
-            target, info = planner.next_target(pipeline, current_pos)
-            dt_plan = time.perf_counter() - t_plan
-
-            # Update NBV debug dashboard
-            if nbv_debug_plot is not None and "nbv_debug" in info:
-                nbv_debug_plot.update(
-                    info, drone_pos=current_pos,
-                    map_points=pipeline.get_map_points())
-
-            # Update viewer overlays
-            pipeline.set_frontier_points(info.get("frontier_world_pts"))
-
-            print(f"  [frame {i+1:03d}/{len(frames)}] "
-                  f"Occupied: {info['n_occupied_cells']} | "
-                  f"Frontiers: {info['n_frontier_cells']}/{info['n_frontier_cells_raw']} "
-                  f"in {info['n_clusters']} clusters | "
-                  f"plan: {dt_plan*1e3:.0f}ms")
-
-            if target is not None:
-                wp_count += 1
-                targets_chosen.append(target.copy())
-                pipeline.set_target_pos(target.tolist())
-                print(f"       -> target #{wp_count}: "
-                      f"({target[0]:.1f}, {target[1]:.1f}, {target[2]:.1f})")
-            else:
-                print(f"       -> no frontiers remain")
-
-    # ── Summary ──────────────────────────────────────────────────────────
-    print(f"\n{'='*60}")
-    print(f"Replay complete — {len(frames)} frames processed, "
-          f"{wp_count} targets selected")
-    if targets_chosen:
-        print(f"  Target waypoints:")
-        for j, t in enumerate(targets_chosen):
-            print(f"    #{j+1}: ({t[0]:.1f}, {t[1]:.1f}, {t[2]:.1f})")
-    print(f"{'='*60}")
-
-    pipeline.get_corrected_map_points()
+    pipeline = runner.run()
     pipeline.print_summary()
 
-    # Save the final SLAM map directly from the viewer's shared-memory
-    # buffer — this is exactly what was displayed, avoiding any GTSAM
-    # recomposition artefacts.
-    map_out_dir = os.path.join(os.path.dirname(__file__), "savedMaps",
-                               f"slam_map_{int(time.time())}")
-    pipeline._viewer.export_map(
-        map_out_dir,
-        bounds=np.array(EXPLORE_BOUNDS, dtype=np.float64),
-        resolution=PLANNER_RES,
-        source="replay",
-    )
+    runner.save_map(source="replay")
 
     print("\n  Viewer is still open — close the Open3D window or press Enter to exit.")
     try:
@@ -2438,7 +2567,7 @@ def run_replay(recording_dir: str):
     except (EOFError, KeyboardInterrupt):
         pass
 
-    pipeline.stop_viewer()
+    runner.stop_viewer()
     print("Done.")
 
 
