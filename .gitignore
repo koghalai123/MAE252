@@ -6,6 +6,8 @@ aloha_sim_dataset/
 wandb/
 /airsim_rosbag_1771564476/
 /airsimTesting/flight_recordings
+/airsimTesting/savedMaps
+/airsimTesting/groundTruthMap
 /venv/
 
 # Python cache
