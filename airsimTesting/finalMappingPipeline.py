@@ -510,6 +510,17 @@ class SLAMPipeline:
         lo = lidar_orientation if lidar_orientation is not None else np.array([1, 0, 0, 0], dtype=float)
         body = xform_pts(pts, lp, lo)
 
+        # Filter out LiDAR self-returns: the LiDAR is mounted above the
+        # drone body (e.g. lidar_position=[0,0,-1]).  Points at sensor
+        # range ~1 m pointing back toward the body become near-zero in
+        # body frame.  Remove any body-frame point within 1 m of the
+        # vehicle centre (body origin) to eliminate ghost voxels along
+        # the flight path.
+        body_ranges = np.linalg.norm(body, axis=1)
+        body_keep = body_ranges >= 1.0
+        pts = pts[body_keep]
+        body = body[body_keep]
+
         pos = np.asarray(position, dtype=float)
         ori = np.asarray(orientation, dtype=float)
         world_init = xform_pts(body, pos, ori)

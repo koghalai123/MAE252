@@ -26,7 +26,7 @@ from pathlib import Path
 import numpy as np
 
 from exploration import ReplayRunner, EXPLORE_BOUNDS, PLANNER_RES, FRAME_SKIP
-from RegistrationComparison import REGISTRATION_METHODS
+from RegistrationComparison import REGISTRATION_METHODS, resolve_recording_dir
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -71,6 +71,39 @@ def _deduplicate_methods(methods: list[str]) -> list[str]:
             seen_fns[id(fn)] = m
             deduped.append(m)
     return deduped
+
+
+def _save_timing_csv(pipeline, method: str, out_dir: str,
+                     wall_time: float) -> None:
+    """Save a CSV with per-step timing breakdown next to the map.
+
+    Rows: one per timing category (transform, register, gtsam, …).
+    Columns: total_s, mean_s, max_s, min_s, std_s, pct, count.
+    An extra "wall_clock" row records the overall elapsed time.
+    """
+    try:
+        summary = pipeline.get_summary()
+        timings = summary.get("timings", {})
+        grand_total = sum(timings.get("total", [0.0]))
+
+        csv_path = os.path.join(out_dir, "timing_breakdown.csv")
+        with open(csv_path, "w") as f:
+            f.write("step,total_s,mean_s,max_s,min_s,std_s,pct,count\n")
+            for key in ["load", "transform", "register", "gtsam",
+                        "octo_insert", "vox_track", "vis", "total"]:
+                vals = timings.get(key, [])
+                if not vals:
+                    continue
+                arr = np.array(vals)
+                s_sum = float(arr.sum())
+                pct = 100.0 * s_sum / grand_total if grand_total > 0 else 0.0
+                f.write(f"{key},{s_sum:.6f},{arr.mean():.6f},{arr.max():.6f},"
+                        f"{arr.min():.6f},{arr.std():.6f},{pct:.2f},{len(vals)}\n")
+            # Wall-clock row
+            f.write(f"wall_clock,{wall_time:.6f},,,,,,\n")
+        print(f"  Timing CSV saved: {csv_path}")
+    except Exception as e:
+        print(f"  (could not save timing CSV: {e})")
 
 
 def _save_quality_plot(pipeline, method: str, out_dir: str):
@@ -133,6 +166,9 @@ def main():
     if rec_arg and not os.path.isabs(rec_arg):
         rec_arg = os.path.join(_SCRIPT_DIR, rec_arg)
 
+    # Resolve to the actual folder containing frame_*.npz files
+    resolved_rec = resolve_recording_dir(rec_arg)
+
     # ── Determine methods to run ──────────────────────────────────────
     methods = (METHODS if METHODS is not None
                else _deduplicate_methods(list(REGISTRATION_METHODS.keys())))
@@ -140,7 +176,7 @@ def main():
     print(f"{'='*70}")
     print(f"  Registration Benchmark")
     print(f"{'='*70}")
-    print(f"  Recording:  {rec_arg}")
+    print(f"  Recording:  {resolved_rec}")
     print(f"  Bounds:     {EXPLORE_BOUNDS}")
     print(f"  Resolution: {OCTO_RESOLUTION} m")
     print(f"  Methods:    {', '.join(methods)}")
@@ -148,7 +184,13 @@ def main():
 
     # ── Run each method ───────────────────────────────────────────────
     results_summary: list[dict] = []
-    timestamp = int(time.time())
+
+    # Extract the timestamp from the source recording folder name
+    # (e.g. "exploration_1773009886" → 1773009886) so saved maps
+    # carry the same timestamp as the data they were built from.
+    import re
+    _ts_match = re.search(r'(\d{10,})', os.path.basename(resolved_rec))
+    timestamp = int(_ts_match.group(1)) if _ts_match else int(time.time())
 
     for method in methods:
         print(f"\n{'━'*70}")
@@ -156,7 +198,7 @@ def main():
         print(f"{'━'*70}")
 
         runner = ReplayRunner(
-            rec_arg,
+            resolved_rec,
             registration=method,
             octo_resolution=OCTO_RESOLUTION,
             bounds=EXPLORE_BOUNDS,
@@ -193,6 +235,9 @@ def main():
         # ── Quality plot ──────────────────────────────────────────────
         if SAVE_QUALITY_PLOT:
             _save_quality_plot(pipeline, method, map_out_dir)
+
+        # ── Timing breakdown CSV ──────────────────────────────────────
+        _save_timing_csv(pipeline, method, map_out_dir, elapsed)
 
         # ── Collect summary ───────────────────────────────────────────
         summary = pipeline.get_summary()

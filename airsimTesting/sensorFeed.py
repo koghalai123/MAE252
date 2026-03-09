@@ -411,7 +411,9 @@ class Viewer3D:
     def export_map(self, path: str, *,
                    bounds: np.ndarray | None = None,
                    resolution: float | None = None,
-                   source: str = "viewer") -> str:
+                   source: str = "viewer",
+                   exclude_positions: np.ndarray | None = None,
+                   exclude_radius: float = 0.5) -> str:
         """Save the currently displayed 3-D map to a ``.npz`` file.
 
         Parameters
@@ -426,6 +428,11 @@ class Viewer3D:
             Optional voxel resolution metadata.
         source : str
             Tag stored in the file for provenance.
+        exclude_positions : ndarray (K, 3) or None
+            Positions (e.g. drone poses) to exclude.  Any map point within
+            *exclude_radius* of one of these positions is dropped.
+        exclude_radius : float
+            Exclusion radius in metres (default 0.5 m).
 
         Returns
         -------
@@ -439,6 +446,16 @@ class Viewer3D:
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
         pts = self.get_displayed_points()
+        if exclude_positions is not None and len(exclude_positions) > 0 and len(pts) > 0:
+            from scipy.spatial import cKDTree
+            tree = cKDTree(np.asarray(exclude_positions, dtype=np.float64))
+            dists, _ = tree.query(pts.astype(np.float64))
+            keep = dists > exclude_radius
+            n_removed = int(np.sum(~keep))
+            pts = pts[keep]
+            if n_removed > 0:
+                print(f"  Viewer export: removed {n_removed:,} points near "
+                      f"{len(exclude_positions)} drone poses (r={exclude_radius:.2f}m)")
         kw = dict(
             points=pts,
             timestamp=np.array(_time.time()),

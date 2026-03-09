@@ -1436,7 +1436,7 @@ def load_ground_truth_map(
 # ══════════════════════════════════════════════════════════════════════════════
 
 # -- Configuration ---------------------------------------------------------
-RECORDINGS_DIR = os.path.join(os.path.dirname(__file__), "flight_recordings")
+RECORDINGS_DIR = os.path.join(os.path.dirname(__file__), "groundTruthMap")
 MAP_NPZ = ""  # leave empty to auto-detect latest ground_truth_*
 
 PLANNING_RESOLUTION = 0.5

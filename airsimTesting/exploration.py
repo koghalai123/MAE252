@@ -184,71 +184,260 @@ class BufferedSLAM:
         Returns the raw scan dict, or None if rate-limited / no data.
         Uses the thread-local AirSim client when running in background
         mode, otherwise falls back to ``self.live.client``.
+
+        When ``USE_SIM_PAUSE`` is enabled, the simulation is frozen
+        while LiDAR, GPS, and ground-truth kinematics are read
+        atomically — no interpolation required.
         """
         import cosysairsim as airsim
         import time as _time
-
-        now = _time.time()
-        if now - self.live._last_scan_time < self.live._min_interval:
-            return None
 
         client = self._thread_client if self._thread_client is not None else self.live.client
         if client is None:
             raise RuntimeError("Call live.connect() first")
 
-        # Get LiDAR data — pose will be interpolated from the high-rate
-        # state ring buffer in drain_ready().
-        lidar_data = client.getLidarData()
+        now = _time.time()
+        rate_ok = (now - self.live._last_scan_time) >= self.live._min_interval
 
-        if len(lidar_data.point_cloud) < 9:
-            return None
+        if USE_SIM_PAUSE:
+            # ── Pause-on-demand mode ──────────────────────────────────
+            # The sim runs FREELY between scans so the flight controller
+            # operates at full frame-rate (normal yaw response, normal
+            # velocity tracking).  Only when it's time to collect a scan
+            # do we briefly pause, get the LiDAR + GT at the same paused
+            # instant, then resume.
+            #
+            # Temporal offset fix:
+            # The LiDAR fires at a lower effective rate than every render
+            # frame (heavy ray budget → not every frame triggers a new
+            # scan).  At the paused instant the GT state.timestamp may be
+            # 1-4 frames (~30-130 ms) AHEAD of the LiDAR scan timestamp.
+            # During yaw rotations this can cause 3-12° of orientation
+            # error.  Fix: velocity back-project the GT pose to the exact
+            # LiDAR capture timestamp using GT linear/angular velocity.
+            # If frame-stepping was needed (stale LiDAR), the existing
+            # before/after SLERP interpolation handles this instead.
 
-        points = np.array(lidar_data.point_cloud, dtype=np.float32).reshape((-1, 3))
+            prev_lidar_ts = self._last_lidar_ts if hasattr(self, '_last_lidar_ts') else 0
 
-        # Position and orientation are left as None here — they will be
-        # filled by drain_ready() via interpolation from the high-rate
-        # sensor ring buffers.  If the buffers aren't ready yet,
-        # drain_ready() simply defers the scan (leaves it in the buffer)
-        # until the data arrives.
-        pos = None
-        ori = None
+            if not rate_ok:
+                # Not time for a scan — let the sim run freely
+                return None
 
-        # LiDAR mount offset
-        lpos = lidar_data.pose.position
-        lori = lidar_data.pose.orientation
-        lidar_position = np.array([lpos.x_val, lpos.y_val, lpos.z_val])
-        lidar_orientation = np.array([lori.w_val, lori.x_val, lori.y_val, lori.z_val])
+            # ── Pause, get fresh scan, resume ─────────────────────────
+            client.simPause(True)
+            _time.sleep(0.005)  # small delay for pause to take effect
 
-        # GPS, IMU, and state are all grabbed at high rate by
-        # _sample_sensors(); placeholders are stored here and filled by
-        # drain_ready() via ring-buffer interpolation.
+            # Read GT + state timestamp BEFORE any stepping
+            gt_before = client.simGetGroundTruthKinematics()
+            state_before = client.getMultirotorState()
+            ts_before = float(state_before.timestamp)
 
-        lidar_ts = float(lidar_data.time_stamp)
+            # Check if LiDAR is already fresh at this paused instant
+            lidar_data = client.getLidarData()
+            cur_ts = float(lidar_data.time_stamp)
 
-        scan = {
-            "points": points,
-            "position": pos,           # filled by drain_ready
-            "orientation": ori,        # filled by drain_ready
-            "lidar_position": lidar_position,
-            "lidar_orientation": lidar_orientation,
-            "gps": None,               # filled by drain_ready
-            "imu_angular_vel": None,    # filled by drain_ready
-            "imu_linear_acc": None,     # filled by drain_ready
-            "imu_orientation": None,    # filled by drain_ready
-            "lidar_ts": lidar_ts,
-            "collect_time": now,
-            "frame_label": self.live._frame_count,
-        }
+            if cur_ts != prev_lidar_ts and len(lidar_data.point_cloud) >= 9:
+                # LiDAR scan is newer than last collected — but may still
+                # be from an *earlier* sim frame than the current GT state.
+                # We'll back-project after extracting pos/ori.
+                gt = gt_before
+                gps_data = client.getGpsData()
+                imu_data = client.getImuData()
+                self._last_lidar_ts = cur_ts
+                client.simPause(False)
+                _did_step = False
+            else:
+                # LiDAR is stale — step frames until a fresh scan appears,
+                # then interpolate GT to the LiDAR timestamp.
+                MAX_STEPS = 60
+                found = False
+                for _step in range(MAX_STEPS):
+                    client.simContinueForFrames(1)
+                    _time.sleep(0.01)
+
+                    lidar_data = client.getLidarData()
+                    cur_ts = float(lidar_data.time_stamp)
+
+                    if cur_ts != prev_lidar_ts and len(lidar_data.point_cloud) >= 9:
+                        gt_after = client.simGetGroundTruthKinematics()
+                        state_after = client.getMultirotorState()
+                        ts_after = float(state_after.timestamp)
+                        gps_data = client.getGpsData()
+                        imu_data = client.getImuData()
+                        self._last_lidar_ts = cur_ts
+                        found = True
+                        break
+
+                client.simPause(False)
+                if not found:
+                    return None
+                _did_step = True
+
+                # Interpolate GT pose to the LiDAR capture timestamp
+                if ts_after != ts_before:
+                    alpha = np.clip(
+                        (cur_ts - ts_before) / (ts_after - ts_before), 0.0, 1.0)
+                else:
+                    alpha = 0.0  # no time passed — use before pose
+
+                # Position: linear interpolation
+                p0 = gt_before.position
+                p1 = gt_after.position
+                pos_before = np.array([p0.x_val, p0.y_val, p0.z_val])
+                pos_after  = np.array([p1.x_val, p1.y_val, p1.z_val])
+
+                # Orientation: SLERP
+                o0 = gt_before.orientation
+                o1 = gt_after.orientation
+                ori_before = np.array([o0.w_val, o0.x_val, o0.y_val, o0.z_val])
+                ori_after  = np.array([o1.w_val, o1.x_val, o1.y_val, o1.z_val])
+
+                # Build a synthetic gt object with interpolated values
+                # so the rest of the code can treat it uniformly.
+                class _GT:
+                    pass
+                gt = _GT()
+
+                class _Vec:
+                    pass
+                interp_pos = (1 - alpha) * pos_before + alpha * pos_after
+                gt.position = _Vec()
+                gt.position.x_val = interp_pos[0]
+                gt.position.y_val = interp_pos[1]
+                gt.position.z_val = interp_pos[2]
+
+                # SLERP for orientation
+                from scipy.spatial.transform import Slerp as _Slerp
+                rots = Rotation.from_quat([
+                    [ori_before[1], ori_before[2], ori_before[3], ori_before[0]],
+                    [ori_after[1],  ori_after[2],  ori_after[3],  ori_after[0]],
+                ])
+                slerp = _Slerp([0.0, 1.0], rots)
+                q_interp = slerp([alpha])[0].as_quat()  # x,y,z,w
+                gt.orientation = _Vec()
+                gt.orientation.w_val = q_interp[3]
+                gt.orientation.x_val = q_interp[0]
+                gt.orientation.y_val = q_interp[1]
+                gt.orientation.z_val = q_interp[2]
+
+            points = np.array(lidar_data.point_cloud, dtype=np.float32).reshape((-1, 3))
+
+            gtp = gt.position
+            gto = gt.orientation
+            pos = np.array([gtp.x_val, gtp.y_val, gtp.z_val])
+            ori = np.array([gto.w_val, gto.x_val, gto.y_val, gto.z_val])
+
+            # ── Velocity back-projection ──────────────────────────────
+            # When steps=0 the GT state.timestamp may be ahead of the
+            # LiDAR capture timestamp by one or more sim frames (the
+            # LiDAR fires at a lower effective rate than every frame).
+            # Back-project the GT pose to the exact LiDAR capture time
+            # using the GT linear & angular velocity.
+            # (For the stepped/interpolated path this is already handled
+            #  by the before/after SLERP, so skip.)
+            _bp_delta_s = (ts_before - cur_ts) / 1e9  # positive = GT ahead
+            if not _did_step and abs(_bp_delta_s) > 0.001:
+                _vel = gt_before.linear_velocity
+                _v = np.array([_vel.x_val, _vel.y_val, _vel.z_val])
+                pos = pos - _v * _bp_delta_s
+
+                _avel = gt_before.angular_velocity
+                _w = np.array([_avel.x_val, _avel.y_val, _avel.z_val])
+                _dtheta = _w * _bp_delta_s
+                _R_delta = Rotation.from_rotvec(-_dtheta)
+                _R_gt = Rotation.from_quat([ori[1], ori[2], ori[3], ori[0]])
+                _R_corr = _R_delta * _R_gt
+                _q = _R_corr.as_quat()   # scipy: x,y,z,w
+                ori = np.array([_q[3], _q[0], _q[1], _q[2]])  # AirSim: w,x,y,z
+
+                _pos_corr_cm = np.linalg.norm(_v * _bp_delta_s) * 100
+                _yaw_corr = np.degrees(np.linalg.norm(_dtheta))
+                print(f"  [backproj] Δt={_bp_delta_s*1000:.1f}ms  "
+                      f"Δpos={_pos_corr_cm:.1f}cm  Δyaw≈{_yaw_corr:.2f}°")
+            elif not _did_step:
+                print(f"  [backproj] Δt={_bp_delta_s*1000:.1f}ms — no correction needed")
+
+            # GPS
+            gp = gps_data.gnss.geo_point
+            gps = np.array([gp.latitude, gp.longitude, gp.altitude])
+
+            # IMU
+            imu_av = np.array([imu_data.angular_velocity.x_val,
+                               imu_data.angular_velocity.y_val,
+                               imu_data.angular_velocity.z_val])
+            imu_la = np.array([imu_data.linear_acceleration.x_val,
+                               imu_data.linear_acceleration.y_val,
+                               imu_data.linear_acceleration.z_val])
+            imu_or = np.array([imu_data.orientation.w_val,
+                               imu_data.orientation.x_val,
+                               imu_data.orientation.y_val,
+                               imu_data.orientation.z_val])
+
+            # LiDAR mount offset (body-frame)
+            lpos = lidar_data.pose.position
+            lori = lidar_data.pose.orientation
+            lidar_position = np.array([lpos.x_val, lpos.y_val, lpos.z_val])
+            lidar_orientation = np.array([lori.w_val, lori.x_val, lori.y_val, lori.z_val])
+
+            lidar_ts = float(lidar_data.time_stamp)
+
+            scan = {
+                "points": points,
+                "position": pos,
+                "orientation": ori,
+                "lidar_position": lidar_position,
+                "lidar_orientation": lidar_orientation,
+                "gps": gps,
+                "imu_angular_vel": imu_av,
+                "imu_linear_acc": imu_la,
+                "imu_orientation": imu_or,
+                "lidar_ts": lidar_ts,
+                "collect_time": now,
+                "frame_label": self.live._frame_count,
+            }
+        else:
+            # ── Legacy mode: pose filled later by drain_ready ─────────
+            if not rate_ok:
+                return None
+
+            lidar_data = client.getLidarData()
+
+            if len(lidar_data.point_cloud) < 9:
+                return None
+
+            points = np.array(lidar_data.point_cloud, dtype=np.float32).reshape((-1, 3))
+
+            pos = None
+            ori = None
+
+            # LiDAR mount offset
+            lpos = lidar_data.pose.position
+            lori = lidar_data.pose.orientation
+            lidar_position = np.array([lpos.x_val, lpos.y_val, lpos.z_val])
+            lidar_orientation = np.array([lori.w_val, lori.x_val, lori.y_val, lori.z_val])
+
+            lidar_ts = float(lidar_data.time_stamp)
+
+            scan = {
+                "points": points,
+                "position": pos,           # filled by drain_ready
+                "orientation": ori,        # filled by drain_ready
+                "lidar_position": lidar_position,
+                "lidar_orientation": lidar_orientation,
+                "gps": None,               # filled by drain_ready
+                "imu_angular_vel": None,    # filled by drain_ready
+                "imu_linear_acc": None,     # filled by drain_ready
+                "imu_orientation": None,    # filled by drain_ready
+                "lidar_ts": lidar_ts,
+                "collect_time": now,
+                "frame_label": self.live._frame_count,
+            }
 
         self._scan_buf.append(scan)
         self._n_collected += 1
         self.live._frame_count += 1
         self.live._last_scan_time = now
-
-        # Save raw frame to disk if recording is enabled
-        if self.live.save_dir is not None:
-            self.live._save_frame(points, pos, ori, lidar_position,
-                                  lidar_orientation, None)
 
         # Safety trim
         if len(self._scan_buf) > self.max_buffer:
@@ -272,7 +461,58 @@ class BufferedSLAM:
         while self._n_registered < ready_count and self._n_registered < len(self._scan_buf):
             scan = self._scan_buf[self._n_registered]
 
-            # ── Interpolate all sensors from the high-rate buffers ──
+            # ── simPause mode: pos/ori already filled — skip interpolation ──
+            if USE_SIM_PAUSE and scan["position"] is not None and scan["orientation"] is not None:
+                buf_depth = len(self._scan_buf) - self._n_registered
+                print(f"  [buf] registering scan {scan['frame_label']:03d}  "
+                      f"| simPause GT pose  | buf depth: {buf_depth}")
+
+                result = self.live.pipeline.process_frame(
+                    scan["points"],
+                    scan["position"],
+                    scan["orientation"],
+                    gps=scan["gps"],
+                    lidar_position=scan["lidar_position"],
+                    lidar_orientation=scan["lidar_orientation"],
+                    frame_label=scan["frame_label"],
+                )
+                results.append(result)
+                self._n_registered += 1
+
+                if self.live.save_dir is not None:
+                    self.live._save_frame(
+                        scan["points"], scan["position"], scan["orientation"],
+                        scan["lidar_position"], scan["lidar_orientation"],
+                        scan["gps"])
+
+                # Forward world-frame points to the planner for raycasting
+                if self._planner is not None:
+                    pts = scan["points"][np.any(scan["points"] != 0, axis=1)]
+                    if len(pts) > 0:
+                        lp = scan["lidar_position"]
+                        lo = scan["lidar_orientation"]
+                        R_l = Rotation.from_quat(
+                            [lo[1], lo[2], lo[3], lo[0]]).as_matrix()
+                        body = (R_l @ pts.T).T + lp
+                        ori = scan["orientation"]
+                        R_b = Rotation.from_quat(
+                            [ori[1], ori[2], ori[3], ori[0]]).as_matrix()
+                        world_pts = (R_b @ body.T).T + scan["position"]
+                        self._planner.feed_scan(
+                            scan["position"].copy(),
+                            world_pts.astype(np.float32),
+                        )
+                        if NBV_SHOW_FRONTIERS:
+                            frontier_pts = self._planner.get_frontier_points()
+                            self.live.pipeline.set_frontier_points(
+                                frontier_pts if len(frontier_pts) > 0 else None)
+
+                self.live.pipeline.set_drone_pos(scan["position"])
+                self.live.pipeline.refresh_overlays()
+                continue
+
+            # ── Legacy interpolation path ─────────────────────────────
+            # Interpolate all sensors from the high-rate buffers
             lidar_ts = scan["lidar_ts"]
             with self._sensor_lock:
                 gps_ts   = list(self._gps_buf_ts)
@@ -423,6 +663,13 @@ class BufferedSLAM:
             results.append(result)
             self._n_registered += 1
 
+            # Save frame to disk now that position/orientation are filled
+            if self.live.save_dir is not None:
+                self.live._save_frame(
+                    scan["points"], scan["position"], scan["orientation"],
+                    scan["lidar_position"], scan["lidar_orientation"],
+                    scan["gps"])
+
             # Forward world-frame points to the planner for raycasting
             if self._planner is not None:
                 pts = scan["points"][np.any(scan["points"] != 0, axis=1)]
@@ -512,9 +759,11 @@ class BufferedSLAM:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop_event.clear()
-        self._sensor_thread = threading.Thread(
-            target=self._sensor_loop, name="BufferedSLAM-Sensor", daemon=True)
-        self._sensor_thread.start()
+        if not USE_SIM_PAUSE:
+            # Legacy mode: high-rate sensor polling on separate thread
+            self._sensor_thread = threading.Thread(
+                target=self._sensor_loop, name="BufferedSLAM-Sensor", daemon=True)
+            self._sensor_thread.start()
         self._thread = threading.Thread(
             target=self._collection_loop, name="BufferedSLAM", daemon=True)
         self._thread.start()
@@ -542,14 +791,28 @@ class BufferedSLAM:
         self._thread_client.confirmConnection()
         print("  [BufferedSLAM] Collection thread AirSim client connected")
 
-        while not self._stop_event.is_set():
-            try:
-                self.collect_once()
-                self.drain_ready()
-            except Exception as e:
-                print(f"  [BufferedSLAM] Error: {e}")
-            # Sleep just under the scan interval so we never miss a window
-            time.sleep(self.live._min_interval * 0.5)
+        if USE_SIM_PAUSE:
+            # ── Pause-on-demand mode ─────────────────────────────────
+            # The sim runs freely between scans.  collect_once() briefly
+            # pauses, steps frames for fresh data, reads sensors, then
+            # resumes.  We poll at ~100 Hz to keep rate checks responsive.
+            import time as _time
+            while not self._stop_event.is_set():
+                try:
+                    self.collect_once()   # pauses sim only during collection
+                    self.drain_ready()
+                except Exception as e:
+                    print(f"  [BufferedSLAM] Error: {e}")
+                _time.sleep(0.01)  # ~100 Hz poll — prevents CPU spin
+        else:
+            while not self._stop_event.is_set():
+                try:
+                    self.collect_once()
+                    self.drain_ready()
+                except Exception as e:
+                    print(f"  [BufferedSLAM] Error: {e}")
+                # Sleep just under the scan interval so we never miss a window
+                time.sleep(self.live._min_interval * 0.5)
 
     def _sensor_loop(self) -> None:
         """Background thread: high-rate GPS, IMU, and state polling.
@@ -702,8 +965,6 @@ class ExplorationPlanner:
         nbv_lidar_max_range: float = 40.0,
         nbv_unknown_block_size: int = 4,
         nbv_n_unknown_blocks: int = 8,
-        nbv_volumetric_radius: float = 8.0,
-        nbv_volumetric_weight: float = 0.3,
         nbv_ray_max_targets: int = 500,
         nbv_use_ray_tracing: bool = True,
     ):
@@ -737,8 +998,6 @@ class ExplorationPlanner:
         self.nbv_lidar_max_range = nbv_lidar_max_range
         self.nbv_unknown_block_size = nbv_unknown_block_size
         self.nbv_n_unknown_blocks = nbv_n_unknown_blocks
-        self.nbv_volumetric_radius = nbv_volumetric_radius
-        self.nbv_volumetric_weight = nbv_volumetric_weight
         self.nbv_ray_max_targets = nbv_ray_max_targets
         self.nbv_use_ray_tracing = nbv_use_ray_tracing
 
@@ -1144,7 +1403,7 @@ class ExplorationPlanner:
         cand: np.ndarray,
         occupied_grid: np.ndarray,
         unknown: np.ndarray,
-    ) -> tuple[int, int]:
+    ) -> int:
         """Score a viewpoint — dispatches to ray-traced or columnar method."""
         if self.nbv_use_ray_tracing:
             return self._nbv_score_candidate_raytrace(cand, occupied_grid, unknown)
@@ -1156,7 +1415,7 @@ class ExplorationPlanner:
         cand: np.ndarray,
         occupied_grid: np.ndarray,
         unknown: np.ndarray,
-    ) -> tuple[int, int]:
+    ) -> int:
         """Score *one* viewpoint using fast columnar (vertical) occlusion.
 
         For each column (ix, iy) within the cone footprint, walks downward
@@ -1168,8 +1427,6 @@ class ExplorationPlanner:
         -------
         frustum_gain : int
             Visible unknown voxels inside the LiDAR cone.
-        volumetric_unknown : int
-            Total unknown voxels within ``nbv_volumetric_radius``.
         """
         cx, cy, cz = cand
         tan_ha = np.tan(np.radians(self.nbv_sensor_half_angle))
@@ -1213,45 +1470,7 @@ class ExplorationPlanner:
 
         frustum_gain = int((in_cone & in_range & not_occ & unk).sum())
 
-        # Volumetric unknown density — columnar occlusion applied within
-        # a sphere around the candidate so unknowns behind walls are not
-        # counted.  We reuse the columnar first-occupied map but extend
-        # to all Z levels (not just below the candidate).
-        vol_r = self.nbv_volumetric_radius
-        vol_r_vox = int(np.ceil(vol_r / res))
-        gxc = int(np.clip((cx - self.xmin) / res, 0, self.nx - 1))
-        gyc = int(np.clip((cy - self.ymin) / res, 0, self.ny - 1))
-        gzc = int(np.clip((cz - self.zmin) / res, 0, self.nz - 1))
-        x0 = max(gxc - vol_r_vox, 0); x1 = min(gxc + vol_r_vox + 1, self.nx)
-        y0 = max(gyc - vol_r_vox, 0); y1 = min(gyc + vol_r_vox + 1, self.ny)
-        z0 = max(gzc - vol_r_vox, 0); z1 = min(gzc + vol_r_vox + 1, self.nz)
-        vol_unk_box = unknown[x0:x1, y0:y1, z0:z1]
-        # Distance filter within the box to make it a sphere
-        vx_ = self.xmin + (np.arange(x0, x1) + 0.5) * res
-        vy_ = self.ymin + (np.arange(y0, y1) + 0.5) * res
-        vz_ = self.zmin + (np.arange(z0, z1) + 0.5) * res
-        vdx2 = (vx_ - cx) ** 2
-        vdy2 = (vy_ - cy) ** 2
-        vdz2 = (vz_ - cz) ** 2
-        vdist_sq = (vdx2[:, None, None] + vdy2[None, :, None]
-                    + vdz2[None, None, :])
-        in_sphere = vdist_sq <= vol_r * vol_r
-        # Columnar occlusion: for each column, find the first occupied
-        # voxel below the candidate inside the sub-box, and mask
-        # everything beneath it.
-        occ_box = occupied_grid[x0:x1, y0:y1, z0:z1]
-        col_first_occ = np.full((x1 - x0, y1 - y0), z1 - z0, dtype=np.intp)
-        # iz relative to box z0; real iz = z0 + local_iz
-        # Walk downward from candidate altitude
-        local_iz_start = max(0, ciz + 1 - z0)
-        for liz in range(local_iz_start, z1 - z0):
-            m = occ_box[:, :, liz] & (col_first_occ == (z1 - z0))
-            col_first_occ[m] = liz
-        local_iz_arr = np.arange(z1 - z0)
-        not_occ_vol = local_iz_arr[None, None, :] < col_first_occ[:, :, None]
-        volumetric_unknown = int((vol_unk_box & in_sphere & not_occ_vol).sum())
-
-        return frustum_gain, volumetric_unknown
+        return frustum_gain
 
     # ── Helper: 3-D Bresenham ray-march visibility check ─────────
     def _ray_march_visible(
@@ -1310,22 +1529,18 @@ class ExplorationPlanner:
     ) -> tuple[int, int]:
         """Score *one* viewpoint using 3-D ray-traced visibility.
 
-        For each unknown voxel within the LiDAR cone/range (frustum) or
-        within ``nbv_volumetric_radius`` (volumetric sphere), a 3-D
-        Bresenham-style ray is marched from the candidate to the voxel.
-        If any occupied voxel lies along that ray the unknown voxel is
-        considered occluded and is not counted.
+        For each unknown voxel within the LiDAR cone/range (frustum), a
+        3-D Bresenham-style ray is marched from the candidate to the
+        voxel.  If any occupied voxel lies along that ray the unknown
+        voxel is considered occluded and is not counted.
 
-        Both sets are independently downsampled to
-        ``nbv_ray_max_targets`` for speed and then scaled back up.
+        The frustum set is downsampled to ``nbv_ray_max_targets`` for
+        speed and then scaled back up.
 
         Returns
         -------
         frustum_gain : int
             Estimated *visible* unknown voxels inside the LiDAR cone.
-        volumetric_unknown : int
-            Estimated *visible* unknown voxels within
-            ``nbv_volumetric_radius`` of the candidate.
         """
         cx, cy, cz = cand
         res = self.resolution
@@ -1361,11 +1576,6 @@ class ExplorationPlanner:
         frustum_mask = in_range & cone_ok & below
         n_frustum_total = int(frustum_mask.sum())
 
-        # ── Volumetric mask: sphere ──────────────────────────────────
-        vol_r = self.nbv_volumetric_radius
-        vol_mask = dist_sq <= vol_r * vol_r
-        n_vol_total = int(vol_mask.sum())
-
         budget = self.nbv_ray_max_targets
 
         # ── Ray-trace frustum set ────────────────────────────────────
@@ -1384,23 +1594,7 @@ class ExplorationPlanner:
                                             occupied_grid)
             frustum_gain = int(round(n_vis * scale))
 
-        # ── Ray-trace volumetric set ─────────────────────────────────
-        if n_vol_total == 0:
-            volumetric_unknown = 0
-        else:
-            vol_ijs = unk_ijs[vol_mask]
-            if len(vol_ijs) > budget:
-                chosen = np.random.choice(len(vol_ijs), budget, replace=False)
-                sample = vol_ijs[chosen]
-                scale = n_vol_total / budget
-            else:
-                sample = vol_ijs
-                scale = 1.0
-            n_vis = self._ray_march_visible(sample, gx0, gy0, gz0,
-                                            occupied_grid)
-            volumetric_unknown = int(round(n_vis * scale))
-
-        return frustum_gain, volumetric_unknown
+        return frustum_gain
 
     def _nbv_select_target(
         self,
@@ -1480,33 +1674,20 @@ class ExplorationPlanner:
                         combined_gain=0.0, score=0.0, status="occupied"))
                     continue
 
-            frustum_gain, vol_unknown = self._nbv_score_candidate(
+            frustum_gain = self._nbv_score_candidate(
                 cand, occupied_grid, unknown)
-            # The frustum gain is the ray-traced count of unknown voxels
-            # actually *visible* from this candidate position.  If it is
-            # zero, the candidate cannot observe any new information
-            # (unknowns are fully occluded by walls / obstacles), so it
-            # must be skipped — the volumetric bonus must NOT rescue a
-            # candidate with zero visibility.
             if frustum_gain <= 0:
                 debug_records.append(dict(
                     pos=cand.copy(), dist=dist, frustum=frustum_gain,
-                    vol=vol_unknown, combined_gain=0.0, score=0.0,
-                    status="zero_frustum"))
+                    score=0.0, status="zero_frustum"))
                 continue
-            # Volumetric unknown density serves as a tiebreaker among
-            # candidates that all have non-zero frustum visibility,
-            # biasing toward large unexplored regions.
-            combined_gain = (frustum_gain
-                             + self.nbv_volumetric_weight * vol_unknown)
 
-            score = combined_gain / max(dist, 0.01) ** self.distance_exponent
+            score = frustum_gain / max(dist, 0.01) ** self.distance_exponent
             n_evaluated += 1
             evaluated_list.append(cand.copy())
 
             debug_records.append(dict(
                 pos=cand.copy(), dist=dist, frustum=frustum_gain,
-                vol=vol_unknown, combined_gain=combined_gain,
                 score=score, status="scored"))
 
             if score > best_score:
@@ -1527,7 +1708,7 @@ class ExplorationPlanner:
             best_rec = debug_records[best_idx]
             print(f"    [nbv] {len(candidates)} candidates, "
                   f"{n_evaluated} scored, best score={best_score:.1f} "
-                  f"(frustum={best_rec['frustum']}, vol={best_rec['vol']})")
+                  f"(frustum={best_rec['frustum']})")
         else:
             print(f"    [nbv] {len(candidates)} candidates, "
                   f"{n_evaluated} scored, no valid target")
@@ -1749,7 +1930,6 @@ class ExplorationPlanner:
 
             # Attach per-candidate debug records for _NBVDebugPlot
             info["nbv_debug"] = getattr(self, "_last_nbv_debug", [])
-            info["nbv_volumetric_weight"] = self.nbv_volumetric_weight
             info["nbv_distance_exponent"] = self.distance_exponent
 
             # Populate frontier overlay from the frontier mask so the
@@ -1913,8 +2093,8 @@ class _NBVDebugPlot:
        candidate.  Filtered-out candidates are shown as small faded
        markers.  The selected winner gets a bright lime star.
 
-    2. **Top-right — Gain components (stacked bar)**
-       Frustum vs weighted-volumetric gain for each scored candidate.
+    2. **Top-right — Gain components (horizontal bar)**
+       Frustum gain for each scored candidate.
 
     3. **Bottom-right — Frustum gain vs Distance (scatter)**
        Scored candidates at (distance, frustum_gain) coloured by score.
@@ -1940,10 +2120,13 @@ class _NBVDebugPlot:
 
         self._ok = True
         self._plt = plt
+        plt.rcParams['font.family'] = 'sans-serif'
+        plt.rcParams['font.sans-serif'] = ['Arial', 'DejaVu Sans', 'Liberation Sans', 'Helvetica']
+        plt.rcParams['font.size'] = 12
         plt.ion()
         # Layout: left half = spatial map (spans both rows),
         #         right column = gain bars (top) + scatter (bottom)
-        self.fig = plt.figure(figsize=(16, 9))
+        self.fig = plt.figure(figsize=(12, 8))
         gs = self.fig.add_gridspec(2, 2, width_ratios=[1.3, 1])
         self.ax_map   = self.fig.add_subplot(gs[:, 0])   # left, full height
         self.ax_stack = self.fig.add_subplot(gs[0, 1])    # top-right
@@ -1995,25 +2178,7 @@ class _NBVDebugPlot:
         # Sort scored by score descending
         scored.sort(key=lambda r: r["score"], reverse=True)
 
-        # ── Hypothetical winners: frustum-only and volume-only ────────
-        # Compute what the selection *would* have been if only one
-        # component were used, so you can see which term is pulling.
         dist_exp = info.get("nbv_distance_exponent", 1.0)
-        frustum_only_winner = None
-        vol_only_winner = None
-        if scored:
-            best_f_score = -np.inf
-            best_v_score = -np.inf
-            for r in scored:
-                d = max(r["dist"], 0.01)
-                f_score = r["frustum"] / d ** dist_exp
-                v_score = r["vol"] / d ** dist_exp
-                if f_score > best_f_score:
-                    best_f_score = f_score
-                    frustum_only_winner = r
-                if v_score > best_v_score:
-                    best_v_score = v_score
-                    vol_only_winner = r
 
         # ── [left] Top-down spatial map with SLAM background ──────────
         ax = self.ax_map
@@ -2034,7 +2199,7 @@ class _NBVDebugPlot:
         if frt is not None and len(frt) > 0:
             frt = np.asarray(frt)
             ax.scatter(frt[:, 1], frt[:, 0], c="#87ceeb", s=1.5,
-                       alpha=0.35, rasterized=True, zorder=2, label="frontier")
+                       alpha=0.35, rasterized=True, zorder=2)
 
         # Compute score range for marker sizing (scored candidates)
         if scored:
@@ -2053,17 +2218,23 @@ class _NBVDebugPlot:
             pts_f = np.array(pts_f)
             ax.scatter(pts_f[:, 1], pts_f[:, 0],
                        c=color, s=15, alpha=0.30, edgecolors="none",
-                       label=status, zorder=3)
+                       zorder=3)
 
         # Scored candidates: size ∝ score, lines from drone
         if scored:
+            _cand_labeled = False
             for r in scored:
                 sz = MIN_SIZE + (r["score"] - s_min) / s_range * (MAX_SIZE - MIN_SIZE)
                 color = self._STATUS_COLORS[r["status"]]
                 pos = r["pos"]
+                # Only label a non-selected candidate so the legend shows blue
+                lbl = ("candidates" if not _cand_labeled
+                       and r["status"] != "selected" else None)
                 ax.scatter([pos[1]], [pos[0]], c=color, s=sz,
                            edgecolors="k", linewidths=0.5, alpha=0.85,
-                           zorder=5)
+                           zorder=5, label=lbl)
+                if lbl:
+                    _cand_labeled = True
                 # Line from drone to candidate
                 if drone_pos is not None:
                     ax.plot([drone_pos[1], pos[1]], [drone_pos[0], pos[0]],
@@ -2081,25 +2252,7 @@ class _NBVDebugPlot:
                 ax.plot([drone_pos[1], s[1]], [drone_pos[0], s[0]],
                         color="lime", linewidth=1.5, alpha=0.7, zorder=6)
 
-        # Hypothetical winners: frustum-only (cyan diamond) & vol-only (orange diamond)
-        if frustum_only_winner is not None:
-            fp = frustum_only_winner["pos"]
-            ax.scatter([fp[1]], [fp[0]], marker="D", s=180, c="cyan",
-                       edgecolors="k", linewidths=1.0, zorder=9,
-                       label="frustum-only pick")
-            if drone_pos is not None:
-                ax.plot([drone_pos[1], fp[1]], [drone_pos[0], fp[0]],
-                        color="cyan", linewidth=1.0, linestyle="--",
-                        alpha=0.6, zorder=6)
-        if vol_only_winner is not None:
-            vp = vol_only_winner["pos"]
-            ax.scatter([vp[1]], [vp[0]], marker="D", s=180, c="#ff7f0e",
-                       edgecolors="k", linewidths=1.0, zorder=9,
-                       label="vol-only pick")
-            if drone_pos is not None:
-                ax.plot([drone_pos[1], vp[1]], [drone_pos[0], vp[0]],
-                        color="#ff7f0e", linewidth=1.0, linestyle="--",
-                        alpha=0.6, zorder=6)
+
 
         # Drone marker
         if drone_pos is not None:
@@ -2109,7 +2262,7 @@ class _NBVDebugPlot:
 
         ax.set_xlabel("Y (m)")
         ax.set_ylabel("X (m)")
-        ax.set_aspect("equal", adjustable="datalim")
+        ax.set_aspect("equal", adjustable="box")
         # Filter summary annotation
         from collections import Counter
         filt_counts = Counter(r["status"] for r in filtered)
@@ -2117,56 +2270,25 @@ class _NBVDebugPlot:
         ax.set_title(f"Candidates on Map  (iter {self._iter})\n"
                      f"filtered: {filt_str if filt_str else 'none'}",
                      fontsize=10)
-        ax.legend(fontsize=7, loc="upper left", ncol=2,
+        ax.legend(fontsize=12, loc="upper left",
                   markerscale=0.6, handletextpad=0.3)
 
-        # ── [top-right] Stacked gain components ──────────────────────
+        # ── [top-right] Frustum gain bar chart ────────────────────────
         ax = self.ax_stack
         ax.clear()
         if scored:
             labels = [f"({r['pos'][0]:.0f},{r['pos'][1]:.0f},{r['pos'][2]:.0f})"
                       for r in scored]
             frustums = np.array([r["frustum"] for r in scored], dtype=float)
-            vols     = np.array([r["vol"] for r in scored], dtype=float)
-            w = info.get("nbv_volumetric_weight", 0.0)
-            weighted_vols = vols * w if w else vols
             y_pos = np.arange(len(scored))
             ax.barh(y_pos, frustums, color="#1f77b4",
                     label="Frustum gain", edgecolor="k", linewidth=0.3)
-            ax.barh(y_pos, weighted_vols, left=frustums, color="#ff7f0e",
-                    label=f"Vol ×{w:.2f}" if w else "Vol (unweighted)",
-                    edgecolor="k", linewidth=0.3)
             ax.set_yticks(y_pos)
             ax.set_yticklabels(labels, fontsize=7)
             ax.invert_yaxis()
             ax.set_xlabel("Gain (voxels)")
-            ax.legend(fontsize=8, loc="lower right")
-
-            # Mark hypothetical winners on the bar chart
-            labels_list = [f"({r['pos'][0]:.0f},{r['pos'][1]:.0f},{r['pos'][2]:.0f})"
-                           for r in scored]
-            if frustum_only_winner is not None:
-                fow_label = (f"({frustum_only_winner['pos'][0]:.0f},"
-                             f"{frustum_only_winner['pos'][1]:.0f},"
-                             f"{frustum_only_winner['pos'][2]:.0f})")
-                if fow_label in labels_list:
-                    fi = labels_list.index(fow_label)
-                    ax.annotate("\u25C6 frustum-only", xy=(frustums[fi], fi),
-                                xytext=(frustums[fi] + frustums.max() * 0.05, fi),
-                                fontsize=7, color="cyan", fontweight="bold",
-                                va="center")
-            if vol_only_winner is not None:
-                vow_label = (f"({vol_only_winner['pos'][0]:.0f},"
-                             f"{vol_only_winner['pos'][1]:.0f},"
-                             f"{vol_only_winner['pos'][2]:.0f})")
-                if vow_label in labels_list:
-                    vi = labels_list.index(vow_label)
-                    bar_end = frustums[vi] + (weighted_vols[vi] if len(weighted_vols) > vi else 0)
-                    ax.annotate("\u25C6 vol-only", xy=(bar_end, vi),
-                                xytext=(bar_end + frustums.max() * 0.05, vi),
-                                fontsize=7, color="#ff7f0e", fontweight="bold",
-                                va="center")
-        ax.set_title("Gain Components", fontsize=10)
+            ax.legend(fontsize=12, loc="lower right")
+        ax.set_title("Frustum Gain", fontsize=10)
         ax.grid(True, alpha=0.3)
 
         # ── [bottom-right] Frustum gain vs distance scatter ──────────
@@ -2183,7 +2305,7 @@ class _NBVDebugPlot:
                 ax.scatter([s["dist"]], [s["frustum"]], marker="*",
                            s=250, c="lime", edgecolors="k", linewidths=1,
                            zorder=5, label="selected")
-                ax.legend(fontsize=8)
+                ax.legend(fontsize=12)
             try:
                 if self._cbar is not None:
                     self._cbar.remove()
@@ -2227,6 +2349,7 @@ VELOCITY        = 3             # m/s (live mode only)
 SCAN_HZ         = 1 / 1.5      # scans per second (live mode only)
 PLANNER_RES     = 1.0           # planning grid voxel size (m)
 MAX_TARGETS     = 10000            # safety cap on autonomous waypoints
+TIME_LIMIT_SEC  = 300                # exploration time limit in seconds (0 = no limit)
 SCAN_DELAY      = 3             # register a scan only after N newer scans (live mode)
 PLAN_EVERY      = 3             # run planner every N frames (replay mode)
 FRAME_SKIP      = 1             # process every Nth frame (replay mode, 1 = all)
@@ -2265,12 +2388,18 @@ NBV_LOCAL_RADIUS        = 10.0  # world-space radius for local samples (m)
 NBV_LIDAR_MAX_RANGE     = 40.0  # LiDAR max range (m); voxels beyond this are not scored
 NBV_UNKNOWN_BLOCK_SIZE  = 4     # coarse block size (voxels) for unknown-region heuristic
 NBV_N_UNKNOWN_BLOCKS    = 8     # top-K densest unknown blocks to generate candidates from
-NBV_VOLUMETRIC_RADIUS   = 8.0   # radius (m) for volumetric unknown density bonus
-NBV_VOLUMETRIC_WEIGHT   = 0.0   # weight of volumetric unknown term vs. frustum gain
 NBV_RAY_MAX_TARGETS     = 500   # max unknown voxels to ray-trace per candidate (downsample budget)
 NBV_USE_RAY_TRACING     = True  # True = 3D ray tracing, False = fast columnar occlusion
 NBV_SHOW_FRONTIERS      = False  # show frontier voxels as orange points in viewer
 NBV_SHOW_CANDIDATES     = False  # show evaluated candidate positions as magenta points in viewer
+
+# ── Sensor synchronisation mode ──────────────────────────────────────────
+# USE_SIM_PAUSE = True  → freeze the sim for each scan and read LiDAR +
+#   ground-truth kinematics atomically.  Pose is exact, no interpolation.
+#   Sensor-polling thread is NOT started.
+# USE_SIM_PAUSE = False → (legacy) two-thread approach: high-rate sensor
+#   ring buffers + delayed registration with interpolation / SLERP.
+USE_SIM_PAUSE           = False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2416,8 +2545,6 @@ class ReplayRunner:
                 nbv_local_radius=NBV_LOCAL_RADIUS,
                 nbv_unknown_block_size=NBV_UNKNOWN_BLOCK_SIZE,
                 nbv_n_unknown_blocks=NBV_N_UNKNOWN_BLOCKS,
-                nbv_volumetric_radius=NBV_VOLUMETRIC_RADIUS,
-                nbv_volumetric_weight=NBV_VOLUMETRIC_WEIGHT,
                 nbv_ray_max_targets=NBV_RAY_MAX_TARGETS,
                 nbv_use_ray_tracing=NBV_USE_RAY_TRACING,
             )
@@ -2503,6 +2630,19 @@ class ReplayRunner:
                                    f"slam_map_{int(time.time())}")
         os.makedirs(out_dir, exist_ok=True)
 
+        # Collect drone pose positions to exclude from the saved map.
+        # LiDAR self-returns near the sensor origin create spurious voxels
+        # at each drone pose — strip them before saving.
+        pose_positions = None
+        try:
+            poses = self.pipeline.get_optimised_poses()
+            if poses:
+                pose_positions = np.array([T[:3, 3] for T in poses],
+                                         dtype=np.float64)
+        except Exception:
+            pass
+        exclude_r = max(self.octo_resolution * 2, 1.0)
+
         # Use the viewer export if the viewer is running (preserves exactly
         # what was displayed).  Otherwise fall back to the pipeline's voxel
         # centres directly.
@@ -2513,9 +2653,22 @@ class ReplayRunner:
                 bounds=np.array(self.bounds, dtype=np.float64),
                 resolution=self.planner_res,
                 source=source,
+                exclude_positions=pose_positions,
+                exclude_radius=exclude_r,
             )
 
         pts = self.pipeline.get_map_points()
+        # Filter out points near drone poses
+        if pose_positions is not None and len(pose_positions) > 0 and len(pts) > 0:
+            from scipy.spatial import cKDTree
+            tree = cKDTree(pose_positions)
+            dists, _ = tree.query(pts.astype(np.float64))
+            keep = dists > exclude_r
+            n_removed = int(np.sum(~keep))
+            pts = pts[keep]
+            if n_removed > 0:
+                print(f"  Filtered {n_removed:,} points near "
+                      f"{len(pose_positions)} drone poses (r={exclude_r:.2f}m)")
         kw = dict(
             points=pts,
             timestamp=np.array(time.time()),
@@ -2584,7 +2737,7 @@ def run_live():
     import cosysairsim as airsim
 
     cfg = SLAMConfig(
-        registration="state_only",#Valid keywords: state_only, icp, p2plane, gicp, ndt, fpfh, fpfh_ransac,
+        registration="vgicp",#Valid keywords: state_only, icp, p2plane, gicp, ndt, fpfh, fpfh_ransac,
                     #small_gicp, vgicp, kiss_icp
         octo_resolution=0.15,
         frame_skip=0,
@@ -2641,8 +2794,6 @@ def run_live():
         nbv_lidar_max_range=NBV_LIDAR_MAX_RANGE,
         nbv_unknown_block_size=NBV_UNKNOWN_BLOCK_SIZE,
         nbv_n_unknown_blocks=NBV_N_UNKNOWN_BLOCKS,
-        nbv_volumetric_radius=NBV_VOLUMETRIC_RADIUS,
-        nbv_volumetric_weight=NBV_VOLUMETRIC_WEIGHT,
         nbv_ray_max_targets=NBV_RAY_MAX_TARGETS,
         nbv_use_ray_tracing=NBV_USE_RAY_TRACING,
     )
@@ -2674,21 +2825,24 @@ def run_live():
     # Wait for the sensor thread to populate its ring buffers so that
     # drain_ready() can actually interpolate poses.  The drone hovers
     # at cruise altitude until data is flowing.
-    SENSOR_READY_TIMEOUT = 15.0   # seconds
-    print("  Waiting for sensor buffers to fill...")
-    t0 = time.time()
-    while (time.time() - t0) < SENSOR_READY_TIMEOUT:
+    if USE_SIM_PAUSE:
+        print("  simPause mode — no sensor-buffer wait needed (GT pose is atomic)")
+    else:
+        SENSOR_READY_TIMEOUT = 15.0   # seconds
+        print("  Waiting for sensor buffers to fill...")
+        t0 = time.time()
+        while (time.time() - t0) < SENSOR_READY_TIMEOUT:
+            with buf._sensor_lock:
+                gps_ok   = len(buf._gps_buf_ts) >= 2
+                state_ok = len(buf._state_buf_ts) >= 2
+                imu_ok   = len(buf._imu_buf_ts) >= 2
+            if gps_ok and state_ok and imu_ok:
+                break
+            time.sleep(0.05)
         with buf._sensor_lock:
-            gps_ok   = len(buf._gps_buf_ts) >= 2
-            state_ok = len(buf._state_buf_ts) >= 2
-            imu_ok   = len(buf._imu_buf_ts) >= 2
-        if gps_ok and state_ok and imu_ok:
-            break
-        time.sleep(0.05)
-    with buf._sensor_lock:
-        print(f"  Sensor buffers: GPS={len(buf._gps_buf_ts)}, "
-              f"state={len(buf._state_buf_ts)}, IMU={len(buf._imu_buf_ts)}  "
-              f"({time.time() - t0:.1f}s)")
+            print(f"  Sensor buffers: GPS={len(buf._gps_buf_ts)}, "
+                  f"state={len(buf._state_buf_ts)}, IMU={len(buf._imu_buf_ts)}  "
+                  f"({time.time() - t0:.1f}s)")
 
     # Hover at cruise altitude and collect several scans so the planner
     # has a proper observed region centred at the operating height.
@@ -2737,13 +2891,23 @@ def run_live():
     print(f"  Grid:  {exploration.nx} x {exploration.ny} x {exploration.nz} voxels @ {PLANNER_RES} m")
     strategy = "random" if USE_RANDOM else ("NBV" if USE_NBV else "WFD")
     print(f"  Target strategy: {strategy}")
+    sensor_mode = "pause-on-demand (GT pose, free-running sim)" if USE_SIM_PAUSE else "interpolation (legacy)"
+    print(f"  Sensor sync: {sensor_mode}")
     print(f"  Path planner: {PATH_PLANNER_TYPE}  |  Inflation: {INFLATION_RADIUS} m")
     print(f"  Flight mode: {mode_label}  |  Max waypoints: {MAX_TARGETS}")
+    if TIME_LIMIT_SEC > 0:
+        print(f"  Time limit: {TIME_LIMIT_SEC}s")
     print(f"{'='*60}\n")
 
     wp_count = 0
+    _explore_t0 = time.time()
 
     while wp_count < MAX_TARGETS:
+        # Check time limit
+        if TIME_LIMIT_SEC > 0 and (time.time() - _explore_t0) >= TIME_LIMIT_SEC:
+            elapsed = time.time() - _explore_t0
+            print(f"\n  Time limit reached ({elapsed:.0f}s / {TIME_LIMIT_SEC}s)")
+            break
         # The PathFollower background thread automatically holds altitude
         # between paths — no explicit hover command needed here.
 

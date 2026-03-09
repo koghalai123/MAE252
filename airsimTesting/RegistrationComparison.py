@@ -101,14 +101,19 @@ def resolve_recording_dir(path: str) -> str:
     if path and os.path.isdir(path):
         if os.path.isfile(os.path.join(path, "frame_00000.npz")):
             return path
-        flights = sorted(glob.glob(os.path.join(path, "flight_*")))
-        if flights:
-            return flights[-1]
+        # Look for flight_* or exploration_* subdirectories
+        subdirs = sorted(
+            glob.glob(os.path.join(path, "flight_*"))
+            + glob.glob(os.path.join(path, "exploration_*")))
+        if subdirs:
+            return subdirs[-1]
         return path
     base = os.path.join(os.path.dirname(__file__), "flight_recordings")
-    dirs = sorted(glob.glob(os.path.join(base, "flight_*")))
+    dirs = sorted(
+        glob.glob(os.path.join(base, "flight_*"))
+        + glob.glob(os.path.join(base, "exploration_*")))
     if not dirs:
-        raise FileNotFoundError(f"No flight_* dirs under {base}")
+        raise FileNotFoundError(f"No flight_* or exploration_* dirs under {base}")
     return dirs[-1]
 
 
@@ -250,15 +255,18 @@ def load_frames(recording_dir):
         paths = paths[:MAX_FRAMES]
     out = []
     for p in paths:
-        d = np.load(p)
+        d = np.load(p, allow_pickle=True)
         pts = filter_valid(d["points"])
         if len(pts) == 0:
             continue
-        lp = d["lidar_position"]    if "lidar_position"    in d.files else np.zeros(3)
-        lo = d["lidar_orientation"] if "lidar_orientation" in d.files else np.array([1,0,0,0], dtype=float)
+        lp = d["lidar_position"]    if "lidar_position"    in d.files and np.asarray(d["lidar_position"]).ndim > 0    else np.zeros(3)
+        lo = d["lidar_orientation"] if "lidar_orientation" in d.files and np.asarray(d["lidar_orientation"]).ndim > 0 else np.array([1,0,0,0], dtype=float)
         body = xform_pts(pts, lp, lo)
-        pos = d["position"]    if "position"    in d.files else np.zeros(3)
-        ori = d["orientation"] if "orientation" in d.files else np.array([1,0,0,0], dtype=float)
+        pos = d["position"]    if "position"    in d.files and np.asarray(d["position"]).ndim > 0    else np.zeros(3)
+        ori = d["orientation"] if "orientation" in d.files and np.asarray(d["orientation"]).ndim > 0 else np.array([1,0,0,0], dtype=float)
+        # Skip frames where position/orientation are missing (saved as None)
+        if pos is None or ori is None or np.asarray(pos).ndim == 0 or np.asarray(ori).ndim == 0:
+            continue
         world = xform_pts(body, pos, ori)
         out.append(dict(world_pts=world.astype(np.float32),
                         position=pos.copy(), orientation=ori.copy(),
