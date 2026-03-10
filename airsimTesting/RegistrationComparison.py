@@ -290,8 +290,8 @@ def register_state_only(src, tgt, init_T=np.eye(4)):
 #   let ICP progressively lock on.
 # ══════════════════════════════════════════════════════════════════════════════
 
-ICP_MULTI_CORR = [0.5, 0.25, 0.1]   # coarse → fine correspondence distances
-ICP_MULTI_ITER = [35, 15,  7 ]   # iterations per pass
+ICP_MULTI_CORR = [0.5, 0.25, 0.15]   # coarse → fine correspondence distances
+ICP_MULTI_ITER = [25, 12,  5 ]   # iterations per pass
 
 
 def register_icp_p2plane(src, tgt, init_T=np.eye(4)):

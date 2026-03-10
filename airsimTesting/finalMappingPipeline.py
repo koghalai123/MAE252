@@ -34,7 +34,7 @@ Usage (embed in your own loop):
 
 from __future__ import annotations
 
-import os, sys, glob, time
+import os, sys, glob, time, csv
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -79,7 +79,8 @@ class SLAMConfig:
     reject_rot_ci: float   = 0.80    # rotation CI threshold
 
     # Registration target cropping
-    reg_local_radius: float = 40.0    # crop target cloud to this radius (m, 0 = no crop)
+    reg_local_radius: float = 0.0   # crop target cloud to this radius (m, 0 = no crop)
+    reg_max_target_pts: int = 120_000  # random-subsample target if larger (0 = no cap)
 
     # GTSAM noise
     gps_sigma: float       = 0.2     # GPS position noise (m)
@@ -93,6 +94,9 @@ class SLAMConfig:
     recording_dir: str = ""
     max_frames: int    = 0            # 0 = all
     frame_skip: int    = 3
+
+    # Registration quality evaluation
+    evaluate_reg: bool = False        # run expensive post-hoc evaluate_registration() each frame
 
     # Live-specific
     live_max_hz: float = 4.0         # max sensor polling rate
@@ -113,16 +117,45 @@ class VoxelHashGrid:
         self.half_res   = resolution * 0.5
         self.keys: set  = set()
 
+    @staticmethod
+    def _pack_ijk(ijk: np.ndarray) -> np.ndarray:
+        """Pack (N,3) int64 voxel indices into N int64 keys via bitshifts.
+
+        Each axis uses 21 bits (mask 0x1FFFFF), supporting ±1 048 576 indices
+        (≈ ±157 km at 0.15 m resolution).  Handles negative indices correctly.
+        """
+        return (((ijk[:, 0].astype(np.int64) & np.int64(0x1FFFFF)) << np.int64(42)) |
+                ((ijk[:, 1].astype(np.int64) & np.int64(0x1FFFFF)) << np.int64(21)) |
+                 (ijk[:, 2].astype(np.int64) & np.int64(0x1FFFFF)))
+
+    @staticmethod
+    def _unpack_keys(packed: np.ndarray) -> np.ndarray:
+        """Unpack int64 keys back to (N,3) int64 voxel indices."""
+        _M = np.int64(0x1FFFFF)
+        _S = np.int64(0x100000)    # sign bit for 21 bits
+        _R = np.int64(0x200000)    # 2^21
+        i_raw = (packed >> np.int64(42)) & _M
+        j_raw = (packed >> np.int64(21)) & _M
+        k_raw =  packed                  & _M
+        # sign-extend from 21 bits
+        i = np.where(i_raw >= _S, i_raw - _R, i_raw)
+        j = np.where(j_raw >= _S, j_raw - _R, j_raw)
+        k = np.where(k_raw >= _S, k_raw - _R, k_raw)
+        return np.column_stack([i, j, k])
+
     def insert_points(self, pts: np.ndarray):
         if len(pts) == 0:
             return
         ijk = np.floor(np.asarray(pts) * self.inv_res).astype(np.int64)
-        self.keys.update(map(tuple, ijk))
+        packed = self._pack_ijk(ijk)
+        new_keys = set(packed.tolist()) - self.keys
+        self.keys.update(new_keys)
 
     def get_centers(self) -> np.ndarray:
         if not self.keys:
             return np.empty((0, 3), dtype=np.float64)
-        arr = np.array(list(self.keys), dtype=np.float64)
+        packed = np.array(list(self.keys), dtype=np.int64)
+        arr = self._unpack_keys(packed).astype(np.float64)
         return arr * self.resolution + self.half_res
 
     def size(self) -> int:
@@ -147,13 +180,14 @@ class Submap:
                  resolution: float):
         self.anchor_index = anchor_index
         self.anchor_T     = anchor_T.copy()
+        self._T_inv_cached = np.linalg.inv(anchor_T)  # cached inverse
         self.resolution   = resolution
         self.frame_indices: list[int] = []
         self.grid = VoxelHashGrid(resolution)
 
     @property
     def _T_inv(self):
-        return np.linalg.inv(self.anchor_T)
+        return self._T_inv_cached
 
     def _to_local(self, world_pts: np.ndarray) -> np.ndarray:
         return apply_T(world_pts, self._T_inv)
@@ -356,6 +390,26 @@ class SLAMPipeline:
                         "octo_insert", "vox_track", "vis", "total"]
         self.timings = {k: [] for k in self._tkeys}
 
+        # ── Per-frame CSV timing log ──────────────────────────────────
+        self._TIMING_CSV_COLS = [
+            "frame", "raw_pts", "world_pts", "voxel_count",
+            "tgt_pts_full", "tgt_pts_cropped",
+            "t_transform_ms", "t_get_vis_ms", "t_local_crop_ms",
+            "t_register_fn_ms", "t_evaluate_reg_ms", "t_register_total_ms",
+            "t_gtsam_ms", "t_octo_insert_ms", "t_vox_track_ms",
+            "t_vis_ms", "t_total_ms",
+            # Sub-timings forwarded from the registration function
+            "reg_local_crop_ms", "reg_src_downsample_ms",
+            "reg_tgt_downsample_ms", "reg_src_normals_ms",
+            "reg_tgt_normals_ms",
+            "reg_pass0_ms", "reg_pass1_ms", "reg_pass2_ms",
+            "reg_total_ms",
+            "reg_src_pts", "reg_tgt_pts",
+        ]
+        self._timing_csv_path: str | None = None
+        self._timing_csv_file = None
+        self._timing_csv_writer = None
+
         # Callbacks (optional hooks for logging / plotting / custom actions)
         self._on_frame_callbacks: list[Callable] = []
 
@@ -453,6 +507,42 @@ class SLAMPipeline:
 
     # ── Callback registration ─────────────────────────────────────────────
 
+    def enable_timing_csv(self, path: str | None = None):
+        """Start writing per-frame timing data to a CSV file.
+
+        Parameters
+        ----------
+        path : str or None
+            CSV file path.  *None* → ``timing_<registration>_<timestamp>.csv``
+            in the script directory.
+        """
+        if path is None:
+            path = os.path.join(
+                os.path.dirname(__file__),
+                f"timing_{self.cfg.registration}_{int(time.time())}.csv")
+        self._timing_csv_path = path
+        self._timing_csv_file = open(path, "w", newline="")
+        self._timing_csv_writer = csv.DictWriter(
+            self._timing_csv_file, fieldnames=self._TIMING_CSV_COLS,
+            extrasaction="ignore")
+        self._timing_csv_writer.writeheader()
+        self._timing_csv_file.flush()
+        print(f"  Timing CSV → {path}")
+
+    def _write_timing_row(self, row: dict):
+        if self._timing_csv_writer is not None:
+            self._timing_csv_writer.writerow(row)
+            self._timing_csv_file.flush()
+
+    def close_timing_csv(self):
+        """Flush and close the timing CSV (idempotent)."""
+        if self._timing_csv_file is not None:
+            self._timing_csv_file.close()
+            self._timing_csv_file = None
+            self._timing_csv_writer = None
+            if self._timing_csv_path:
+                print(f"  Timing CSV closed: {self._timing_csv_path}")
+
     def on_frame(self, callback: Callable):
         """Register a callback invoked after each accepted frame.
 
@@ -535,31 +625,59 @@ class SLAMPipeline:
 
         # ── Registration against voxel map ────────────────────────────────
         t0 = time.perf_counter()
+        _csv = {}   # per-frame timing row
+        _csv["frame"] = idx
+        _csv["raw_pts"] = len(pts)
+        _csv["world_pts"] = len(world_init)
+        _csv["voxel_count"] = self._vis_len
+        _t_get_vis = _t_local_crop = _t_register_fn = _t_evaluate_reg = 0.0
+        _tgt_full = _tgt_cropped = 0
+        reg_detail = {}
+
         if (self._vis_len >= MIN_VOXELS
                 and self._pose_count > 0
                 and self.cfg.registration != "state_only"):
+            _ts = time.perf_counter()
             target_pts = self._get_vis()
+            _t_get_vis = time.perf_counter() - _ts
+            _tgt_full = len(target_pts)
+
+            _ts = time.perf_counter()
             if self.cfg.reg_local_radius > 0:
                 dists = np.linalg.norm(target_pts - pos.reshape(1, 3), axis=1)
                 target_pts = target_pts[dists <= self.cfg.reg_local_radius]
+            cap = self.cfg.reg_max_target_pts
+            if cap > 0 and len(target_pts) > cap:
+                idx_sub = np.random.default_rng(42).choice(
+                    len(target_pts), cap, replace=False)
+                target_pts = target_pts[idx_sub]
+            _t_local_crop = time.perf_counter() - _ts
+            _tgt_cropped = len(target_pts)
 
+            _ts = time.perf_counter()
             T_reg, fitness, rmse, reg_detail = self._register_fn(
                 world_init.astype(np.float64),
                 target_pts.astype(np.float64))
+            _t_register_fn = time.perf_counter() - _ts
             world_pts = apply_T(world_init, T_reg).astype(np.float32)
 
-            # Re-evaluate with all-points RMSE — Open3D's inlier_rmse only
-            # measures points within max_correspondence_distance, which
-            # stays deceptively low even on badly misaligned registrations.
-            _, inlier_rmse, full_rmse, mean_dist = evaluate_registration(
-                world_init.astype(np.float64),
-                target_pts.astype(np.float64),
-                T_reg,
-                max_correspondence_distance=ICP_VOXEL,
-                downsample_voxel=ICP_VOXEL,
-            )
-            rmse = full_rmse  # use all-points RMSE for quality gating
-            inlier_rmse_val = inlier_rmse  # keep for plotting
+            # Re-evaluate with all-points RMSE (expensive — off by default
+            # for live mode, enabled for replay via cfg.evaluate_reg).
+            inlier_rmse_val = 0.0
+            full_rmse = rmse
+            mean_dist = 0.0
+            if self.cfg.evaluate_reg:
+                _ts = time.perf_counter()
+                _, inlier_rmse, full_rmse, mean_dist = evaluate_registration(
+                    world_init.astype(np.float64),
+                    target_pts.astype(np.float64),
+                    T_reg,
+                    max_correspondence_distance=ICP_VOXEL,
+                    downsample_voxel=ICP_VOXEL,
+                )
+                _t_evaluate_reg = time.perf_counter() - _ts
+                rmse = full_rmse
+                inlier_rmse_val = inlier_rmse
 
             ct = T_reg[:3, 3]
             ce = Rotation.from_matrix(T_reg[:3, :3]).as_euler("xyz", degrees=True)
@@ -568,7 +686,7 @@ class SLAMPipeline:
             src_n = reg_detail.get('src_pts', 0) if isinstance(reg_detail, dict) else 0
             tgt_n = reg_detail.get('tgt_pts', 0) if isinstance(reg_detail, dict) else 0
             print(f"  REG {idx:03d}: fit={fitness:.4f} rmse={full_rmse:.4f} "
-                  f"(inlier={inlier_rmse:.4f} mean={mean_dist:.4f}) "
+                  f"(inlier={inlier_rmse_val:.4f} mean={mean_dist:.4f}) "
                   f"\u0394t={dt_mag:.4f}m "
                   f"\u0394r=({ce[0]:+.2f},{ce[1]:+.2f},{ce[2]:+.2f})\u00b0"
                   f"  src={src_n:,} tgt={tgt_n:,}")
@@ -581,6 +699,25 @@ class SLAMPipeline:
                   f"{'baseline' if self.cfg.registration == 'state_only' else f'too few voxels ({self._vis_len})'}"
                   f", state pose only")
         self.timings["register"].append(time.perf_counter() - t0)
+
+        # Populate CSV sub-timing columns
+        _csv["tgt_pts_full"] = _tgt_full
+        _csv["tgt_pts_cropped"] = _tgt_cropped
+        _csv["t_get_vis_ms"]      = _t_get_vis * 1e3
+        _csv["t_local_crop_ms"]   = _t_local_crop * 1e3
+        _csv["t_register_fn_ms"]  = _t_register_fn * 1e3
+        _csv["t_evaluate_reg_ms"] = _t_evaluate_reg * 1e3
+        _csv["t_register_total_ms"] = self.timings["register"][-1] * 1e3
+        # Forward sub-timings from RegistrationComparison (if available)
+        if isinstance(reg_detail, dict):
+            for rk in ("local_crop", "src_downsample", "tgt_downsample",
+                       "src_normals", "tgt_normals"):
+                _csv[f"reg_{rk}_ms"] = reg_detail.get(rk, 0.0) * 1e3
+            for pi in range(3):
+                _csv[f"reg_pass{pi}_ms"] = reg_detail.get(f"gicp_pass{pi}", 0.0) * 1e3
+            _csv["reg_total_ms"]  = reg_detail.get("total", 0.0) * 1e3
+            _csv["reg_src_pts"]   = reg_detail.get("src_pts", 0)
+            _csv["reg_tgt_pts"]   = reg_detail.get("tgt_pts", 0)
 
         # Record quality metrics
         self.q_frames.append(idx)
@@ -685,6 +822,15 @@ class SLAMPipeline:
         self.timings["vis"].append(time.perf_counter() - t0)
 
         self.timings["total"].append(time.perf_counter() - t_frame)
+
+        # ── Write CSV timing row ──────────────────────────────────────────
+        _csv["t_transform_ms"]    = self.timings["transform"][-1] * 1e3
+        _csv["t_gtsam_ms"]        = self.timings["gtsam"][-1] * 1e3
+        _csv["t_octo_insert_ms"]  = self.timings["octo_insert"][-1] * 1e3
+        _csv["t_vox_track_ms"]    = self.timings["vox_track"][-1] * 1e3
+        _csv["t_vis_ms"]          = self.timings["vis"][-1] * 1e3
+        _csv["t_total_ms"]        = self.timings["total"][-1] * 1e3
+        self._write_timing_row(_csv)
 
         # ── Console log ───────────────────────────────────────────────────
         total_mem = sum(sm.memory_usage() for sm in self._submaps)
@@ -816,6 +962,7 @@ class SLAMPipeline:
             print(f"  {k:<20} {s_sum:>7.3f} {va.mean():>7.4f} {va.max():>7.4f} "
                   f"{va.min():>7.4f} {va.std():>7.4f} {pct:>4.1f}%  {len(v):>5d}")
         print(f"  {'='*76}")
+        self.close_timing_csv()
 
     # ── Reset ─────────────────────────────────────────────────────────────
 
@@ -854,22 +1001,33 @@ class SLAMPipeline:
     # ══════════════════════════════════════════════════════════════════════
 
     def _downsample_for_insert(self, pts: np.ndarray) -> np.ndarray:
-        if self.cfg.octo_insert_voxel <= 0:
+        """Downsample before submap insertion.
+
+        When the insert voxel size equals the grid resolution (the common
+        case), skip the expensive Open3D path entirely — the VoxelHashGrid
+        already deduplicates at that resolution.
+        """
+        v = self.cfg.octo_insert_voxel
+        if v <= 0 or v <= self.cfg.octo_resolution:
             return pts
+        # Only use Open3D when a *coarser* pre-downsample is requested.
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
-        pcd = pcd.voxel_down_sample(self.cfg.octo_insert_voxel)
+        pcd = pcd.voxel_down_sample(v)
         return np.asarray(pcd.points)
 
     def _voxelise_and_append(self, pts: np.ndarray):
-        ijk = np.floor(pts * self._inv_res).astype(np.int32)
-        unique = set(map(tuple, ijk))
-        new = unique - self._seen_keys
+        ijk = np.floor(pts * self._inv_res).astype(np.int64)
+        # Pack (i,j,k) into int64 keys — same bitshift encoding as VoxelHashGrid
+        packed = VoxelHashGrid._pack_ijk(ijk)
+        unique_packed = set(packed.tolist())
+        new = unique_packed - self._seen_keys
         if not new:
             return 0
         self._seen_keys.update(new)
-        arr = np.array(list(new), dtype=np.float32)
-        centres = arr * self.cfg.octo_resolution + self._half_res
+        new_arr = np.array(list(new), dtype=np.int64)
+        ijk_new = VoxelHashGrid._unpack_keys(new_arr)
+        centres = ijk_new.astype(np.float32) * self.cfg.octo_resolution + self._half_res
         n = len(centres)
         if self._vis_len + n > len(self._vis_buf):
             ns = max(len(self._vis_buf) * 2, self._vis_len + n)
@@ -885,7 +1043,7 @@ class SLAMPipeline:
 
     def _recomposite_from_submaps(self):
         values = self._isam.calculateEstimate()
-        self._seen_keys = set()
+        self._seen_keys = set()     # now stores packed int64 keys
         self._vis_buf = np.zeros((self.cfg.vis_buffer_size, 3), dtype=np.float32)
         self._vis_len = 0
         for sm in self._submaps:

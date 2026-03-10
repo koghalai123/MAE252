@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Benchmark every registration method on one flight recording.
+"""Benchmark every registration method on the N most recent flight recordings.
 
 Imports ``ReplayRunner`` from ``exploration.py`` and runs it once per
-registration method, saving each resulting map for later comparison
-with ``mapAnalysis.py``.
+(recording × registration method × noise level), saving each resulting
+map for later comparison with ``mapAnalysis.py``.
 
 Usage
 -----
-    python registrationBenchmark.py                          # latest recording
-    python registrationBenchmark.py  flight_recordings/exploration_1772938325
+    python registrationBenchmark.py              # N_RECORDINGS most recent
+    python registrationBenchmark.py 5            # last 5 recordings
+    python registrationBenchmark.py path/to/dir  # single explicit directory
 
 Configuration
 -------------
@@ -18,7 +19,9 @@ exploration bounds, registration methods to run, etc.
 
 from __future__ import annotations
 
+import glob
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -35,8 +38,12 @@ from RegistrationComparison import REGISTRATION_METHODS, resolve_recording_dir
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Recording directory (empty string → auto-detect latest exploration_* or flight_*).
+# Recording base directory (contains exploration_* / flight_* sub-folders).
 RECORDING_DIR = "flight_recordings"
+
+# How many of the most-recent recordings to benchmark (0 = all available).
+# Ignored when a single explicit directory is given on the command line.
+N_RECORDINGS = 5
 
 # Voxel / OctoMap resolution (same as exploration.py defaults).
 OCTO_RESOLUTION = 0.15
@@ -44,14 +51,40 @@ OCTO_RESOLUTION = 0.15
 # Registration methods to benchmark.
 # Set to None to run ALL available methods automatically.
 # Otherwise provide a list of method keywords, e.g.:
-#   ["state_only", "icp", "gicp", "ndt", "fpfh_ransac", "small_gicp", "vgicp", "kiss_icp"]
-METHODS = ["state_only", "fpfh_ransac", "vgicp"]
+#METHODS = ["state_only", "icp", "gicp", "ndt", "fpfh_ransac", "small_gicp", "vgicp", "kiss_icp"]
+#METHODS = ["state_only","vgicp"]
+
+
+METHODS = ["state_only","fpfh_ransac"]
+
 
 # Show the Open3D viewer while processing each method.
 ENABLE_VIEWER = True
 
 # Save quality plot for each method alongside the map.
 SAVE_QUALITY_PLOT = True
+
+# ── Pose noise injection ──────────────────────────────────────────────────────
+# Add normally-distributed noise to the drone's reported position / orientation
+# before it enters the SLAM pipeline.  Set both to 0.0 to disable.
+#
+# Each entry is (position_std_m, orientation_std_deg).
+# Every method will be run once *clean* plus once per noise level listed here.
+# All noisy runs share the same random seed so the noise sequence is identical
+# across registration methods (and across noise levels with the same index).
+POSE_NOISE_LEVELS: list[tuple[float, float]] = [
+    (0.0125, 0.05),  # 1.25 cm, 0.05°
+    (0.125, 0.5),  
+    (0.25, 1.0),     # 2× base
+    (0.5, 2.0),      # 4× base
+    (1.0, 4.0),      # 8× base
+]
+'''POSE_NOISE_LEVELS: list[tuple[float, float]] = [
+]'''
+# Random seed for reproducible noise (None → non-deterministic).
+POSE_NOISE_SEED: int | None = 42
+# Also run each method with zero noise for a clean baseline.
+RUN_CLEAN_BASELINE = True
 
 # Output directory for saved maps. Each method gets its own sub-folder.
 SAVED_MAPS_DIR = os.path.join(_SCRIPT_DIR, "savedMaps")
@@ -60,6 +93,43 @@ SAVED_MAPS_DIR = os.path.join(_SCRIPT_DIR, "savedMaps")
 # ══════════════════════════════════════════════════════════════════════════════
 # Helpers
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _resolve_n_recordings(base_dir: str, n: int) -> list[str]:
+    """Return the *n* most-recent recording directories under *base_dir*.
+
+    Each returned path is a directory that contains ``frame_*.npz`` files.
+    Sorted newest-first.  If *n* ≤ 0, return all found directories.
+    """
+    if not os.path.isdir(base_dir):
+        raise FileNotFoundError(f"Recording base directory not found: {base_dir}")
+
+    # If the directory itself contains frames, treat it as a single recording
+    if glob.glob(os.path.join(base_dir, "frame_*.npz")):
+        return [base_dir]
+
+    subdirs = sorted(
+        glob.glob(os.path.join(base_dir, "flight_*"))
+        + glob.glob(os.path.join(base_dir, "exploration_*")))
+
+    # Filter to those that actually contain frame files
+    valid = [d for d in subdirs
+             if os.path.isdir(d) and glob.glob(os.path.join(d, "frame_*.npz"))]
+    if not valid:
+        raise FileNotFoundError(
+            f"No recording directories with frame_*.npz under {base_dir}")
+
+    # newest first (lexicographic sort puts newest timestamp last)
+    valid = list(reversed(valid))
+    if n > 0:
+        valid = valid[:n]
+    return valid
+
+
+def _timestamp_from_dir(rec_dir: str) -> int:
+    """Extract the numeric timestamp from a recording folder name."""
+    m = re.search(r'(\d{10,})', os.path.basename(rec_dir))
+    return int(m.group(1)) if m else int(time.time())
+
 
 def _deduplicate_methods(methods: list[str]) -> list[str]:
     """Remove method aliases that map to the same underlying function."""
@@ -161,140 +231,204 @@ def _save_quality_plot(pipeline, method: str, out_dir: str):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    # ── Resolve recording directory ───────────────────────────────────
-    rec_arg = sys.argv[1] if len(sys.argv) > 1 else RECORDING_DIR
-    if rec_arg and not os.path.isabs(rec_arg):
-        rec_arg = os.path.join(_SCRIPT_DIR, rec_arg)
+    # ── Resolve recording(s) ──────────────────────────────────────────
+    cli_arg = sys.argv[1] if len(sys.argv) > 1 else None
 
-    # Resolve to the actual folder containing frame_*.npz files
-    resolved_rec = resolve_recording_dir(rec_arg)
+    # If the CLI arg is a plain integer, treat it as "last N recordings".
+    if cli_arg is not None and cli_arg.isdigit():
+        n_requested = int(cli_arg)
+        base = RECORDING_DIR
+        if base and not os.path.isabs(base):
+            base = os.path.join(_SCRIPT_DIR, base)
+        recordings = _resolve_n_recordings(base, n_requested)
+    elif cli_arg is not None:
+        # Explicit path to one directory
+        p = cli_arg if os.path.isabs(cli_arg) else os.path.join(_SCRIPT_DIR, cli_arg)
+        recordings = [resolve_recording_dir(p)]
+    else:
+        # Default: use N_RECORDINGS from config
+        base = RECORDING_DIR
+        if base and not os.path.isabs(base):
+            base = os.path.join(_SCRIPT_DIR, base)
+        recordings = _resolve_n_recordings(base, N_RECORDINGS)
 
     # ── Determine methods to run ──────────────────────────────────────
     methods = (METHODS if METHODS is not None
                else _deduplicate_methods(list(REGISTRATION_METHODS.keys())))
 
+    # ── Build per-recording noise runs ────────────────────────────────
+    noise_runs: list[tuple[str, str, float, float]] = []
+    for method in methods:
+        if RUN_CLEAN_BASELINE:
+            noise_runs.append((method, "clean", 0.0, 0.0))
+        for pos_std, rot_std in POSE_NOISE_LEVELS:
+            tag = f"noise_{pos_std*100:.3f}cm_{rot_std:.3f}deg"
+            noise_runs.append((method, tag, pos_std, rot_std))
+
+    total_runs = len(recordings) * len(noise_runs)
+
     print(f"{'='*70}")
     print(f"  Registration Benchmark")
     print(f"{'='*70}")
-    print(f"  Recording:  {resolved_rec}")
+    print(f"  Recordings: {len(recordings)}")
+    for i, rec in enumerate(recordings):
+        print(f"       [{i+1}]  {os.path.basename(rec)}")
     print(f"  Bounds:     {EXPLORE_BOUNDS}")
     print(f"  Resolution: {OCTO_RESOLUTION} m")
     print(f"  Methods:    {', '.join(methods)}")
+    if POSE_NOISE_LEVELS:
+        print(f"  Noise lvls: {len(POSE_NOISE_LEVELS)}")
+        for j, (ps, rs) in enumerate(POSE_NOISE_LEVELS):
+            print(f"       [{j}]  pos σ={ps*100:.2f} cm,  rot σ={rs:.3f}°")
+        print(f"  Seed:       {POSE_NOISE_SEED}")
+        if RUN_CLEAN_BASELINE:
+            print(f"  Mode:       clean baseline + {len(POSE_NOISE_LEVELS)} noise level(s)")
+    else:
+        print(f"  Pose noise: disabled (clean only)")
+    print(f"  Total runs: {total_runs}")
     print(f"{'='*70}\n")
 
-    # ── Run each method ───────────────────────────────────────────────
+    # ── Run each recording × method × noise ───────────────────────────
     results_summary: list[dict] = []
+    run_counter = 0
 
-    # Extract the timestamp from the source recording folder name
-    # (e.g. "exploration_1773009886" → 1773009886) so saved maps
-    # carry the same timestamp as the data they were built from.
-    import re
-    _ts_match = re.search(r'(\d{10,})', os.path.basename(resolved_rec))
-    timestamp = int(_ts_match.group(1)) if _ts_match else int(time.time())
+    for rec_idx, resolved_rec in enumerate(recordings):
+        rec_name = os.path.basename(resolved_rec)
+        timestamp = _timestamp_from_dir(resolved_rec)
 
-    for method in methods:
-        print(f"\n{'━'*70}")
-        print(f"  Running: {method}")
-        print(f"{'━'*70}")
+        print(f"\n{'▓'*70}")
+        print(f"  Recording [{rec_idx+1}/{len(recordings)}]: {rec_name}")
+        print(f"{'▓'*70}")
 
-        runner = ReplayRunner(
-            resolved_rec,
-            registration=method,
-            octo_resolution=OCTO_RESOLUTION,
-            bounds=EXPLORE_BOUNDS,
-            planner_res=PLANNER_RES,
-            frame_skip=FRAME_SKIP,
-            enable_viewer=ENABLE_VIEWER,
-            enable_planner=False,
-        )
+        for method, noise_tag, noise_pos, noise_rot in noise_runs:
+            run_counter += 1
+            print(f"\n{'━'*70}")
+            print(f"  [{run_counter}/{total_runs}]  {method}  [{noise_tag}]  on {rec_name}")
+            print(f"{'━'*70}")
 
-        t0 = time.perf_counter()
-        try:
-            pipeline = runner.run()
-        except Exception as e:
-            print(f"  ERROR running {method}: {e}")
-            results_summary.append({"method": method, "status": "FAILED",
-                                    "error": str(e)})
-            continue
-        elapsed = time.perf_counter() - t0
+            runner = ReplayRunner(
+                resolved_rec,
+                registration=method,
+                octo_resolution=OCTO_RESOLUTION,
+                bounds=EXPLORE_BOUNDS,
+                planner_res=PLANNER_RES,
+                frame_skip=FRAME_SKIP,
+                enable_viewer=ENABLE_VIEWER,
+                enable_planner=False,
+                pose_noise_pos_std=noise_pos,
+                pose_noise_rot_std_deg=noise_rot,
+                pose_noise_seed=POSE_NOISE_SEED,
+            )
 
-        pipeline.print_summary()
+            t0 = time.perf_counter()
+            try:
+                pipeline = runner.run()
+            except Exception as e:
+                print(f"  ERROR running {method} [{noise_tag}] on {rec_name}: {e}")
+                results_summary.append({
+                    "recording": rec_name, "timestamp": timestamp,
+                    "method": method, "noise_tag": noise_tag,
+                    "noise_pos": noise_pos, "noise_rot": noise_rot,
+                    "status": "FAILED", "error": str(e)})
+                continue
+            elapsed = time.perf_counter() - t0
 
-        # ── Save the map ──────────────────────────────────────────────
-        map_out_dir = os.path.join(SAVED_MAPS_DIR,
-                                   f"slam_map_{timestamp}_{method}")
-        npz_path = runner.save_map(
-            out_dir=map_out_dir,
-            source=f"benchmark_{method}",
-            extra_metadata={
-                "recording": Path(runner.recording_dir).name,
-                "registration_method": method,
-            },
-        )
+            pipeline.print_summary()
 
-        # ── Quality plot ──────────────────────────────────────────────
-        if SAVE_QUALITY_PLOT:
-            _save_quality_plot(pipeline, method, map_out_dir)
+            # ── Save the map ──────────────────────────────────────────
+            suffix = f"{method}_{noise_tag}"
+            map_out_dir = os.path.join(SAVED_MAPS_DIR,
+                                       f"slam_map_{timestamp}_{suffix}")
+            npz_path = runner.save_map(
+                out_dir=map_out_dir,
+                source=f"benchmark_{suffix}",
+                extra_metadata={
+                    "recording": rec_name,
+                    "registration_method": method,
+                    "noise_tag": noise_tag,
+                    "pose_noise_pos_std": noise_pos,
+                    "pose_noise_rot_std_deg": noise_rot,
+                },
+            )
 
-        # ── Timing breakdown CSV ──────────────────────────────────────
-        _save_timing_csv(pipeline, method, map_out_dir, elapsed)
+            # ── Quality plot ──────────────────────────────────────────
+            if SAVE_QUALITY_PLOT:
+                _save_quality_plot(pipeline, f"{method} [{noise_tag}]", map_out_dir)
 
-        # ── Collect summary ───────────────────────────────────────────
-        summary = pipeline.get_summary()
-        results_summary.append({
-            "method":         method,
-            "status":         "OK",
-            "voxel_count":    summary["voxel_count"],
-            "pose_count":     summary["pose_count"],
-            "submap_count":   summary["submap_count"],
-            "rejected_count": summary["rejected_count"],
-            "plane_residual": (summary["plane"][3]
-                               if summary["plane"] else float("inf")),
-            "total_time":     elapsed,
-            "map_path":       npz_path,
-        })
+            # ── Timing breakdown CSV ──────────────────────────────────
+            _save_timing_csv(pipeline, method, map_out_dir, elapsed)
 
-        runner.stop_viewer()
+            # ── Collect summary ───────────────────────────────────────
+            summary = pipeline.get_summary()
+            results_summary.append({
+                "recording":      rec_name,
+                "timestamp":      timestamp,
+                "method":         method,
+                "noise_tag":      noise_tag,
+                "noise_pos":      noise_pos,
+                "noise_rot":      noise_rot,
+                "status":         "OK",
+                "voxel_count":    summary["voxel_count"],
+                "pose_count":     summary["pose_count"],
+                "submap_count":   summary["submap_count"],
+                "rejected_count": summary["rejected_count"],
+                "plane_residual": (summary["plane"][3]
+                                   if summary["plane"] else float("inf")),
+                "total_time":     elapsed,
+                "map_path":       npz_path,
+            })
+
+            runner.stop_viewer()
 
     # ── Summary table ─────────────────────────────────────────────────
     ok = [r for r in results_summary if r["status"] == "OK"]
     failed = [r for r in results_summary if r["status"] != "OK"]
 
-    print(f"\n\n{'='*90}")
+    print(f"\n\n{'='*110}")
     print(f"  REGISTRATION BENCHMARK RESULTS")
-    print(f"  {len(ok)}/{len(results_summary)} methods succeeded")
-    print(f"{'='*90}")
+    print(f"  {len(ok)}/{len(results_summary)} runs succeeded  "
+          f"({len(recordings)} recording(s) × {len(noise_runs)} run(s) each)")
+    print(f"{'='*110}")
 
     if ok:
-        hdr = (f"  {'Method':<16} {'Voxels':>10} {'Poses':>7} {'Submaps':>8} "
+        hdr = (f"  {'Recording':<28} {'Method':<16} {'Noise':<28} "
+               f"{'Voxels':>10} {'Poses':>7} {'Submaps':>8} "
                f"{'Rejected':>9} {'Plane Res':>10} {'Time(s)':>9}")
         print(hdr)
-        print(f"  {'─'*82}")
+        print(f"  {'─'*138}")
         for r in ok:
-            print(f"  {r['method']:<16} {r['voxel_count']:>10,} "
+            print(f"  {r['recording']:<28} {r['method']:<16} "
+                  f"{r['noise_tag']:<28} {r['voxel_count']:>10,} "
                   f"{r['pose_count']:>7} {r['submap_count']:>8} "
                   f"{r['rejected_count']:>9} {r['plane_residual']:>10.4f} "
                   f"{r['total_time']:>9.1f}")
     if failed:
-        print(f"\n  Failed methods:")
+        print(f"\n  Failed runs:")
         for r in failed:
-            print(f"    {r['method']}: {r.get('error', 'unknown')}")
+            print(f"    {r.get('recording','?')} / {r['method']}: "
+                  f"{r.get('error', 'unknown')}")
 
-    print(f"{'='*90}")
+    print(f"{'='*110}")
 
     # ── Save CSV summary ──────────────────────────────────────────────
-    csv_path = os.path.join(SAVED_MAPS_DIR, f"benchmark_{timestamp}.csv")
+    bench_ts = int(time.time())
+    csv_path = os.path.join(SAVED_MAPS_DIR, f"benchmark_{bench_ts}.csv")
     with open(csv_path, "w") as f:
-        f.write("method,status,voxel_count,pose_count,submap_count,"
-                "rejected_count,plane_residual,total_time,map_path\n")
+        f.write("recording,timestamp,method,noise_tag,noise_pos_std_m,"
+                "noise_rot_std_deg,status,voxel_count,pose_count,"
+                "submap_count,rejected_count,plane_residual,"
+                "total_time,map_path\n")
         for r in results_summary:
-            f.write(f"{r['method']},{r['status']},"
+            f.write(f"{r.get('recording','')},{r.get('timestamp','')},"
+                    f"{r['method']},{r.get('noise_tag','clean')},"
+                    f"{r.get('noise_pos','')},{r.get('noise_rot','')},"
+                    f"{r['status']},"
                     f"{r.get('voxel_count','')},{r.get('pose_count','')},"
                     f"{r.get('submap_count','')},{r.get('rejected_count','')},"
                     f"{r.get('plane_residual','')},{r.get('total_time','')},"
                     f"{r.get('map_path','')}\n")
     print(f"\n  CSV summary saved to {csv_path}")
-    print(f"  All maps saved under {SAVED_MAPS_DIR}/slam_map_{timestamp}_*/")
+    print(f"  All maps saved under {SAVED_MAPS_DIR}/")
     print(f"  Run mapAnalysis.py to compare against ground truth.")
     print("Done.")
 

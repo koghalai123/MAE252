@@ -827,7 +827,7 @@ class BufferedSLAM:
 
         while not self._stop_event.is_set():
             self._sample_sensors()
-            time.sleep(0.003)  # ~200 Hz
+            time.sleep(0.01)  
 
     def _sample_sensors(self) -> None:
         """Poll GPS, IMU, and vehicle state once and append to ring buffers."""
@@ -2346,7 +2346,19 @@ REPLAY_DIR      = ""
 EXPLORE_BOUNDS  = (-13, 27, -35, 5, -14, 0.15)   # (xmin,xmax,ymin,ymax,zmin,zmax) NED
 TAKEOFF_HEIGHT  = EXPLORE_BOUNDS[4] -5         
 VELOCITY        = 3             # m/s (live mode only)
-SCAN_HZ         = 1 / 1.5      # scans per second (live mode only)
+
+# ── Random edge spawn ────────────────────────────────────────────────────
+# When True, after takeoff the drone flies to a random position on the
+# perimeter of the exploration bounding box (at cruise altitude) before
+# starting autonomous exploration.  The exploration bounds themselves are
+# unchanged.
+RANDOM_EDGE_SPAWN   = True
+# Inset (m) from the hard bound edge so the drone doesn't start exactly
+# on the boundary.  Keeps it inside the safe region.
+EDGE_SPAWN_INSET    = 2.0
+# Random seed (None → non-deterministic).  Set for reproducible spawns.
+EDGE_SPAWN_SEED: int | None = None
+SCAN_HZ         = 1      # scans per second (live mode only)
 PLANNER_RES     = 1.0           # planning grid voxel size (m)
 MAX_TARGETS     = 10000            # safety cap on autonomous waypoints
 TIME_LIMIT_SEC  = 300                # exploration time limit in seconds (0 = no limit)
@@ -2444,6 +2456,9 @@ class ReplayRunner:
         frame_skip: int = 1,
         enable_viewer: bool = True,
         enable_planner: bool = False,
+        pose_noise_pos_std: float = 0.0,
+        pose_noise_rot_std_deg: float = 0.0,
+        pose_noise_seed: int | None = None,
     ):
         self.recording_dir = resolve_recording_dir(recording_dir)
         self.registration = registration
@@ -2453,6 +2468,11 @@ class ReplayRunner:
         self.frame_skip = frame_skip
         self.enable_viewer = enable_viewer
         self.enable_planner = enable_planner
+
+        # Pose noise injection (0.0 = disabled)
+        self.pose_noise_pos_std = pose_noise_pos_std      # metres
+        self.pose_noise_rot_std_deg = pose_noise_rot_std_deg  # degrees
+        self._noise_rng = np.random.default_rng(pose_noise_seed)
 
         # Populated after run()
         self.pipeline: SLAMPipeline | None = None
@@ -2520,8 +2540,10 @@ class ReplayRunner:
             octo_resolution=self.octo_resolution,
             frame_skip=1,
             enable_viewer=self.enable_viewer,
+            evaluate_reg=True,
         )
         pipeline = SLAMPipeline(cfg)
+        pipeline.enable_timing_csv()   # per-frame timing CSV
         if self.enable_viewer:
             pipeline.start_viewer()
             pipeline.set_bounds(self.bounds)
@@ -2557,8 +2579,25 @@ class ReplayRunner:
 
         for i, path in enumerate(frame_paths):
             f = self._load_one_frame(path)
-            pos = f["position"]
-            ori = f["orientation"]
+            pos = np.array(f["position"], dtype=np.float64)
+            ori = np.array(f["orientation"], dtype=np.float64)
+
+            # ── Inject pose noise (if configured) ────────────────
+            if self.pose_noise_pos_std > 0:
+                pos = pos + self._noise_rng.normal(
+                    0.0, self.pose_noise_pos_std, size=3)
+            if self.pose_noise_rot_std_deg > 0:
+                # Small random rotation: normally distributed Euler
+                # angles (deg) composed with the original quaternion.
+                euler_noise = self._noise_rng.normal(
+                    0.0, self.pose_noise_rot_std_deg, size=3)
+                R_noise = Rotation.from_euler('xyz', euler_noise, degrees=True)
+                # ori is stored as [w, x, y, z]; scipy uses [x, y, z, w]
+                R_orig = Rotation.from_quat(
+                    [ori[1], ori[2], ori[3], ori[0]])
+                R_noisy = R_noise * R_orig
+                qxyzw = R_noisy.as_quat()  # [x, y, z, w]
+                ori = np.array([qxyzw[3], qxyzw[0], qxyzw[1], qxyzw[2]])
 
             pipeline.set_drone_pos(pos)
             pipeline.process_frame(
@@ -2729,6 +2768,50 @@ def run_replay(recording_dir: str):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Random edge spawn helper
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _random_edge_position(
+    bounds: tuple[float, ...],
+    z: float,
+    inset: float = 2.0,
+    seed: int | None = None,
+) -> tuple[float, float, float]:
+    """Pick a random point on the XY perimeter of *bounds* at altitude *z*.
+
+    The point is inset by *inset* metres from the bounding-box edge so the
+    drone starts safely inside the exploration volume.
+
+    Returns (x, y, z) in NED.
+    """
+    rng = np.random.default_rng(seed)
+    xmin, xmax, ymin, ymax = bounds[0] + inset, bounds[1] - inset, \
+                              bounds[2] + inset, bounds[3] - inset
+
+    # Four edges: top, bottom, left, right.  Weight by edge length so
+    # the spawn is uniformly distributed along the perimeter.
+    w = xmax - xmin   # width  (x extent)
+    h = ymax - ymin   # height (y extent)
+    perimeter = 2 * (w + h)
+    t = rng.uniform(0, perimeter)
+
+    if t < w:
+        # Bottom edge: y = ymin
+        return (xmin + t, ymin, z)
+    t -= w
+    if t < h:
+        # Right edge: x = xmax
+        return (xmax, ymin + t, z)
+    t -= h
+    if t < w:
+        # Top edge: y = ymax
+        return (xmax - t, ymax, z)
+    t -= w
+    # Left edge: x = xmin
+    return (xmin, ymax - t, z)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Live mode — autonomous flight with AirSim
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2746,6 +2829,9 @@ def run_live():
     )
 
     live = LiveSLAM(cfg)
+
+    # Enable per-frame timing CSV for performance analysis
+    live.pipeline.enable_timing_csv()
 
     # Start the 3-D viewer as early as possible so the user can see
     # the map being populated from the very first scan.
@@ -2821,6 +2907,18 @@ def run_live():
     print(f"Rising to altitude z={TAKEOFF_HEIGHT} ...")
     live.client.moveToPositionAsync(0, 0, TAKEOFF_HEIGHT, velocity=VELOCITY).join()
     live.client.hoverAsync().join()
+
+    # ── Random edge spawn ────────────────────────────────────────────────
+    if RANDOM_EDGE_SPAWN:
+        spawn_pos = _random_edge_position(
+            EXPLORE_BOUNDS, TAKEOFF_HEIGHT,
+            inset=EDGE_SPAWN_INSET, seed=EDGE_SPAWN_SEED)
+        print(f"Flying to random edge spawn: "
+              f"x={spawn_pos[0]:.1f}, y={spawn_pos[1]:.1f}, z={spawn_pos[2]:.1f}")
+        live.client.moveToPositionAsync(
+            spawn_pos[0], spawn_pos[1], spawn_pos[2],
+            velocity=VELOCITY).join()
+        live.client.hoverAsync().join()
 
     # Wait for the sensor thread to populate its ring buffers so that
     # drain_ready() can actually interpolate poses.  The drone hovers
