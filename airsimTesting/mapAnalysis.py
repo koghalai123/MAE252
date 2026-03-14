@@ -61,8 +61,8 @@ SAVED_MAPS_ROOT = os.path.join(_SCRIPT_DIR, "savedMaps")
 # names inside savedMaps/ (e.g. "registrationComparison",
 # "noiseComparison").  Each sub-folder should contain one or more
 # slam_map_* directories, each holding a slam_map.npz.
-COMPARISON_GROUP = "registrationComparison"
-#COMPARISON_GROUP = "noiseComparison"
+#COMPARISON_GROUP = "registrationComparison"
+COMPARISON_GROUP = "noiseComparison"
 
 # Resolved SLAM map directory — all slam_map_* folders inside this are
 # automatically added to the comparison.
@@ -834,11 +834,6 @@ def plot_comparison(results: list[tuple[str, dict]],
                       color=colors[i], edgecolor="k", linewidth=0.5,
                       yerr=errs if has_err else None,
                       capsize=3, error_kw={"lw": 1.2})
-        for bar, v, e in zip(bars, vals, errs):
-            y_top = bar.get_height() + e
-            ax.text(bar.get_x() + bar.get_width() / 2,
-                    y_top, f"{v:.2f}",
-                    ha="center", va="bottom", fontsize=8)
 
         # Overlay directional RMSE markers on the RMSE (sym) bar
         if rmse_idx is not None:
@@ -1172,16 +1167,10 @@ def plot_timing_comparison(
         stds = [td.get(s, {}).get("mean_s_std", 0.0) * 1000 for s in steps]
         has_err = any(e > 0 for e in stds)
         offset = (i - (n - 1) / 2) * bar_w
-        bars = ax_mean.bar(sx + offset, means, bar_w, label=disp,
-                           color=colors_methods[i], edgecolor="k", linewidth=0.4,
-                           yerr=stds if has_err else None,
-                           capsize=3, error_kw={"lw": 1.0})
-        for bar, v, e in zip(bars, means, stds):
-            if v > 0:
-                y_top = bar.get_height() + e
-                ax_mean.text(bar.get_x() + bar.get_width() / 2,
-                             y_top, f"{v:.1f}",
-                             ha="center", va="bottom", fontsize=8)
+        ax_mean.bar(sx + offset, means, bar_w, label=disp,
+                    color=colors_methods[i], edgecolor="k", linewidth=0.4,
+                    yerr=stds if has_err else None,
+                    capsize=3, error_kw={"lw": 1.0})
 
     ax_mean.set_xticks(sx)
     ax_mean.set_xticklabels([step_labels.get(s, s) for s in steps],
