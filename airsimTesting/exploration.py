@@ -1019,6 +1019,46 @@ class ExplorationPlanner:
         # History of all selected waypoints — used to avoid revisiting
         self._waypoint_history: list[np.ndarray] = []
 
+        # Per-timestep log of which candidate heuristic was selected
+        # Each entry: dict with timestep, source, score, pos, etc.
+        self._candidate_source_log: list[dict] = []
+
+    # ── Candidate source CSV export ──────────────────────────────────────
+
+    def save_candidate_log_csv(self, out_dir: str) -> str | None:
+        """Write the per-timestep candidate-source log to a CSV file.
+
+        Parameters
+        ----------
+        out_dir : str
+            Directory (typically the flight recording folder) where the
+            CSV will be written.
+
+        Returns
+        -------
+        path : str or None
+            Absolute path to the written file, or ``None`` if the log is
+            empty.
+        """
+        if not self._candidate_source_log:
+            return None
+        import csv
+        os.makedirs(out_dir, exist_ok=True)
+        csv_path = os.path.join(out_dir, "candidate_sources.csv")
+        fields = [
+            "timestep", "selected_source",
+            "n_frontier", "n_unknown_column",
+            "n_local_random", "n_dense_block",
+            "n_total", "score",
+        ]
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            for row in self._candidate_source_log:
+                writer.writerow(row)
+        print(f"  Candidate source log saved to {csv_path}")
+        return csv_path
+
     # ── Coordinate helpers ────────────────────────────────────────────────
 
     def _world_to_grid(self, x: float, y: float, z: float) -> tuple[int, int, int]:
@@ -1274,8 +1314,13 @@ class ExplorationPlanner:
         -------
         candidates : ndarray (N, 3)
             De-duplicated candidate viewpoints in NED world frame.
+        labels : list[str]
+            Source heuristic label for each candidate (same length as
+            ``candidates``).  One of ``'frontier'``, ``'unknown_column'``,
+            ``'local_random'``, ``'dense_block'``.
         """
         raw: list[np.ndarray] = []
+        raw_labels: list[str] = []
         margin = self.inflation_margin
         cruise_z = (self.nbv_cruise_altitude
                     if self.nbv_cruise_altitude is not None
@@ -1301,7 +1346,9 @@ class ExplorationPlanner:
             wx, wy, wz_f = self._grid_to_world(cx_, cy_, cz_)
             for zo in z_offsets:
                 raw.append(np.array([wx, wy, wz_f - zo]))
+                raw_labels.append("frontier")
             raw.append(np.array([wx, wy, cruise_z]))
+            raw_labels.append("frontier")
 
         # ── H2: Columns with most unknown voxels ─────────────────────
         unknown_per_col = unknown.sum(axis=2)              # (nx, ny)
@@ -1319,8 +1366,10 @@ class ExplorationPlanner:
                 if free[ix_, iy_, iz_]:
                     _, _, wz = self._grid_to_world(ix_, iy_, iz_)
                     raw.append(np.array([wx, wy, wz]))
+                    raw_labels.append("unknown_column")
                     break
             raw.append(np.array([wx, wy, cruise_z]))
+            raw_labels.append("unknown_column")
 
         # ── H3: Local random samples around drone ────────────────────
         for _ in range(self.nbv_n_local_samples):
@@ -1334,6 +1383,7 @@ class ExplorationPlanner:
             if occupied_grid[gx, gy, gz]:
                 continue
             raw.append(cand)
+            raw_labels.append("local_random")
 
         # ── H4: Dense unknown region centroids ───────────────────────
         # Divide grid into coarse blocks and find the densest unknown
@@ -1363,12 +1413,16 @@ class ExplorationPlanner:
 
             # Candidate at cruise altitude directly above the block
             raw.append(np.array([wx, wy, cruise_z]))
+            raw_labels.append("dense_block")
             # Candidate at the LiDAR offset above the block centroid
             if self.lidar_altitude_offset > 0:
                 raw.append(np.array([wx, wy, wz - self.lidar_altitude_offset]))
+                raw_labels.append("dense_block")
                 raw.append(np.array([wx, wy, wz - self.lidar_altitude_offset * 2.0]))
+                raw_labels.append("dense_block")
             # Candidate at the block's own Z (useful for enclosed regions)
             raw.append(np.array([wx, wy, wz]))
+            raw_labels.append("dense_block")
             # Offset candidates approaching from four horizontal sides
             offset_d = bs * self.resolution * 0.5 + margin
             for dx_, dy_ in [(offset_d, 0), (-offset_d, 0),
@@ -1378,16 +1432,19 @@ class ExplorationPlanner:
                 if (self.xmin + margin <= sx_ <= self.xmax - margin and
                         self.ymin + margin <= sy_ <= self.ymax - margin):
                     raw.append(np.array([sx_, sy_, cruise_z]))
+                    raw_labels.append("dense_block")
 
         if not raw:
-            return np.empty((0, 3), dtype=np.float64)
+            return np.empty((0, 3), dtype=np.float64), []
 
         # ── De-duplicate: snap to half-resolution grid ───────────────
         pts = np.array(raw, dtype=np.float64)
         snap = self.resolution * 0.5
         keys = np.round(pts / snap).astype(np.int64)
         _, idx = np.unique(keys, axis=0, return_index=True)
-        pts = pts[np.sort(idx)]
+        sorted_idx = np.sort(idx)
+        pts = pts[sorted_idx]
+        labels = [raw_labels[i] for i in sorted_idx]
 
         # ── Clamp Z to valid OMPL range ──────────────────────────────
         # The PathPlanner extends zmin upward by above_grid_margin.
@@ -1396,7 +1453,7 @@ class ExplorationPlanner:
         z_ceil = self.zmin - self.above_grid_margin + 0.5
         z_floor = self.zmax - 0.5
         pts[:, 2] = np.clip(pts[:, 2], z_ceil, z_floor)
-        return pts
+        return pts, labels
 
     def _nbv_score_candidate(
         self,
@@ -1627,7 +1684,7 @@ class ExplorationPlanner:
             World-space positions of all candidates that passed filtering
             and were scored (for visualization).
         """
-        candidates = self._nbv_generate_candidates(
+        candidates, source_labels = self._nbv_generate_candidates(
             current_pos, occupied_grid, free, unknown, is_frontier, start)
 
         # Per-candidate debug records: list of dicts with scoring details
@@ -1636,6 +1693,13 @@ class ExplorationPlanner:
         if len(candidates) == 0:
             print("    [nbv] 0 candidates generated")
             self._last_nbv_debug = debug_records
+            self._candidate_source_log.append(dict(
+                timestep=len(self._candidate_source_log),
+                selected_source="none",
+                n_frontier=0, n_unknown_column=0,
+                n_local_random=0, n_dense_block=0,
+                n_total=0, score=0.0,
+            ))
             return None, None
 
         cur_xyz = current_pos[:3]
@@ -1647,11 +1711,13 @@ class ExplorationPlanner:
 
         for ci, cand in enumerate(candidates):
             dist = float(np.linalg.norm(cand - cur_xyz))
+            src = source_labels[ci] if ci < len(source_labels) else "unknown"
 
             if dist < self.min_target_distance:
                 debug_records.append(dict(
                     pos=cand.copy(), dist=dist, frustum=0, vol=0,
-                    combined_gain=0.0, score=0.0, status="too_close"))
+                    combined_gain=0.0, score=0.0, status="too_close",
+                    source=src))
                 continue
 
             if self._waypoint_history:
@@ -1660,7 +1726,8 @@ class ExplorationPlanner:
                           < self.waypoint_exclusion_radius):
                     debug_records.append(dict(
                         pos=cand.copy(), dist=dist, frustum=0, vol=0,
-                        combined_gain=0.0, score=0.0, status="revisited"))
+                        combined_gain=0.0, score=0.0, status="revisited",
+                        source=src))
                     continue
 
             # Check that the candidate voxel (if inside grid) is not occupied
@@ -1671,7 +1738,8 @@ class ExplorationPlanner:
                 if occupied_grid[gx, gy, gz]:
                     debug_records.append(dict(
                         pos=cand.copy(), dist=dist, frustum=0, vol=0,
-                        combined_gain=0.0, score=0.0, status="occupied"))
+                        combined_gain=0.0, score=0.0, status="occupied",
+                        source=src))
                     continue
 
             frustum_gain = self._nbv_score_candidate(
@@ -1679,7 +1747,7 @@ class ExplorationPlanner:
             if frustum_gain <= 0:
                 debug_records.append(dict(
                     pos=cand.copy(), dist=dist, frustum=frustum_gain,
-                    score=0.0, status="zero_frustum"))
+                    score=0.0, status="zero_frustum", source=src))
                 continue
 
             score = frustum_gain / max(dist, 0.01) ** self.distance_exponent
@@ -1688,7 +1756,7 @@ class ExplorationPlanner:
 
             debug_records.append(dict(
                 pos=cand.copy(), dist=dist, frustum=frustum_gain,
-                score=score, status="scored"))
+                score=score, status="scored", source=src))
 
             if score > best_score:
                 best_score = score
@@ -1712,6 +1780,22 @@ class ExplorationPlanner:
         else:
             print(f"    [nbv] {len(candidates)} candidates, "
                   f"{n_evaluated} scored, no valid target")
+
+        # ── Log candidate source statistics for this timestep ────
+        from collections import Counter
+        src_counts = Counter(source_labels)
+        selected_src = (debug_records[best_idx]["source"]
+                        if best_idx >= 0 else "none")
+        self._candidate_source_log.append(dict(
+            timestep=len(self._candidate_source_log),
+            selected_source=selected_src,
+            n_frontier=src_counts.get("frontier", 0),
+            n_unknown_column=src_counts.get("unknown_column", 0),
+            n_local_random=src_counts.get("local_random", 0),
+            n_dense_block=src_counts.get("dense_block", 0),
+            n_total=len(candidates),
+            score=best_score if best_score > -np.inf else 0.0,
+        ))
 
         if best_candidate is not None:
             self._waypoint_history.append(best_candidate.copy())
@@ -2109,7 +2193,7 @@ class _NBVDebugPlot:
         "zero_frustum": "#9467bd",   # purple
     }
 
-    def __init__(self):
+    def __init__(self, bounds=None):
         try:
             import matplotlib
             matplotlib.use("TkAgg")
@@ -2120,20 +2204,25 @@ class _NBVDebugPlot:
 
         self._ok = True
         self._plt = plt
+        self._bounds = bounds  # (xmin,xmax,ymin,ymax,zmin,zmax) NED
         plt.rcParams['font.family'] = 'sans-serif'
         plt.rcParams['font.sans-serif'] = ['Arial', 'DejaVu Sans', 'Liberation Sans', 'Helvetica']
         plt.rcParams['font.size'] = 12
         plt.ion()
-        # Layout: left half = spatial map (spans both rows),
-        #         right column = gain bars (top) + scatter (bottom)
-        self.fig = plt.figure(figsize=(12, 8))
-        gs = self.fig.add_gridspec(2, 2, width_ratios=[1.3, 1])
-        self.ax_map   = self.fig.add_subplot(gs[:, 0])   # left, full height
-        self.ax_stack = self.fig.add_subplot(gs[0, 1])    # top-right
-        self.ax_scat  = self.fig.add_subplot(gs[1, 1])    # bottom-right
-        self.fig.suptitle("NBV Candidate Debug", fontsize=14)
 
-        for ax in [self.ax_map, self.ax_stack, self.ax_scat]:
+        # Separate figure for the top-down spatial map
+        self.fig_map, self.ax_map = plt.subplots(figsize=(4, 4))
+        self.fig_map.canvas.manager.set_window_title("Top-Down Candidates")
+        self.ax_map.grid(True, alpha=0.3)
+        self.fig_map.tight_layout(pad=0.3)
+        plt.show(block=False)
+        plt.pause(0.01)
+
+        # Main figure for gain bar chart + scatter
+        self.fig, (self.ax_stack, self.ax_scat) = plt.subplots(
+            2, 1, figsize=(8, 6))
+        self.fig.suptitle("NBV Candidate Debug", fontsize=14)
+        for ax in [self.ax_stack, self.ax_scat]:
             ax.grid(True, alpha=0.3)
         self.fig.tight_layout(rect=[0, 0, 1, 0.95])
         plt.show(block=False)
@@ -2262,16 +2351,21 @@ class _NBVDebugPlot:
 
         ax.set_xlabel("Y (m)")
         ax.set_ylabel("X (m)")
-        ax.set_aspect("equal", adjustable="box")
-        # Filter summary annotation
-        from collections import Counter
-        filt_counts = Counter(r["status"] for r in filtered)
-        filt_str = ", ".join(f"{v} {k}" for k, v in filt_counts.items())
-        ax.set_title(f"Candidates on Map  (iter {self._iter})\n"
-                     f"filtered: {filt_str if filt_str else 'none'}",
-                     fontsize=10)
-        ax.legend(fontsize=12, loc="upper left",
-                  markerscale=0.6, handletextpad=0.3)
+        ax.set_aspect("equal", adjustable="datalim")
+        ax.legend(fontsize=12, loc="upper center",
+                  bbox_to_anchor=(0.5, -0.22), ncol=1,
+                  markerscale=0.6, handletextpad=0.3, frameon=False)
+
+        # Crop to 1.3× exploration bounds (axes: x-axis=Y, y-axis=X)
+        if self._bounds is not None:
+            xmin, xmax, ymin, ymax = (self._bounds[0], self._bounds[1],
+                                      self._bounds[2], self._bounds[3])
+            x_center = (xmin + xmax) / 2
+            y_center = (ymin + ymax) / 2
+            x_half = (xmax - xmin) / 2 * 1.3
+            y_half = (ymax - ymin) / 2 * 1.3
+            ax.set_xlim(y_center - y_half, y_center + y_half)
+            ax.set_ylim(x_center - x_half, x_center + x_half)
 
         # ── [top-right] Frustum gain bar chart ────────────────────────
         ax = self.ax_stack
@@ -2319,15 +2413,29 @@ class _NBVDebugPlot:
         ax.grid(True, alpha=0.3)
 
         # ── Redraw ────────────────────────────────────────────────────
+        self.fig_map.tight_layout(pad=0.3)
+        self.fig_map.canvas.draw_idle()
+        self.fig_map.canvas.flush_events()
+
         self.fig.tight_layout(rect=[0, 0, 1, 0.95])
         self.fig.canvas.draw_idle()
         self.fig.canvas.flush_events()
 
     def save(self, path: str) -> None:
-        """Save the current figure to *path*."""
+        """Save the current figures to *path*."""
         if not self._ok:
             return
-        self.fig.savefig(path, dpi=150, bbox_inches="tight")
+        base, ext = os.path.splitext(path)
+        self.fig_map.savefig(f"{base}_map{ext}", dpi=150, bbox_inches="tight")
+        self.fig.savefig(f"{base}_charts{ext}", dpi=150, bbox_inches="tight")
+
+    def close(self) -> None:
+        """Close both matplotlib figures."""
+        if not self._ok:
+            return
+        import matplotlib.pyplot as plt
+        plt.close(self.fig_map)
+        plt.close(self.fig)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2340,8 +2448,8 @@ SAVE_DIR = os.path.join(os.path.dirname(__file__), "flight_recordings")
 # Set REPLAY_DIR to a recording directory (or parent) to run offline on
 # saved LiDAR data.  Leave empty ("") for live AirSim flight.
 
-#REPLAY_DIR      = "flight_recordings"            # e.g. "flight_recordings/flight_1771909992"
-REPLAY_DIR      = ""  
+REPLAY_DIR      = "flight_recordings"            # e.g. "flight_recordings/flight_1771909992"
+#REPLAY_DIR      = ""  
 # ── Exploration parameters (shared by both modes) ────────────────────────
 EXPLORE_BOUNDS  = (-13, 27, -35, 5, -14, 0.15)   # (xmin,xmax,ymin,ymax,zmin,zmax) NED
 TAKEOFF_HEIGHT  = EXPLORE_BOUNDS[4] -5         
@@ -2455,7 +2563,7 @@ class ReplayRunner:
         planner_res: float = 1.0,
         frame_skip: int = 1,
         enable_viewer: bool = True,
-        enable_planner: bool = False,
+        enable_planner: bool = True,
         pose_noise_pos_std: float = 0.0,
         pose_noise_rot_std_deg: float = 0.0,
         pose_noise_seed: int | None = None,
@@ -2476,6 +2584,8 @@ class ReplayRunner:
 
         # Populated after run()
         self.pipeline: SLAMPipeline | None = None
+        self._planner: ExplorationPlanner | None = None
+        self._nbv_debug_plot: _NBVDebugPlot | None = None
         self.n_frames: int = 0
 
     # ── Frame loading ─────────────────────────────────────────────────
@@ -2570,7 +2680,7 @@ class ReplayRunner:
                 nbv_ray_max_targets=NBV_RAY_MAX_TARGETS,
                 nbv_use_ray_tracing=NBV_USE_RAY_TRACING,
             )
-            nbv_debug_plot = _NBVDebugPlot() if USE_NBV else None
+            nbv_debug_plot = _NBVDebugPlot(bounds=EXPLORE_BOUNDS) if USE_NBV else None
 
         # ── Process frames ───────────────────────────────────────────
         wp_count = 0
@@ -2638,8 +2748,30 @@ class ReplayRunner:
                       f"submaps={pipeline.submap_count}")
 
         # ── Finalise ─────────────────────────────────────────────────
+        self._planner = planner
+        self._nbv_debug_plot = nbv_debug_plot
         pipeline.get_corrected_map_points()
         return pipeline
+
+    # ── Candidate source CSV export ───────────────────────────────────
+
+    def save_candidate_log(self, out_dir: str) -> str | None:
+        """Save the exploration planner's candidate-source CSV.
+
+        Parameters
+        ----------
+        out_dir : str
+            Directory where ``candidate_sources.csv`` will be written.
+
+        Returns
+        -------
+        str or None
+            Path to the written file, or ``None`` if the planner was
+            not enabled or logged no candidates.
+        """
+        if self._planner is None:
+            return None
+        return self._planner.save_candidate_log_csv(out_dir)
 
     # ── Map saving ────────────────────────────────────────────────────
 
@@ -2724,7 +2856,10 @@ class ReplayRunner:
         return npz_path
 
     def stop_viewer(self):
-        """Stop the Open3D viewer (if running)."""
+        """Stop the Open3D viewer and close debug plots (if running)."""
+        if self._nbv_debug_plot is not None:
+            self._nbv_debug_plot.close()
+            self._nbv_debug_plot = None
         if self.pipeline is not None:
             self.pipeline.stop_viewer()
 
@@ -2851,7 +2986,7 @@ def run_live():
     quality_plot = _QualityPlot(cfg.registration)
 
     # NBV candidate comparison dashboard (only active when USE_NBV=True)
-    nbv_debug_plot = _NBVDebugPlot() if USE_NBV else None
+    nbv_debug_plot = _NBVDebugPlot(bounds=EXPLORE_BOUNDS) if USE_NBV else None
 
     # Start background scan collection immediately so the viewer
     # and SLAM map are populated from the very first moment.
@@ -3146,6 +3281,10 @@ def run_live():
         nbv_path = os.path.join(out_dir, "nbv_debug.png")
         nbv_debug_plot.save(nbv_path)
         print(f"  NBV debug plot saved to {nbv_path}")
+
+    # Save the candidate source log CSV
+    if out_dir:
+        exploration.save_candidate_log_csv(out_dir)
 
     if out_dir:
         bt_path = os.path.join(out_dir, "map.bt")

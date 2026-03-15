@@ -52,14 +52,18 @@ OCTO_RESOLUTION = 0.15
 # Set to None to run ALL available methods automatically.
 # Otherwise provide a list of method keywords, e.g.:
 #METHODS = ["state_only", "icp", "gicp", "ndt", "fpfh_ransac", "small_gicp", "vgicp", "kiss_icp"]
-#METHODS = ["state_only","vgicp"]
+METHODS = ["vgicp"]
 
 
-METHODS = ["state_only","fpfh_ransac"]
+#METHODS = ["state_only","fpfh_ransac"]
 
 
 # Show the Open3D viewer while processing each method.
 ENABLE_VIEWER = True
+
+# Run the exploration planner during replay to generate candidate
+# waypoint selection logs (candidate_sources.csv).
+ENABLE_PLANNER = True
 
 # Save quality plot for each method alongside the map.
 SAVE_QUALITY_PLOT = True
@@ -72,15 +76,15 @@ SAVE_QUALITY_PLOT = True
 # Every method will be run once *clean* plus once per noise level listed here.
 # All noisy runs share the same random seed so the noise sequence is identical
 # across registration methods (and across noise levels with the same index).
-POSE_NOISE_LEVELS: list[tuple[float, float]] = [
+'''POSE_NOISE_LEVELS: list[tuple[float, float]] = [
     (0.0125, 0.05),  # 1.25 cm, 0.05°
     (0.125, 0.5),  
     (0.25, 1.0),     # 2× base
     (0.5, 2.0),      # 4× base
     (1.0, 4.0),      # 8× base
-]
-'''POSE_NOISE_LEVELS: list[tuple[float, float]] = [
 ]'''
+POSE_NOISE_LEVELS: list[tuple[float, float]] = [
+]
 # Random seed for reproducible noise (None → non-deterministic).
 POSE_NOISE_SEED: int | None = 42
 # Also run each method with zero noise for a clean baseline.
@@ -314,7 +318,7 @@ def main():
                 planner_res=PLANNER_RES,
                 frame_skip=FRAME_SKIP,
                 enable_viewer=ENABLE_VIEWER,
-                enable_planner=False,
+                enable_planner=ENABLE_PLANNER,
                 pose_noise_pos_std=noise_pos,
                 pose_noise_rot_std_deg=noise_rot,
                 pose_noise_seed=POSE_NOISE_SEED,
@@ -357,6 +361,10 @@ def main():
 
             # ── Timing breakdown CSV ──────────────────────────────────
             _save_timing_csv(pipeline, method, map_out_dir, elapsed)
+
+            # ── Candidate source CSV ──────────────────────────────────
+            if ENABLE_PLANNER:
+                runner.save_candidate_log(map_out_dir)
 
             # ── Collect summary ───────────────────────────────────────
             summary = pipeline.get_summary()

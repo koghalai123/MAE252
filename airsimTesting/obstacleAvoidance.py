@@ -35,6 +35,10 @@ import os
 import time
 from typing import TYPE_CHECKING
 
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+
 from ompl import base as ob
 from ompl import geometric as og
 
@@ -1128,6 +1132,300 @@ class PathFollower:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# TrajectoryErrorPlotter — live matplotlib figure for trajectory tracking error
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _closest_point_on_segment(p: np.ndarray, a: np.ndarray,
+                               b: np.ndarray) -> tuple[np.ndarray, float]:
+    """Return the closest point on segment *ab* to *p*, and the parameter *t*.
+
+    *t* ∈ [0, 1] where 0 → *a* and 1 → *b*.
+    """
+    ab = b - a
+    length_sq = float(np.dot(ab, ab))
+    if length_sq < 1e-12:
+        return a.copy(), 0.0
+    t = float(np.dot(p - a, ab)) / length_sq
+    t = max(0.0, min(1.0, t))
+    return a + t * ab, t
+
+
+def _densify_path(waypoints: np.ndarray,
+                  max_step: float = 0.25) -> tuple[np.ndarray, np.ndarray]:
+    """Interpolate a piecewise-linear path to a fine, uniform spacing.
+
+    Returns
+    -------
+    dense_pts : ndarray (K, 3)
+        Densely sampled points along the path.
+    arc_lengths : ndarray (K,)
+        Cumulative arc-length from the path start for each dense point.
+    """
+    pts: list[np.ndarray] = []
+    arcs: list[float] = []
+    cum = 0.0
+    for i in range(len(waypoints) - 1):
+        a, b = waypoints[i], waypoints[i + 1]
+        seg_len = float(np.linalg.norm(b - a))
+        n_sub = max(int(np.ceil(seg_len / max_step)), 1)
+        for j in range(n_sub):
+            t = j / n_sub
+            pt = a + t * (b - a)
+            pts.append(pt)
+            arcs.append(cum + t * seg_len)
+        cum += seg_len
+    # Always include the final point
+    pts.append(waypoints[-1])
+    arcs.append(cum)
+    return np.array(pts), np.array(arcs)
+
+
+def _find_true_direction_changes(
+    waypoints: np.ndarray,
+    angle_threshold_deg: float = 3.0,
+) -> list[int]:
+    """Return indices of waypoints where the path direction truly changes.
+
+    Consecutive collinear segments (direction cosine ≈ 1) are NOT counted
+    as direction changes.  Only waypoints where the angle between the
+    incoming and outgoing segment directions exceeds *angle_threshold_deg*
+    are returned.
+
+    Parameters
+    ----------
+    waypoints : ndarray (N, 3)
+    angle_threshold_deg : float
+        Minimum angular deviation (degrees) to count as a direction change.
+
+    Returns
+    -------
+    list[int]
+        Waypoint indices (1 … N-2) where a true direction change occurs.
+    """
+    cos_thresh = np.cos(np.radians(angle_threshold_deg))
+    changes: list[int] = []
+    for i in range(1, len(waypoints) - 1):
+        d_in = waypoints[i] - waypoints[i - 1]
+        d_out = waypoints[i + 1] - waypoints[i]
+        len_in = np.linalg.norm(d_in)
+        len_out = np.linalg.norm(d_out)
+        if len_in < 1e-9 or len_out < 1e-9:
+            continue
+        cos_angle = float(np.dot(d_in, d_out) / (len_in * len_out))
+        cos_angle = max(-1.0, min(1.0, cos_angle))  # numerical safety
+        if cos_angle < cos_thresh:
+            changes.append(i)
+    return changes
+
+
+def compute_trajectory_error(
+    desired_waypoints: np.ndarray,
+    actual_trajectory: list[np.ndarray] | np.ndarray,
+    densify_step: float = 0.25,
+    angle_threshold_deg: float = 3.0,
+) -> tuple[np.ndarray, np.ndarray, list[int], list[float]]:
+    """Compute per-sample error between actual trajectory and desired path.
+
+    The desired path is first densified (interpolated at *densify_step*
+    spacing) so that the closest-point calculation is not affected by
+    coarse waypoint discretisation.
+
+    Direction changes are detected by comparing the incoming/outgoing
+    segment directions at each original waypoint; only waypoints where
+    the angle exceeds *angle_threshold_deg* are flagged.
+
+    Parameters
+    ----------
+    desired_waypoints : ndarray (N, 3)
+        Planned waypoints (piecewise-linear desired path).
+    actual_trajectory : list of ndarray (3,) or ndarray (M, 3)
+        Recorded drone positions during flight.
+    densify_step : float
+        Maximum spacing (m) between interpolated points on the desired
+        path.  Smaller values give more accurate error but cost slightly
+        more compute.
+    angle_threshold_deg : float
+        Minimum angular deviation at a waypoint to count as a true
+        direction change.
+
+    Returns
+    -------
+    errors : ndarray (M,)
+        Distance from each actual position to the nearest point on the
+        densified desired path.
+    closest_segments : ndarray (M,)
+        Index of the closest desired-path segment for each sample
+        (segment *i* goes from waypoint *i* to waypoint *i+1*).
+    direction_change_sample_indices : list[int]
+        Indices in the actual trajectory closest to the true direction-
+        change waypoints on the desired path.
+    direction_change_times : list[float]
+        Approximate arc-length positions (useful for time-axis mapping)
+        of each true direction change, expressed as the fraction of total
+        path length.
+    """
+    actual = np.asarray(actual_trajectory, dtype=np.float64)
+    wps = np.asarray(desired_waypoints, dtype=np.float64)
+
+    n_segments = len(wps) - 1
+    if n_segments < 1 or len(actual) == 0:
+        return np.array([]), np.array([]), [], []
+
+    # ── Densify the desired path ──────────────────────────────────────
+    dense_pts, dense_arcs = _densify_path(wps, max_step=densify_step)
+
+    # Build a KD-tree-like lookup using vectorised distance
+    # (fast enough for typical trajectory lengths < 10k samples)
+    errors = np.empty(len(actual))
+    closest_dense_idx = np.empty(len(actual), dtype=int)
+
+    for i, pt in enumerate(actual):
+        dists = np.linalg.norm(dense_pts - pt, axis=1)
+        idx = int(np.argmin(dists))
+        errors[i] = dists[idx]
+        closest_dense_idx[i] = idx
+
+    # Map each dense point back to its original segment index
+    # (segment s spans waypoints[s] → waypoints[s+1])
+    seg_cum_counts = np.zeros(n_segments + 1, dtype=int)
+    cum = 0
+    for s in range(n_segments):
+        seg_len = float(np.linalg.norm(wps[s + 1] - wps[s]))
+        n_sub = max(int(np.ceil(seg_len / densify_step)), 1)
+        seg_cum_counts[s] = cum
+        cum += n_sub
+    seg_cum_counts[n_segments] = cum  # final point index
+
+    # For each dense index, determine its original segment
+    dense_to_seg = np.zeros(len(dense_pts), dtype=int)
+    for s in range(n_segments):
+        lo = seg_cum_counts[s]
+        hi = seg_cum_counts[s + 1] if s < n_segments - 1 else len(dense_pts)
+        dense_to_seg[lo:hi] = s
+    # The very last point belongs to the last segment
+    dense_to_seg[-1] = n_segments - 1
+
+    closest_segments = dense_to_seg[closest_dense_idx]
+
+    # ── Detect TRUE direction changes (not collinear waypoints) ───────
+    true_change_wp_indices = _find_true_direction_changes(
+        wps, angle_threshold_deg=angle_threshold_deg)
+
+    # Map each direction-change waypoint to the closest actual-trajectory
+    # sample (by finding the actual sample nearest to that waypoint).
+    direction_change_sample_indices: list[int] = []
+    direction_change_times: list[float] = []
+    total_arc = dense_arcs[-1] if len(dense_arcs) > 0 else 1.0
+
+    for wp_idx in true_change_wp_indices:
+        wp_pos = wps[wp_idx]
+        dists_to_wp = np.linalg.norm(actual - wp_pos, axis=1)
+        sample_idx = int(np.argmin(dists_to_wp))
+        direction_change_sample_indices.append(sample_idx)
+
+        # Also compute the arc-length fraction for this waypoint
+        # (cumulative length up to waypoint wp_idx)
+        arc = 0.0
+        for s in range(wp_idx):
+            arc += float(np.linalg.norm(wps[s + 1] - wps[s]))
+        direction_change_times.append(arc / max(total_arc, 1e-9))
+
+    return (errors, closest_segments,
+            direction_change_sample_indices, direction_change_times)
+
+
+class TrajectoryErrorPlotter:
+    """Non-blocking matplotlib figure showing trajectory tracking error.
+
+    Updates after each completed trajectory and persists until the next
+    trajectory overwrites it.
+
+    Usage::
+
+        plotter = TrajectoryErrorPlotter()
+        # after each flight:
+        plotter.update(desired_waypoints, actual_trajectory, goal_index=i)
+    """
+
+    def __init__(self):
+        plt.ion()
+        plt.rcParams.update({'font.size': 12})
+        self._fig, self._ax = plt.subplots(
+            figsize=(3.5, 3.2))
+        self._fig.canvas.manager.set_window_title("Trajectory Error")
+        self._fig.tight_layout()
+        plt.show(block=False)
+        plt.pause(0.01)
+
+    def update(
+        self,
+        desired_waypoints: np.ndarray,
+        actual_trajectory: list[np.ndarray] | np.ndarray,
+        goal_index: int = 0,
+        poll_hz: float = 20.0,
+    ) -> None:
+        """Replot the figure with data from the latest trajectory.
+
+        Parameters
+        ----------
+        desired_waypoints : ndarray (N, 3)
+            Planned waypoints.
+        actual_trajectory : list of ndarray (3,) or ndarray (M, 3)
+            Recorded drone positions during flight.
+        goal_index : int
+            Display label for which goal this trajectory belongs to.
+        poll_hz : float
+            Approximate sample rate — used to generate a time axis.
+        """
+        errors, segments, dir_changes, _ = compute_trajectory_error(
+            desired_waypoints, actual_trajectory)
+
+        if len(errors) == 0:
+            return
+
+        wps = np.asarray(desired_waypoints, dtype=np.float64)
+        n_samples = len(errors)
+        time_axis = np.arange(n_samples) / poll_hz  # approximate seconds
+
+        ax = self._ax
+
+        ax.clear()
+        ax.plot(time_axis, errors, color="tab:blue", linewidth=1.2,
+                label="Tracking error")
+        ax.fill_between(time_axis, 0, errors, color="tab:blue", alpha=0.15)
+
+        # Mark true direction changes (not collinear waypoint transitions)
+        for idx in dir_changes:
+            t = time_axis[min(idx, n_samples - 1)]
+            ax.axvline(t, color="tab:red", linestyle="--", linewidth=0.9,
+                       alpha=0.7)
+        # Single legend entry for direction-change lines
+        if dir_changes:
+            ax.axvline(np.nan, color="tab:red", linestyle="--",
+                       linewidth=0.9, label="Direction change")
+
+        n_dir_changes = len(_find_true_direction_changes(wps))
+        ax.set_xlabel("Time (s)", fontsize=12)
+        ax.set_ylabel("Error (m)", fontsize=12)
+        ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18),
+                  fontsize=12, ncol=1, frameon=False)
+        ax.tick_params(labelsize=12)
+        ax.grid(True, alpha=0.3)
+        ax.set_xlim(time_axis[0], time_axis[-1])
+        ax.set_ylim(bottom=0)
+
+        self._fig.tight_layout()
+        self._fig.canvas.draw_idle()
+        self._fig.canvas.flush_events()
+        plt.pause(0.01)
+
+    def close(self):
+        """Close the matplotlib figure."""
+        plt.close(self._fig)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ThreadedPathPlanner — background planning while flying
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1440,7 +1738,7 @@ RECORDINGS_DIR = os.path.join(os.path.dirname(__file__), "groundTruthMap")
 MAP_NPZ = ""  # leave empty to auto-detect latest ground_truth_*
 
 PLANNING_RESOLUTION = 0.5
-INFLATION_RADIUS    = 1.5
+INFLATION_RADIUS    = 2.2
 PLANNER_TYPE        = "ABITstar"
 SOLVE_TIMEOUT       = 2.0
 GROUND_Z            = 0.0
@@ -1534,6 +1832,10 @@ def main():
           f"occupied voxels")
     viewer = Viewer3D()
     viewer.start(initial_points=planner.points)
+
+    # -- 5b) Launch trajectory error plotter -------------------------------
+    print("  Launching trajectory error plotter ...")
+    error_plotter = TrajectoryErrorPlotter()
 
     # -- 6) Set up ThreadedPathPlanner early (plans during takeoff) -------
     threaded_planner = ThreadedPathPlanner(planner)
@@ -1673,11 +1975,15 @@ def main():
             return None
         return plan_start
 
+    # Track the waypoints associated with the flight currently in progress
+    current_flight_waypoints: np.ndarray | None = None
+
     # ── Helper: process a completed flight ────────────────────────────
     def process_flight(flight: FlightResult | None, goal_i: int,
                        goal: np.ndarray) -> bool:
         """Log flight result. Returns True if goal was reached."""
         nonlocal goals_reached, goals_failed, total_collisions
+        nonlocal current_flight_waypoints
 
         if flight is None:
             print(f"  FAIL -- flight returned no result")
@@ -1708,6 +2014,20 @@ def main():
             print(f"    Collided with: '{ci.object_name}' "
                   f"(penetration: {ci.penetration_depth:.3f})")
         print()
+
+        # Update the trajectory error plot
+        if (current_flight_waypoints is not None
+                and len(flight.trajectory) > 0):
+            try:
+                error_plotter.update(
+                    current_flight_waypoints,
+                    flight.trajectory,
+                    goal_index=goal_i,
+                    poll_hz=POLL_HZ,
+                )
+            except Exception as e:
+                print(f"  [TrajectoryErrorPlotter] Update failed: {e}")
+
         return flight.success or not flight.collided
 
     # ── Collect the pre-planned first path ────────────────────────────
@@ -1787,6 +2107,7 @@ def main():
         viewer.update(planner.points, drone_pos=current_pos,
                       target_pos=first_goal, frontier_points=first_path)
         print(f"  Flying ({mode_label}) ...")
+        current_flight_waypoints = first_path.copy()
         follower.follow(first_path, goal=first_goal,
                         map_points=planner.points)
 
@@ -1846,6 +2167,7 @@ def main():
                 if not pr.success:
                     prev_goal = current_pos
                     continue
+                current_flight_waypoints = pr.path.copy()
                 follower.follow(pr.path, goal=next_goal,
                                 map_points=planner.points)
                 prev_goal = next_goal.copy()
@@ -1897,6 +2219,7 @@ def main():
             viewer.update(planner.points, drone_pos=actual_pos,
                           target_pos=next_goal, frontier_points=path)
             print(f"  Flying ({mode_label}) ...")
+            current_flight_waypoints = path.copy()
             follower.follow(path, goal=next_goal,
                             map_points=planner.points)
             prev_goal = next_goal.copy()
@@ -1931,7 +2254,7 @@ def main():
     follower.stop()
     threaded_planner.stop()
 
-    print("\nViewer is still open -- press Enter to land and exit.")
+    print("\nViewer and error plot are still open -- press Enter to land and exit.")
     try:
         input()
     except (EOFError, KeyboardInterrupt):
@@ -1941,6 +2264,7 @@ def main():
     client.landAsync().join()
     client.armDisarm(False)
     client.enableApiControl(False)
+    error_plotter.close()
     viewer.stop()
     print("Done.")
 

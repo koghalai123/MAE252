@@ -1245,6 +1245,157 @@ def save_trial_csv(results: list[tuple[str, dict]], path: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Waypoint selection analysis
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_candidate_sources_csv(slam_path: str) -> dict | None:
+    """Load ``candidate_sources.csv`` from a SLAM map folder.
+
+    Returns a dict mapping source names to selection counts, plus a
+    ``_total`` key with the total number of timesteps, or *None* if
+    the file doesn't exist.
+    """
+    import csv
+    p = Path(slam_path) / "candidate_sources.csv"
+    if not p.exists():
+        return None
+    counts: dict[str, int] = {}
+    total = 0
+    with open(p) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            src = row.get("selected_source", "unknown")
+            if src == "none":
+                continue  # no valid candidate at this timestep
+            counts[src] = counts.get(src, 0) + 1
+            total += 1
+    if total == 0:
+        return None
+    counts["_total"] = total
+    return counts
+
+
+def plot_waypoint_selection(
+    slam_paths: list[str],
+    save_path: str | None = None,
+) -> None:
+    """Bar chart showing the percentage of waypoints from each heuristic.
+
+    Each SLAM map directory is treated as one trial.  Bars show the mean
+    percentage across trials, with ±1 std error bars.
+
+    Parameters
+    ----------
+    slam_paths : list[str]
+        Directories that may contain ``candidate_sources.csv``.
+    save_path : str or None
+        If given, save the figure to this path.
+    """
+    import matplotlib
+    matplotlib.use("TkAgg")
+    import matplotlib.pyplot as plt
+
+    _FONT = {"family": "DejaVu Sans", "size": 12}
+    plt.rc("font", **_FONT)
+
+    # Canonical source order and display labels
+    _SOURCES = ["frontier", "unknown_column", "local_random", "dense_block"]
+    _LABELS = {
+        "frontier":       "Frontier\nClusters",
+        "unknown_column": "Unknown\nColumns",
+        "local_random":   "Local\nRandom",
+        "dense_block":    "Dense Unknown\nBlocks",
+    }
+    _COLORS = ["#4c72b0", "#dd8452", "#55a868", "#c44e52"]
+
+    # Collect per-method per-trial percentages
+    # Key: method label  →  list of dicts {source: pct}
+    from collections import OrderedDict
+    method_trials: OrderedDict[str, list[dict[str, float]]] = OrderedDict()
+
+    for sp in slam_paths:
+        raw_name = Path(sp).name if os.path.isdir(sp) else Path(sp).stem
+        method = extract_method_name(raw_name)
+        noise = extract_noise_level(raw_name)
+        if noise is not None:
+            label = f"{method} ({noise[0]:.1f}cm, {noise[1]:.2f}°)"
+        elif raw_name.endswith("_clean"):
+            label = f"{method} (clean)"
+        else:
+            label = method
+
+        counts = load_candidate_sources_csv(sp)
+        if counts is None:
+            continue
+        total = counts["_total"]
+        pcts = {s: 100.0 * counts.get(s, 0) / total for s in _SOURCES}
+        method_trials.setdefault(label, []).append(pcts)
+
+    if not method_trials:
+        print("  No candidate_sources.csv files found — skipping waypoint plot.")
+        return
+
+    # Aggregate: mean ± std per method
+    methods = list(method_trials.keys())
+    n_methods = len(methods)
+    n_sources = len(_SOURCES)
+
+    mean_pcts = np.zeros((n_methods, n_sources))
+    std_pcts = np.zeros((n_methods, n_sources))
+    for i, meth in enumerate(methods):
+        trials = method_trials[meth]
+        for j, src in enumerate(_SOURCES):
+            vals = np.array([t[src] for t in trials])
+            mean_pcts[i, j] = vals.mean()
+            std_pcts[i, j] = vals.std(ddof=1) if len(vals) > 1 else 0.0
+
+    # Plot
+    x = np.arange(n_sources)
+    bar_w = 0.8 / max(n_methods, 1)
+    fig, ax = plt.subplots(figsize=(max(6, 1.5 * n_sources * n_methods), 4.5))
+
+    cmap = plt.cm.tab10
+    colors = [cmap(i / max(n_methods - 1, 1)) for i in range(n_methods)]
+
+    for i, meth in enumerate(methods):
+        n_trials = len(method_trials[meth])
+        disp = f"{meth} (n={n_trials})" if n_trials > 1 else meth
+        offset = (i - (n_methods - 1) / 2) * bar_w
+        has_err = any(std_pcts[i, j] > 0 for j in range(n_sources))
+        ax.bar(
+            x + offset, mean_pcts[i], bar_w,
+            label=disp, color=colors[i],
+            edgecolor="k", linewidth=0.5,
+            yerr=std_pcts[i] if has_err else None,
+            capsize=3, error_kw={"lw": 1.2},
+        )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([_LABELS[s] for s in _SOURCES])
+    ax.set_ylabel("Selected (%)")
+    ax.set_ylim(0, min(100, mean_pcts.max() * 1.35 + 5))
+    ax.grid(True, axis="y", alpha=0.3)
+
+    ax.legend(
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.18),
+        ncol=1,
+        frameon=False,
+        fontsize=11,
+    )
+
+    fig.tight_layout()
+    fig.subplots_adjust(bottom=0.28 + 0.06 * n_methods)
+
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"  Waypoint selection figure saved to {save_path}")
+    plt.show(block=False)
+    plt.pause(0.01)
+    return fig
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1402,6 +1553,13 @@ def main():
                        csv_name.replace(".csv", "_trials.csv")))
         # CSV summary — averaged per method
         save_csv(avg_results, os.path.join(out_dir, csv_name))
+
+        # Waypoint selection breakdown (when candidate_sources.csv exists)
+        if not no_plot:
+            plot_waypoint_selection(
+                slam_paths,
+                save_path=os.path.join(out_dir, "waypoint_selection.png"),
+            )
 
     if not no_plot and results:
         print("\n  Plots are open — close the windows or press Enter to exit.")
