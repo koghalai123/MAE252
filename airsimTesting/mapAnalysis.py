@@ -63,6 +63,7 @@ SAVED_MAPS_ROOT = os.path.join(_SCRIPT_DIR, "savedMaps")
 # slam_map_* directories, each holding a slam_map.npz.
 #COMPARISON_GROUP = "registrationComparison"
 COMPARISON_GROUP = "noiseComparison"
+#COMPARISON_GROUP = "waypointSelection"
 
 # Resolved SLAM map directory — all slam_map_* folders inside this are
 # automatically added to the comparison.
@@ -572,8 +573,9 @@ def plot_single(m: dict, slam_pts: np.ndarray, gt_pts: np.ndarray,
     slam_display = slam_pts_full if slam_pts_full is not None else slam_pts
     gt_display   = gt_pts_full   if gt_pts_full   is not None else gt_pts
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    fig.suptitle(f"Map Quality Analysis{f'  —  {label}' if label else ''}")
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    fig.suptitle(f"Map Quality Analysis{f'  —  {label}' if label else ''}",
+                 fontsize=12)
 
     # ── (a) NN distance histograms ────────────────────────────────────
     ax = axes[0]
@@ -585,7 +587,6 @@ def plot_single(m: dict, slam_pts: np.ndarray, gt_pts: np.ndarray,
     ax.set_xlabel("NN distance (m)")
     ax.set_ylabel("Count")
     ax.set_title("Nearest-Neighbour Distance Distribution")
-    ax.legend()
     ax.grid(True, alpha=0.3)
 
     # ── (b) Top-down XY overlay (full maps for orientation) ───────────
@@ -631,9 +632,19 @@ def plot_single(m: dict, slam_pts: np.ndarray, gt_pts: np.ndarray,
     ax.set_ylabel("Cumulative %")
     ax.set_title("CDF of NN Distances")
     ax.set_xlim(0, clip_val)
-    ax.legend()
     ax.grid(True, alpha=0.3)
 
+    # Collect unique legend entries from all axes and place below
+    _handles, _labels = [], []
+    for _ax in axes:
+        for h, l in zip(*_ax.get_legend_handles_labels()):
+            if l not in _labels:
+                _handles.append(h)
+                _labels.append(l)
+    fig.legend(_handles, _labels,
+               loc="upper center", bbox_to_anchor=(0.5, -0.02),
+               ncol=min(len(_labels), 4), frameon=False, fontsize=12,
+               markerscale=10)
     fig.tight_layout(rect=[0, 0, 1, 0.94])
 
     if save_path:
@@ -672,8 +683,8 @@ def plot_combined(
     fnames = folder_names or [m.get("_folder", lbl) for lbl, m in results]
     colors = build_noise_colormap(labels, fnames)
 
-    fig, axes = plt.subplots(1, 3, figsize=(20, 7))
-    fig.suptitle("Registration Method Comparison")
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    fig.suptitle("Registration Method Comparison", fontsize=12)
 
     # Compute a shared clip value for the histograms / CDF x-axis
     all_d = np.concatenate([m["_d_s2g"] for _, m in results])
@@ -692,7 +703,6 @@ def plot_combined(
     ax.set_xlabel("NN distance SLAM→GT (m)")
     ax.set_ylabel("Count")
     ax.set_title("NN Distance Distribution (SLAM→GT)")
-    ax.legend()
     ax.grid(True, alpha=0.3)
 
     # ── (b) Top-down XY overlay — GT + all SLAM maps ─────────────────
@@ -717,16 +727,29 @@ def plot_combined(
                    alpha=0.3, rasterized=True, label=disp)
     ax.set_xlabel("Y (m)")
     ax.set_ylabel("X (m)")
-    ax.set_title("Top-Down Overlay (X–Y) — All Methods")
+    ax.set_title("Top-Down All")
     ax.set_aspect("equal", adjustable="datalim")
-    ax.legend(markerscale=10)
     ax.grid(True, alpha=0.3)
 
     # ── (c) CDF of SLAM→GT NN distances (with ±1σ shading) ──────────
     ax = axes[2]
     n_cdf_pts = 2000  # evaluation points for mean/std CDF
     x_eval = np.linspace(0, clip_val, n_cdf_pts)
+
+    # First pass: compute CDF-at-tau for each method (for legend sorting)
+    cdf_at_tau: list[float] = []
     for (label, m), clr in zip(results, colors):
+        per_run_dists = m.get("_d_s2g_runs", [m["_d_s2g"]])
+        # Fraction of points with NN distance ≤ τ (averaged over runs)
+        fracs = [np.mean(np.asarray(rd) <= tau) * 100 for rd in per_run_dists]
+        cdf_at_tau.append(float(np.mean(fracs)))
+
+    # Sort descending by CDF at τ
+    order = sorted(range(len(results)), key=lambda k: cdf_at_tau[k],
+                   reverse=True)
+
+    for idx in order:
+        (label, m), clr = results[idx], colors[idx]
         n_runs = m.get("_n_runs", 1)
         disp = f"{label} (n={n_runs})" if n_runs > 1 else label
         per_run_dists = m.get("_d_s2g_runs", [m["_d_s2g"]])
@@ -740,7 +763,7 @@ def plot_combined(
                     / len(rd) * 100)
             cdf_mean = cdf_matrix.mean(axis=0)
             cdf_std = cdf_matrix.std(axis=0, ddof=1)
-            ax.plot(x_eval, cdf_mean, label=disp, color=clr, lw=1.5)
+            ax.plot(x_eval, cdf_mean, label=disp, color=clr, lw=2.25)
             ax.fill_between(
                 x_eval,
                 np.clip(cdf_mean - cdf_std, 0, 100),
@@ -755,15 +778,27 @@ def plot_combined(
                 step = len(sorted_d) // 5000
                 sorted_d = sorted_d[::step]
                 cdf = cdf[::step]
-            ax.plot(sorted_d, cdf * 100, label=disp, color=clr, lw=1.5)
+            ax.plot(sorted_d, cdf * 100, label=disp, color=clr, lw=2.25)
     ax.axvline(tau, color="r", ls="--", lw=1, label=f"τ = {tau:.2f}m")
     ax.set_xlabel("NN distance SLAM→GT (m)")
     ax.set_ylabel("Cumulative %")
     ax.set_title("CDF of NN Distances (SLAM→GT)")
     ax.set_xlim(0, clip_val)
-    ax.legend()
+    ax.legend(loc="lower right", fontsize=10,
+              labelspacing=0.25, handlelength=1.2, handletextpad=0.4)
     ax.grid(True, alpha=0.3)
 
+    # Collect unique legend entries from all axes and place below
+    _handles, _labels = [], []
+    for _ax in axes:
+        for h, l in zip(*_ax.get_legend_handles_labels()):
+            if l not in _labels:
+                _handles.append(h)
+                _labels.append(l)
+    fig.legend(_handles, _labels,
+               loc="upper center", bbox_to_anchor=(0.5, -0.02),
+               ncol=min(len(_labels), 4), frameon=False, fontsize=12,
+               markerscale=10)
     fig.tight_layout(rect=[0, 0, 1, 0.94])
 
     if save_path:
@@ -808,8 +843,8 @@ def plot_comparison(results: list[tuple[str, dict]],
     bar_width = 0.8 / max(n_maps, 1)
     x = np.arange(n_metrics)
 
-    fig, ax = plt.subplots(figsize=(max(12, 1.8 * n_metrics), 6))
-    fig.suptitle("Registration Method Comparison")
+    fig, ax = plt.subplots(figsize=(7.5, 7.5))
+    fig.suptitle("Registration Method Comparison", fontsize=12)
 
     # Index of the RMSE (sym) metric for marker overlay
     rmse_idx = next(
@@ -852,11 +887,15 @@ def plot_comparison(results: list[tuple[str, dict]],
     ax.set_xticklabels([lbl for _, lbl in metrics_to_plot],
                        rotation=30, ha="right")
     ax.set_ylabel("Value")
-    ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", borderaxespad=0,
-              fontsize=10, framealpha=0.9)
     ax.grid(True, axis="y", alpha=0.3)
 
-    fig.tight_layout(rect=[0, 0, 0.82, 0.93])
+    _handles, _labels = ax.get_legend_handles_labels()
+    fig.legend(_handles, _labels,
+               loc="upper center", bbox_to_anchor=(0.5, 0.42),
+               ncol=2, frameon=False, fontsize=12,
+               labelspacing=0.25, handlelength=1.2, handletextpad=0.4,
+               columnspacing=1.0)
+    fig.tight_layout(rect=[0, 0.37, 1, 1.0])
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
         print(f"  Comparison figure saved to {save_path}")
@@ -1124,8 +1163,8 @@ def plot_timing_comparison(
     n = len(methods)
     x = np.arange(n)
 
-    fig, (ax_stack, ax_mean) = plt.subplots(1, 2, figsize=(16, 6))
-    fig.suptitle("Pipeline Timing Breakdown")
+    fig, (ax_stack, ax_mean) = plt.subplots(1, 2, figsize=(8, 4))
+    fig.suptitle("Pipeline Timing Breakdown", fontsize=12)
 
     # ── Left: stacked bar of total seconds per step ───────────────────
     bottoms = np.zeros(n)
@@ -1151,7 +1190,6 @@ def plot_timing_comparison(
     ax_stack.set_xticklabels(methods)
     ax_stack.set_ylabel("Total time (s)")
     ax_stack.set_title("Total Time per Step")
-    ax_stack.legend(loc="upper left")
     ax_stack.grid(True, axis="y", alpha=0.3)
 
     # ── Right: grouped bars of mean per-frame time ────────────────────
@@ -1177,8 +1215,15 @@ def plot_timing_comparison(
                             rotation=25, ha="right")
     ax_mean.set_ylabel("Mean per-frame time (ms)")
     ax_mean.set_title("Mean Per-Frame Time")
-    ax_mean.legend()
     ax_mean.grid(True, axis="y", alpha=0.3)
+
+    # Left axes legend: pipeline steps (stacked bar colors)
+    ax_stack.legend(loc="upper left", fontsize=9, framealpha=0.85,
+                    labelspacing=0.25, handlelength=1.2, handletextpad=0.4)
+
+    # Right axes legend: methods/algorithms only
+    ax_mean.legend(loc="upper right", fontsize=9, framealpha=0.85,
+                   labelspacing=0.25, handlelength=1.2, handletextpad=0.4)
 
     fig.tight_layout(rect=[0, 0, 1, 0.94])
     if save_path:
@@ -1251,38 +1296,62 @@ def save_trial_csv(results: list[tuple[str, dict]], path: str) -> None:
 def load_candidate_sources_csv(slam_path: str) -> dict | None:
     """Load ``candidate_sources.csv`` from a SLAM map folder.
 
-    Returns a dict mapping source names to selection counts, plus a
-    ``_total`` key with the total number of timesteps, or *None* if
-    the file doesn't exist.
+    Returns a dict with:
+      - ``"sel"``   : {source: selection_count}
+      - ``"gen"``   : {source: total_candidates_generated}
+      - ``"_total"``: number of valid timesteps (where a candidate was selected)
+    or *None* if the file doesn't exist / is empty.
     """
     import csv
+    _SRC_COLS = {
+        "frontier":       "n_frontier",
+        "unknown_column": "n_unknown_column",
+        "local_random":   "n_local_random",
+        "dense_block":    "n_dense_block",
+    }
     p = Path(slam_path) / "candidate_sources.csv"
     if not p.exists():
         return None
-    counts: dict[str, int] = {}
+    sel_counts: dict[str, int] = {}   # how often each source won
+    gen_counts: dict[str, int] = {}   # total candidates generated per source
     total = 0
     with open(p) as f:
         reader = csv.DictReader(f)
         for row in reader:
+            # accumulate generated counts even for "none" rows
+            for src, col in _SRC_COLS.items():
+                gen_counts[src] = gen_counts.get(src, 0) + int(row.get(col, 0))
             src = row.get("selected_source", "unknown")
             if src == "none":
-                continue  # no valid candidate at this timestep
-            counts[src] = counts.get(src, 0) + 1
+                continue
+            sel_counts[src] = sel_counts.get(src, 0) + 1
             total += 1
     if total == 0:
         return None
-    counts["_total"] = total
-    return counts
+    return {"sel": sel_counts, "gen": gen_counts, "_total": total}
 
 
 def plot_waypoint_selection(
     slam_paths: list[str],
     save_path: str | None = None,
 ) -> None:
-    """Bar chart showing the percentage of waypoints from each heuristic.
+    """Two-row bar chart: selection percentage and selection likelihood.
+
+    Top row  – *Selection %*: what fraction of all waypoint selections came
+    from each heuristic.
+
+    Bottom row – *Selection Likelihood*: controls for the number of candidates
+    each heuristic generates.  Defined as::
+
+        L_X = (sel_X / Σsel) / (gen_X / Σgen)
+
+    ``L = 1`` means the heuristic is selected proportionally to its candidate
+    volume; ``L > 1`` means its candidates are *more* likely to be chosen than
+    expected by volume alone; ``L < 1`` means less likely.
 
     Each SLAM map directory is treated as one trial.  Bars show the mean
-    percentage across trials, with ±1 std error bars.
+    across trials, with ±1 std error bars.  A single-column legend sits
+    below both axes.  Each axes panel is 4 × 4 in.
 
     Parameters
     ----------
@@ -1306,12 +1375,17 @@ def plot_waypoint_selection(
         "local_random":   "Local\nRandom",
         "dense_block":    "Dense Unknown\nBlocks",
     }
-    _COLORS = ["#4c72b0", "#dd8452", "#55a868", "#c44e52"]
 
-    # Collect per-method per-trial percentages
-    # Key: method label  →  list of dicts {source: pct}
+    # Collect per-method per-trial data
     from collections import OrderedDict
-    method_trials: OrderedDict[str, list[dict[str, float]]] = OrderedDict()
+    method_trials_pct:  OrderedDict[str, list[dict[str, float]]] = OrderedDict()
+    method_trials_lkl:  OrderedDict[str, list[dict[str, float]]] = OrderedDict()
+
+    # If every path is clean, suppress the "(clean)" tag
+    _all_clean = all(
+        (Path(sp).name if os.path.isdir(sp) else Path(sp).stem).endswith("_clean")
+        for sp in slam_paths
+    ) if slam_paths else False
 
     for sp in slam_paths:
         raw_name = Path(sp).name if os.path.isdir(sp) else Path(sp).stem
@@ -1319,73 +1393,135 @@ def plot_waypoint_selection(
         noise = extract_noise_level(raw_name)
         if noise is not None:
             label = f"{method} ({noise[0]:.1f}cm, {noise[1]:.2f}°)"
-        elif raw_name.endswith("_clean"):
+        elif raw_name.endswith("_clean") and not _all_clean:
             label = f"{method} (clean)"
         else:
             label = method
 
-        counts = load_candidate_sources_csv(sp)
-        if counts is None:
+        info = load_candidate_sources_csv(sp)
+        if info is None:
             continue
-        total = counts["_total"]
-        pcts = {s: 100.0 * counts.get(s, 0) / total for s in _SOURCES}
-        method_trials.setdefault(label, []).append(pcts)
+        total_sel = info["_total"]
+        sel = info["sel"]
+        gen = info["gen"]
+        total_gen = sum(gen.get(s, 0) for s in _SOURCES)
+        if total_gen == 0:
+            continue
 
-    if not method_trials:
+        pcts = {s: 100.0 * sel.get(s, 0) / total_sel for s in _SOURCES}
+
+        # Likelihood ratio:  (sel_X / Σsel) / (gen_X / Σgen)
+        likelihoods = {}
+        for s in _SOURCES:
+            g = gen.get(s, 0)
+            if g == 0:
+                likelihoods[s] = 0.0
+            else:
+                sel_frac = sel.get(s, 0) / total_sel
+                gen_frac = g / total_gen
+                likelihoods[s] = sel_frac / gen_frac
+
+        method_trials_pct.setdefault(label, []).append(pcts)
+        method_trials_lkl.setdefault(label, []).append(likelihoods)
+
+    if not method_trials_pct:
         print("  No candidate_sources.csv files found — skipping waypoint plot.")
         return
 
-    # Aggregate: mean ± std per method
-    methods = list(method_trials.keys())
+    methods   = list(method_trials_pct.keys())
     n_methods = len(methods)
     n_sources = len(_SOURCES)
 
-    mean_pcts = np.zeros((n_methods, n_sources))
-    std_pcts = np.zeros((n_methods, n_sources))
-    for i, meth in enumerate(methods):
-        trials = method_trials[meth]
-        for j, src in enumerate(_SOURCES):
-            vals = np.array([t[src] for t in trials])
-            mean_pcts[i, j] = vals.mean()
-            std_pcts[i, j] = vals.std(ddof=1) if len(vals) > 1 else 0.0
+    # Helper: aggregate mean ± std across trials
+    def _aggregate(trials_dict):
+        mean = np.zeros((n_methods, n_sources))
+        std  = np.zeros((n_methods, n_sources))
+        for i, meth in enumerate(methods):
+            trials = trials_dict[meth]
+            for j, src in enumerate(_SOURCES):
+                vals = np.array([t[src] for t in trials])
+                mean[i, j] = vals.mean()
+                std[i, j]  = vals.std(ddof=1) if len(vals) > 1 else 0.0
+        return mean, std
 
-    # Plot
+    mean_pct, std_pct = _aggregate(method_trials_pct)
+    mean_lkl, std_lkl = _aggregate(method_trials_lkl)
+
+    # ── Draw figure: two 4×4-in axes stacked inside a larger window ──
+    _AX_W, _AX_H = 4.0, 4.0
+    _FIG_W, _FIG_H = _AX_W + 2.5, 2 * _AX_H + 3.0
+    fig, (ax_pct, ax_lkl) = plt.subplots(
+        2, 1,
+        figsize=(_FIG_W, _FIG_H),
+    )
+    # Position each axes to be exactly 4 × 4 in, centred horizontally
+    _left = ((_FIG_W - _AX_W) / 2) / _FIG_W
+    _aw   = _AX_W / _FIG_W
+    _ah   = _AX_H / _FIG_H
+    _gap  = 0.6 / _FIG_H          # 0.6 in gap between the two axes
+    _bot_top = 1.8 / _FIG_H       # 1.8 in margin at very bottom (for legend)
+    ax_lkl.set_position([_left, _bot_top, _aw, _ah])
+    ax_pct.set_position([_left, _bot_top + _ah + _gap, _aw, _ah])
+
     x = np.arange(n_sources)
     bar_w = 0.8 / max(n_methods, 1)
-    fig, ax = plt.subplots(figsize=(max(6, 1.5 * n_sources * n_methods), 4.5))
 
     cmap = plt.cm.tab10
     colors = [cmap(i / max(n_methods - 1, 1)) for i in range(n_methods)]
 
     for i, meth in enumerate(methods):
-        n_trials = len(method_trials[meth])
+        n_trials = len(method_trials_pct[meth])
         disp = f"{meth} (n={n_trials})" if n_trials > 1 else meth
         offset = (i - (n_methods - 1) / 2) * bar_w
-        has_err = any(std_pcts[i, j] > 0 for j in range(n_sources))
-        ax.bar(
-            x + offset, mean_pcts[i], bar_w,
+        has_err_pct = any(std_pct[i, j]  > 0 for j in range(n_sources))
+        has_err_lkl = any(std_lkl[i, j] > 0 for j in range(n_sources))
+
+        ax_pct.bar(
+            x + offset, mean_pct[i], bar_w,
             label=disp, color=colors[i],
             edgecolor="k", linewidth=0.5,
-            yerr=std_pcts[i] if has_err else None,
+            yerr=std_pct[i] if has_err_pct else None,
+            capsize=3, error_kw={"lw": 1.2},
+        )
+        ax_lkl.bar(
+            x + offset, mean_lkl[i], bar_w,
+            label=disp, color=colors[i],
+            edgecolor="k", linewidth=0.5,
+            yerr=std_lkl[i] if has_err_lkl else None,
             capsize=3, error_kw={"lw": 1.2},
         )
 
-    ax.set_xticks(x)
-    ax.set_xticklabels([_LABELS[s] for s in _SOURCES])
-    ax.set_ylabel("Selected (%)")
-    ax.set_ylim(0, min(100, mean_pcts.max() * 1.35 + 5))
-    ax.grid(True, axis="y", alpha=0.3)
+    # Top subplot — Selection %
+    ax_pct.set_xticks(x)
+    ax_pct.set_xticklabels([_LABELS[s] for s in _SOURCES], fontsize=12)
+    ax_pct.set_ylabel("Selected (%)", fontsize=12)
+    ax_pct.set_ylim(0, min(100, mean_pct.max() * 1.35 + 5))
+    ax_pct.tick_params(labelsize=12)
+    ax_pct.grid(True, axis="y", alpha=0.3)
+    ax_pct.set_title("Waypoint Selection Percentage", fontsize=12)
 
-    ax.legend(
+    # Bottom subplot — Selection likelihood
+    ax_lkl.set_xticks(x)
+    ax_lkl.set_xticklabels([_LABELS[s] for s in _SOURCES], fontsize=12)
+    ax_lkl.set_ylabel("Selection Likelihood", fontsize=12)
+    lkl_max = mean_lkl.max() + std_lkl.max()
+    ax_lkl.set_ylim(0, max(2.0, lkl_max * 1.25))
+    ax_lkl.axhline(1.0, color="k", ls="--", lw=0.8, alpha=0.6)
+    ax_lkl.tick_params(labelsize=12)
+    ax_lkl.grid(True, axis="y", alpha=0.3)
+    ax_lkl.set_title("Selection Likelihood (controlled for candidate count)",
+                     fontsize=12)
+
+    # Single-column legend below the bottom axes
+    handles, labels = ax_pct.get_legend_handles_labels()
+    fig.legend(
+        handles, labels,
         loc="upper center",
-        bbox_to_anchor=(0.5, -0.18),
+        bbox_to_anchor=(0.5, 0.02),
         ncol=1,
         frameon=False,
-        fontsize=11,
+        fontsize=12,
     )
-
-    fig.tight_layout()
-    fig.subplots_adjust(bottom=0.28 + 0.06 * n_methods)
 
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
@@ -1422,6 +1558,12 @@ def main():
     all_slam_pts_full: list[np.ndarray] = []   # raw clouds for combined plots
     timing_data: list[tuple[str, dict]] = []   # (label, timing_dict) pairs
 
+    # If every map is clean, suppress the "(clean)" tag
+    _all_clean = all(
+        (Path(sp).name if os.path.isdir(sp) else Path(sp).stem).endswith("_clean")
+        for sp in slam_paths
+    ) if slam_paths else False
+
     for slam_path in slam_paths:
         raw_name = Path(slam_path).stem
         if os.path.isdir(slam_path):
@@ -1430,7 +1572,7 @@ def main():
         noise = extract_noise_level(raw_name)
         if noise is not None:
             label = f"{method} ({noise[0]:.1f}cm, {noise[1]:.2f}°)"
-        elif raw_name.endswith("_clean"):
+        elif raw_name.endswith("_clean") and not _all_clean:
             label = f"{method} (clean)"
         else:
             label = method
